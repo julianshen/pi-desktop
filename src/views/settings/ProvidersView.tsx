@@ -1,13 +1,8 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { Blueprint } from "../../components/Blueprint";
 import { StatusTag } from "../../components/StatusTag";
-
-// Same env var (and same fallback host/port) App.tsx's RUNTIME_URL uses for the
-// CopilotKit endpoint — derived independently here since RUNTIME_URL isn't exported.
-// Do not hardcode a second, divergent default port/host; keep this in sync with
-// App.tsx's `RUNTIME_URL` if that ever changes.
-const COPILOTKIT_RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
-const SERVER_ORIGIN = new URL(COPILOTKIT_RUNTIME_URL).origin;
+import { SERVER_ORIGIN } from "../../lib/serverOrigin";
+import { mutedText } from "../../lib/styles";
 
 /** Mirrors SPEC.md's `ProviderStatus` response shape (server/src/settings/routes.ts). */
 interface ProviderStatus {
@@ -36,8 +31,6 @@ const PROVIDER_GUIDANCE: Record<string, string> = {
   mistral: "Create a key at console.mistral.ai/api-keys.",
   openrouter: "Create a key at openrouter.ai/keys — routes to 100+ underlying models.",
 };
-
-const mutedText: CSSProperties = { color: "color-mix(in srgb, var(--color-text) 55%, transparent)" };
 
 export function ProvidersView() {
   const [providers, setProviders] = useState<ProviderStatus[] | null>(null);

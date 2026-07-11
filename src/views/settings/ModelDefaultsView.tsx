@@ -1,17 +1,7 @@
 import { useEffect, useState } from "react";
 import { Blueprint } from "../../components/Blueprint";
-
-/**
- * Same env var + fallback App.tsx uses for the CopilotKit runtime URL
- * (`VITE_COPILOTKIT_RUNTIME_URL`, default `http://127.0.0.1:4319/copilotkit`) —
- * stripped of the `/copilotkit` suffix to get the server's plain HTTP base for
- * REST calls. Deliberately derived from that same source rather than a second,
- * independently-hardcoded host/port default.
- */
-const SERVER_BASE_URL = (import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit").replace(
-  /\/copilotkit\/?$/,
-  "",
-);
+import { SERVER_ORIGIN } from "../../lib/serverOrigin";
+import { mutedText } from "../../lib/styles";
 
 interface ModelOption {
   provider: string;
@@ -25,8 +15,6 @@ interface DefaultModel {
   model: string | null;
 }
 
-const mutedText = { color: "color-mix(in srgb, var(--color-text) 55%, transparent)" };
-
 export function ModelDefaultsView() {
   const [models, setModels] = useState<ModelOption[]>([]);
   const [current, setCurrent] = useState<DefaultModel>({ provider: null, model: null });
@@ -36,6 +24,7 @@ export function ModelDefaultsView() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [hoveredKey, setHoveredKey] = useState<string | null>(null);
+  const searchInputId = "model-defaults-search";
 
   useEffect(() => {
     let cancelled = false;
@@ -43,8 +32,8 @@ export function ModelDefaultsView() {
     async function load() {
       try {
         const [modelsRes, defaultRes] = await Promise.all([
-          fetch(`${SERVER_BASE_URL}/api/settings/models`),
-          fetch(`${SERVER_BASE_URL}/api/settings/default-model`),
+          fetch(`${SERVER_ORIGIN}/api/settings/models`),
+          fetch(`${SERVER_ORIGIN}/api/settings/default-model`),
         ]);
         if (!modelsRes.ok || !defaultRes.ok) throw new Error("request_failed");
         const modelsBody = (await modelsRes.json()) as { models: ModelOption[] };
@@ -77,7 +66,7 @@ export function ModelDefaultsView() {
     setSavingKey(key);
     setSaveError(null);
     try {
-      const res = await fetch(`${SERVER_BASE_URL}/api/settings/default-model`, {
+      const res = await fetch(`${SERVER_ORIGIN}/api/settings/default-model`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider: m.provider, model: m.id }),
@@ -89,7 +78,7 @@ export function ModelDefaultsView() {
       }
       setCurrent({ provider: body.provider ?? m.provider, model: body.model ?? m.id });
     } catch {
-      setSaveError("Could not reach the server — check it's running.");
+      setSaveError("Could not reach the server. Check that it's running and try again.");
     } finally {
       setSavingKey(null);
     }
@@ -136,8 +125,9 @@ export function ModelDefaultsView() {
         {loadError && <p style={{ fontSize: 13, color: "var(--color-danger)", margin: "0 0 14px" }}>{loadError}</p>}
 
         <div className="field" style={{ marginBottom: 10 }}>
-          <label>Default model</label>
+          <label htmlFor={searchInputId}>Search models</label>
           <input
+            id={searchInputId}
             className="input"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -147,12 +137,14 @@ export function ModelDefaultsView() {
 
         {saveError && <p style={{ fontSize: 13, color: "var(--color-danger)", margin: "0 0 10px" }}>{saveError}</p>}
 
-        <div style={{ border: "1px solid var(--color-divider)", maxHeight: 320, overflowY: "auto" }}>
-          {!loading && models.length === 0 ? (
+        <div role="listbox" aria-label="Available models" style={{ border: "1px solid var(--color-divider)", maxHeight: 320, overflowY: "auto" }}>
+          {loading ? (
+            <div style={{ padding: 14, fontSize: 13, ...mutedText }}>Loading models…</div>
+          ) : loadError ? null : models.length === 0 ? (
             <div style={{ padding: 14, fontSize: 13, ...mutedText }}>
               No available models match your connected providers.
             </div>
-          ) : !loading && filtered.length === 0 ? (
+          ) : filtered.length === 0 ? (
             <div style={{ padding: 14, fontSize: 13, ...mutedText }}>No models match your search.</div>
           ) : (
             filtered.map((m) => {
@@ -163,8 +155,17 @@ export function ModelDefaultsView() {
               return (
                 <div
                   key={key}
+                  role="option"
+                  aria-selected={isSelected}
+                  tabIndex={0}
                   onClick={() => {
                     if (!savingKey) void pickModel(m);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      if (!savingKey) void pickModel(m);
+                    }
                   }}
                   onMouseEnter={() => setHoveredKey(key)}
                   onMouseLeave={() => setHoveredKey((k) => (k === key ? null : k))}
