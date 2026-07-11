@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type Router } from "express";
 import type { AuthStorage } from "@earendil-works/pi-coding-agent";
 import { getAgentDeps } from "../agent/deps.js";
+import { getSharedSession } from "../agent/session.js";
 
 /**
  * Hardcoded copy of the SDK's built-in provider id -> display name map.
@@ -59,6 +60,13 @@ interface ProviderStatus {
   source: "api_key" | "oauth" | "env" | "none";
   modelCount: number;
   maskedKey?: string;
+}
+
+interface ModelOption {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow?: number;
 }
 
 export const settingsRouter: Router = express.Router();
@@ -201,6 +209,118 @@ async function handleDisconnectProvider(req: Request, res: Response): Promise<vo
 settingsRouter.delete("/providers/:id", (req, res) => {
   handleDisconnectProvider(req, res).catch((error: unknown) => {
     console.error("[settings] unhandled error in DELETE /providers/:id", error);
+    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+  });
+});
+
+async function handleGetModels(_req: Request, res: Response): Promise<void> {
+  const { modelRegistry } = await getAgentDeps();
+  const models: ModelOption[] = modelRegistry.getAvailable().map((model) => ({
+    provider: model.provider,
+    id: model.id,
+    name: model.name,
+    contextWindow: model.contextWindow,
+  }));
+  res.json({ models });
+}
+
+settingsRouter.get("/models", (req, res) => {
+  handleGetModels(req, res).catch((error: unknown) => {
+    console.error("[settings] unhandled error in GET /models", error);
+    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+  });
+});
+
+/*
+ * Open question resolved (Task 3, per TASKS.md's "Before writing code" instruction):
+ * does `(await getSharedSession()).model` return a sensible value on a cold server
+ * start, before any explicit setModel() call / chat turn?
+ *
+ * Traced through the SDK source (not just the .d.ts prose) to confirm:
+ *
+ *   - model-resolver.d.ts's findInitialModel() documents priority order:
+ *     1. CLI args, 2. first scoped model (non-continuing only), 3. restored from
+ *     session, 4. SettingsManager saved default, 5. first available model with a
+ *     configured key.
+ *   - dist/core/sdk.js's createAgentSession() (the function server/src/agent/session.ts's
+ *     createSession() calls) shows this isn't just documentation: when no `model` option
+ *     is passed in (our case — agent/deps.ts's `model` is only set if PI_DESKTOP_MODEL is
+ *     set) and there's no existing session to restore from, it calls
+ *     `findInitialModel({ defaultProvider: settingsManager.getDefaultProvider(),
+ *     defaultModelId: settingsManager.getDefaultModel(), ... })` and assigns the result to
+ *     `model` BEFORE constructing the Agent/AgentSession — i.e. resolution happens
+ *     synchronously during `createAgentSession()`, not lazily on first prompt.
+ *   - dist/core/agent-session.js's `setModel()` confirms the write path: it calls
+ *     `this.settingsManager.setDefaultModelAndProvider(model.provider, model.id)` on the
+ *     *same* `SettingsManager` instance `createAgentSession()` constructed internally and
+ *     handed to `new AgentSession({ ..., settingsManager })` — so reads and writes go
+ *     through one consistent object, persisted to disk under `<agentDir>/settings.json`
+ *     via `FileSettingsStorage`. No gap, no need for a second, competing `SettingsManager`.
+ *
+ * BUT: live-verified (not just .d.ts-verified) that `session.model` is *never actually
+ * `undefined`*, contradicting agent-session.d.ts's "(may be undefined if not yet
+ * selected)" comment. A curl against a scratch env with zero providers configured
+ * returned `{"provider":"unknown","model":"unknown"}`, not `{provider: null, model:
+ * null}`. Root cause, found in pi-agent-core's dist/agent.js (createMutableAgentState):
+ * `model: initialState?.model ?? DEFAULT_MODEL`, where `DEFAULT_MODEL` is a hardcoded
+ * sentinel object (`{ id: "unknown", provider: "unknown", baseUrl: "", ... }`) — findInitialModel()
+ * returning `model: undefined` still results in `agent.state.model` being this sentinel,
+ * never real `undefined`. So a plain truthiness check on `session.model` is wrong here.
+ * Instead, treat it as "no default set" whenever it doesn't resolve to a real registered
+ * model via `modelRegistry.find()` — robust regardless of the sentinel's exact shape, and
+ * doesn't require importing pi-agent-core's unexported DEFAULT_MODEL to compare against.
+ */
+async function handleGetDefaultModel(_req: Request, res: Response): Promise<void> {
+  const session = await getSharedSession();
+  const { modelRegistry } = await getAgentDeps();
+  const current = session.model;
+  const registered = current && modelRegistry.find(current.provider, current.id);
+  res.json(registered ? { provider: registered.provider, model: registered.id } : { provider: null, model: null });
+}
+
+settingsRouter.get("/default-model", (req, res) => {
+  handleGetDefaultModel(req, res).catch((error: unknown) => {
+    console.error("[settings] unhandled error in GET /default-model", error);
+    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+  });
+});
+
+async function handleSetDefaultModel(req: Request, res: Response): Promise<void> {
+  const { provider, model: modelId } = (req.body ?? {}) as { provider?: unknown; model?: unknown };
+  if (typeof provider !== "string" || typeof modelId !== "string" || !provider || !modelId) {
+    res.status(422).json({ error: "Both provider and model are required." });
+    return;
+  }
+
+  const { modelRegistry } = await getAgentDeps();
+  const found = modelRegistry.find(provider, modelId);
+  if (!found) {
+    res.status(422).json({ error: "Model not found or not available." });
+    return;
+  }
+
+  const session = await getSharedSession();
+  // setModel() is the SDK's own documented write path — "Validates that auth is
+  // configured, saves to session and settings" (agent-session.d.ts) — and it's the
+  // only writer we ever want touching AgentSession/SettingsManager state (see the
+  // open-question resolution above). Its thrown error ("No API key for provider/id")
+  // is an expected, user-correctable condition (the model was found in the registry
+  // but has no configured auth), not a genuine server fault, so it gets its own inner
+  // catch -> 422 here rather than falling through to the outer .catch() -> 500 guard.
+  try {
+    await session.setModel(found);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "No auth configured for that model.";
+    res.status(422).json({ error: message });
+    return;
+  }
+
+  res.json({ provider: found.provider, model: found.id });
+}
+
+settingsRouter.put("/default-model", (req, res) => {
+  handleSetDefaultModel(req, res).catch((error: unknown) => {
+    console.error("[settings] unhandled error in PUT /default-model", error);
     if (!res.headersSent) res.status(500).json({ error: "internal_error" });
   });
 });
