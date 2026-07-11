@@ -1,5 +1,5 @@
 import express, { type Request, type Response, type Router } from "express";
-import type { AuthStorage } from "@earendil-works/pi-coding-agent";
+import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { getAgentDeps } from "../agent/deps.js";
 import { getSharedSession } from "../agent/session.js";
 
@@ -72,6 +72,38 @@ interface ModelOption {
 export const settingsRouter: Router = express.Router();
 
 /**
+ * Wraps an async route handler so its rejection path is defined exactly once.
+ * Every route below previously duplicated this `.catch()` block inline; centralizing
+ * it here means there's one place that decides how an unhandled handler error becomes
+ * a response (log server-side, generic 500, no message leakage, and never double-send
+ * if the handler already wrote a response before throwing).
+ */
+function guarded(label: string, handler: (req: Request, res: Response) => Promise<void>) {
+  return (req: Request, res: Response) => {
+    handler(req, res).catch((error: unknown) => {
+      console.error(`[settings] unhandled error in ${label}`, error);
+      if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+    });
+  };
+}
+
+/**
+ * Count available models for a single provider. Used by the POST/DELETE
+ * /providers/:id handlers, which only ever need one provider's count.
+ *
+ * NOT used by GET /providers' N-provider loop: that route builds a
+ * provider -> count map in a single grouping pass over `getAvailable()` to stay
+ * O(models) instead of O(providers * models) — swapping it for repeated calls to
+ * this helper would reintroduce that quadratic behavior across ~33 built-in
+ * providers, so it deliberately keeps its own optimized code path.
+ */
+function countModelsForProvider(modelRegistry: ModelRegistry, id: string): number {
+  return modelRegistry.getAvailable().filter((m) => m.provider === id).length;
+}
+
+// ==================== Provider routes ====================
+
+/**
  * Build a single provider's status. Shared by the GET /providers loop and the
  * POST/DELETE /providers/:id handlers (which only ever need one entry) so the
  * source->public-enum translation logic below lives in exactly one place.
@@ -134,12 +166,7 @@ async function handleGetProviders(_req: Request, res: Response): Promise<void> {
   res.json({ providers });
 }
 
-settingsRouter.get("/providers", (req, res) => {
-  handleGetProviders(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in GET /providers", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.get("/providers", guarded("GET /providers", handleGetProviders));
 
 async function handleConnectProvider(req: Request, res: Response): Promise<void> {
   const { id } = req.params as { id: string };
@@ -180,16 +207,11 @@ async function handleConnectProvider(req: Request, res: Response): Promise<void>
   // naturally the first time the agent actually uses that provider, not here.
   modelRegistry.refresh();
 
-  const modelCount = modelRegistry.getAvailable().filter((m) => m.provider === id).length;
+  const modelCount = countModelsForProvider(modelRegistry, id);
   res.json({ provider: buildProviderStatus(id, displayName, authStorage, modelCount) });
 }
 
-settingsRouter.post("/providers/:id", (req, res) => {
-  handleConnectProvider(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in POST /providers/:id", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.post("/providers/:id", guarded("POST /providers/:id", handleConnectProvider));
 
 async function handleDisconnectProvider(req: Request, res: Response): Promise<void> {
   const { id } = req.params as { id: string };
@@ -202,16 +224,13 @@ async function handleDisconnectProvider(req: Request, res: Response): Promise<vo
   const { authStorage, modelRegistry } = await getAgentDeps();
   authStorage.remove(id);
 
-  const modelCount = modelRegistry.getAvailable().filter((m) => m.provider === id).length;
+  const modelCount = countModelsForProvider(modelRegistry, id);
   res.json({ provider: buildProviderStatus(id, displayName, authStorage, modelCount) });
 }
 
-settingsRouter.delete("/providers/:id", (req, res) => {
-  handleDisconnectProvider(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in DELETE /providers/:id", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.delete("/providers/:id", guarded("DELETE /providers/:id", handleDisconnectProvider));
+
+// ==================== Model-defaults routes ====================
 
 async function handleGetModels(_req: Request, res: Response): Promise<void> {
   const { modelRegistry } = await getAgentDeps();
@@ -224,12 +243,7 @@ async function handleGetModels(_req: Request, res: Response): Promise<void> {
   res.json({ models });
 }
 
-settingsRouter.get("/models", (req, res) => {
-  handleGetModels(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in GET /models", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.get("/models", guarded("GET /models", handleGetModels));
 
 /*
  * Open question resolved (Task 3, per TASKS.md's "Before writing code" instruction):
@@ -278,12 +292,7 @@ async function handleGetDefaultModel(_req: Request, res: Response): Promise<void
   res.json(registered ? { provider: registered.provider, model: registered.id } : { provider: null, model: null });
 }
 
-settingsRouter.get("/default-model", (req, res) => {
-  handleGetDefaultModel(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in GET /default-model", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.get("/default-model", guarded("GET /default-model", handleGetDefaultModel));
 
 async function handleSetDefaultModel(req: Request, res: Response): Promise<void> {
   const { provider, model: modelId } = (req.body ?? {}) as { provider?: unknown; model?: unknown };
@@ -303,24 +312,31 @@ async function handleSetDefaultModel(req: Request, res: Response): Promise<void>
   // setModel() is the SDK's own documented write path — "Validates that auth is
   // configured, saves to session and settings" (agent-session.d.ts) — and it's the
   // only writer we ever want touching AgentSession/SettingsManager state (see the
-  // open-question resolution above). Its thrown error ("No API key for provider/id")
-  // is an expected, user-correctable condition (the model was found in the registry
-  // but has no configured auth), not a genuine server fault, so it gets its own inner
-  // catch -> 422 here rather than falling through to the outer .catch() -> 500 guard.
+  // open-question resolution above). Its *auth-validation* failure ("No API key for
+  // {provider}/{id}", thrown verbatim from agent-session.js's setModel() — confirmed
+  // by reading the SDK source, not just its .d.ts) is an expected, user-correctable
+  // condition (the model was found in the registry but has no configured auth), not a
+  // genuine server fault, so that specific error gets its own inner catch -> 422 here.
+  //
+  // setModel() can ALSO throw for unrelated reasons — most notably it calls
+  // sessionManager.appendModelChange(), a synchronous, unguarded session-file write
+  // that can fail on disk-full/permissions/moved-directory infra faults. Those are not
+  // "fix your input" conditions, and their raw fs error `.message` can embed an
+  // absolute filesystem path we don't want to hand back to the client. So only the
+  // known auth-validation shape gets converted to 422 here; anything else is
+  // re-thrown to fall through to the outer `guarded()` .catch(), which already logs
+  // server-side and returns a generic, non-leaking 500.
   try {
     await session.setModel(found);
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : "No auth configured for that model.";
-    res.status(422).json({ error: message });
-    return;
+    if (error instanceof Error && error.message.startsWith("No API key for")) {
+      res.status(422).json({ error: error.message });
+      return;
+    }
+    throw error;
   }
 
   res.json({ provider: found.provider, model: found.id });
 }
 
-settingsRouter.put("/default-model", (req, res) => {
-  handleSetDefaultModel(req, res).catch((error: unknown) => {
-    console.error("[settings] unhandled error in PUT /default-model", error);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
-  });
-});
+settingsRouter.put("/default-model", guarded("PUT /default-model", handleSetDefaultModel));
