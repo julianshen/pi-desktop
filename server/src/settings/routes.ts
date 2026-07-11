@@ -151,6 +151,12 @@ async function handleConnectProvider(req: Request, res: Response): Promise<void>
 
   const { authStorage, modelRegistry } = await getAgentDeps();
 
+  // authStorage.set() persists to disk before refresh() runs below. If refresh()
+  // ever throws, the outer .catch() returns 500 but the credential is already
+  // saved — a partial-write state. In practice this is believed unreachable:
+  // refresh()'s internal models.json parsing swallows its own errors rather than
+  // throwing (see model-registry.js's loadModels()), so this route has no known
+  // path to actually hit it. Documented rather than silently possible.
   authStorage.set(id, { type: "api_key", key: apiKey });
 
   // Connect is optimistic (revised during /tgd-develop — see PRD.md's US-06 revision
