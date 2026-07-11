@@ -1,0 +1,38 @@
+{
+  "name": "pi-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -n web,server -c blue,green \"vite\" \"npm run dev -w server\"",
+    "build": "tsc && vite build && npm run build -w server",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "server:dev": "npm run dev -w server",
+    "server:build": "npm run build -w server",
+    "sidecar:build": "npm run sidecar -w server",
+    "lint": "tsc --noEmit && npm run lint -w server",
+    "typecheck": "tsc --noEmit && npm run typecheck -w server"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-shell": "^2",
+    "@copilotkit/react-core": "^1.62.3",
+    "@copilotkit/react-ui": "^1.62.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4",
+    "@tauri-apps/cli": "^2",
+    "concurrently": "^9.1.2"
+  }
+}
