@@ -1,5 +1,4 @@
-import express, { type Router } from "express";
-import type { ApiKeyCredential } from "@earendil-works/pi-coding-agent";
+import express, { type Request, type Response, type Router } from "express";
 import { getAgentDeps } from "../agent/deps.js";
 
 /**
@@ -63,9 +62,16 @@ interface ProviderStatus {
 
 export const settingsRouter: Router = express.Router();
 
-settingsRouter.get("/providers", async (_req, res) => {
+async function handleGetProviders(_req: Request, res: Response): Promise<void> {
   const { authStorage, modelRegistry } = await getAgentDeps();
   const availableModels = modelRegistry.getAvailable();
+
+  // Single grouping pass instead of a `.filter()` per provider inside the `.map()` below
+  // (that would be O(providers * models) over the ~33 built-in providers).
+  const modelCountByProvider = new Map<string, number>();
+  for (const model of availableModels) {
+    modelCountByProvider.set(model.provider, (modelCountByProvider.get(model.provider) ?? 0) + 1);
+  }
 
   const providers: ProviderStatus[] = Object.entries(BUILT_IN_PROVIDER_DISPLAY_NAMES).map(
     ([id, displayName]) => {
@@ -93,18 +99,24 @@ settingsRouter.get("/providers", async (_req, res) => {
           source = "oauth";
         } else {
           source = "api_key";
-          const apiKeyCredential = credential as ApiKeyCredential;
-          maskedKey = `…${apiKeyCredential.key.slice(-4)}`;
+          maskedKey = `…${credential.key.slice(-4)}`;
         }
       } else if (authStatus.source === "environment") {
         source = "env";
       }
 
-      const modelCount = availableModels.filter((m) => m.provider === id).length;
+      const modelCount = modelCountByProvider.get(id) ?? 0;
 
       return { id, displayName, configured, source, modelCount, maskedKey };
     },
   );
 
   res.json({ providers });
+}
+
+settingsRouter.get("/providers", (req, res) => {
+  handleGetProviders(req, res).catch((error: unknown) => {
+    console.error("[settings] unhandled error in GET /providers", error);
+    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+  });
 });
