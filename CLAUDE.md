@@ -47,8 +47,9 @@ Three processes make up the app:
    calls the server directly over HTTP.
 2. **`server/`** — a Bun/TypeScript HTTP server that owns all agent logic (pi session, tools,
    MCP, scheduler, memory). See below.
-3. **`src/`** — a React/Vite frontend that is just a CopilotKit chat surface (`src/App.tsx`)
-   pointed at the server's `/copilotkit` endpoint. No Tauri IPC is used for the chat protocol.
+3. **`src/`** — a React/Vite frontend implementing the full "pi agent desktop" shell (see
+   "Frontend shell" below), talking to the server's `/copilotkit` endpoint for chat. No Tauri IPC
+   is used for the chat protocol.
 
 **Dev vs. packaged startup differ**, which matters if you touch process lifecycle: in dev,
 `tauri.conf.json`'s `beforeDevCommand` (`npm run dev`) starts the server as a plain concurrent
@@ -102,6 +103,32 @@ despite the docs showing that import — use `resolveCliModel` from
 - Skills need no code — `createAgentSession({ cwd: workspaceDir, agentDir })` gives pi's own
   `DefaultResourceLoader` its standard discovery paths (`<workspaceDir>/.pi/skills/`,
   `<agentDir>/skills/`, etc.).
+
+### Frontend shell (`src/`)
+
+Ported from a Claude Design mockup ("PI Agent Desktop") using the **Industry** design system —
+steel-blue accent on a light ground, Barlow Condensed/Barlow fonts, hairline-bordered "blueprint"
+cards with `+` corner registration marks (`src/styles/design-system.css`, `Blueprint` component).
+Layout: `TitleBar` (traffic lights + search) → `IconRail` (Chat/Store/Tasks/Code/MCP/Skills +
+Settings gear) → `Sidebar` (conversations/filters/settings-nav, dispatched per view) →
+`MainHeader` + the active view → an optional `ArtifactCanvas` panel (chat view only). All nav/UI
+state lives in `state/useShellState.ts`, one hook mirroring the mockup's state machine.
+
+**Only the Chat view (`views/ChatView.tsx`) is wired to a real backend** — via
+`useCopilotChat()`'s `visibleMessages`/`appendMessage` (the public hook only exposes this legacy
+non-AG-UI-native API; the `messages`/`sendMessage` fields need the Enterprise
+`useCopilotChatHeadless_c` hook). The other five views (Artifact Store, Scheduled Tasks,
+Coding Agents, MCP Servers, Skills Library) plus Settings render the mockup's own sample data from
+`data/mockData.ts` — there is no backend for those yet (no artifact storage, no coding-agent
+runner, no skills registry, no provider-management API). Wire them to real endpoints as those land
+server-side; don't mistake the sample data for real state.
+
+**Gotcha already hit once, don't reintroduce it:** the CopilotKit endpoint must be mounted at
+Express root (`app.use(createCopilotEndpoint(baseUrl))`), *not* under a path
+(`app.use("/copilotkit", ...)`). `copilotRuntimeNodeExpressEndpoint`'s internal router is built
+with `basePath: options.endpoint` ("/copilotkit") and matches against the raw `req.url` — but
+Express strips the mount prefix from `req.url` for path-scoped `app.use()`, so the two disagree and
+every request 404s. Mounting at root keeps `req.url` as the full path.
 
 ### Data directories (all under `~/.pi-desktop` by default, overridable via `PI_DESKTOP_*` env vars)
 

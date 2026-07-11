@@ -35,3 +35,6 @@ server/dist
 # tGD tooling — symlinks into a machine-local sibling directory ($TGD_DIR)
 /.codegraph
 /.understand-anything
+
+# Claude Code runtime state (session locks, machine-local)
+/.claude

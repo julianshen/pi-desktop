@@ -23,8 +23,11 @@ async function main(): Promise<void> {
 
   const baseUrl = `http://${env.host}:${env.port}`;
 
-  // CopilotKit's own runtime does its own body parsing (GraphQL over HTTP); mount unparsed.
-  app.use("/copilotkit", createCopilotEndpoint(baseUrl));
+  // Mounted at root (not app.use("/copilotkit", ...)): the handler's internal router is built
+  // with basePath: "/copilotkit" and reads the raw req.url, which Express already strips of the
+  // mount prefix for path-scoped app.use() — mounting at root keeps req.url as the full path so
+  // the two agree. CopilotKit's own runtime does its own body parsing; mount unparsed.
+  app.use(createCopilotEndpoint(baseUrl));
 
   app.listen(env.port, env.host, () => {
     console.log(`[pi-desktop] server listening on ${baseUrl}`);
