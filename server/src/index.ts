@@ -4,6 +4,7 @@ import { env } from "./config/env.js";
 import { handleAguiRun } from "./agui/adapter.js";
 import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
+import { settingsRouter } from "./settings/routes.js";
 
 async function main(): Promise<void> {
   const app = express();
@@ -20,6 +21,13 @@ async function main(): Promise<void> {
       if (!res.headersSent) res.status(500).end();
     });
   });
+
+  // Settings routes (provider status, connect/disconnect, model selection). Mounted as its
+  // own app.use() call, after /health and /agui and before the CopilotKit catch-all mount
+  // below (that mount is unauthenticated/path-agnostic per its own comment, so anything
+  // that needs its own routing must be registered before it or Express's router falls
+  // through to CopilotKit's handler instead).
+  app.use("/api/settings", express.json(), settingsRouter);
 
   const baseUrl = `http://${env.host}:${env.port}`;
 
