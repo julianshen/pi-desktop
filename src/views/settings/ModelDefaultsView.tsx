@@ -1,86 +1,201 @@
+import { useEffect, useState } from "react";
 import { Blueprint } from "../../components/Blueprint";
 
+/**
+ * Same env var + fallback App.tsx uses for the CopilotKit runtime URL
+ * (`VITE_COPILOTKIT_RUNTIME_URL`, default `http://127.0.0.1:4319/copilotkit`) —
+ * stripped of the `/copilotkit` suffix to get the server's plain HTTP base for
+ * REST calls. Deliberately derived from that same source rather than a second,
+ * independently-hardcoded host/port default.
+ */
+const SERVER_BASE_URL = (import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit").replace(
+  /\/copilotkit\/?$/,
+  "",
+);
+
+interface ModelOption {
+  provider: string;
+  id: string;
+  name: string;
+  contextWindow?: number;
+}
+
+interface DefaultModel {
+  provider: string | null;
+  model: string | null;
+}
+
+const mutedText = { color: "color-mix(in srgb, var(--color-text) 55%, transparent)" };
+
 export function ModelDefaultsView() {
+  const [models, setModels] = useState<ModelOption[]>([]);
+  const [current, setCurrent] = useState<DefaultModel>({ provider: null, model: null });
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [hoveredKey, setHoveredKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const [modelsRes, defaultRes] = await Promise.all([
+          fetch(`${SERVER_BASE_URL}/api/settings/models`),
+          fetch(`${SERVER_BASE_URL}/api/settings/default-model`),
+        ]);
+        if (!modelsRes.ok || !defaultRes.ok) throw new Error("request_failed");
+        const modelsBody = (await modelsRes.json()) as { models: ModelOption[] };
+        const defaultBody = (await defaultRes.json()) as DefaultModel;
+        if (cancelled) return;
+        setModels(modelsBody.models);
+        setCurrent(defaultBody);
+      } catch {
+        if (!cancelled) setLoadError("Couldn't load model settings — is the server running?");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const query = search.trim().toLowerCase();
+  // Mirrors the conservative sketch's renderModels() filter exactly:
+  // m.name.toLowerCase().includes(q) || m.provider.toLowerCase().includes(q)
+  const filtered = models.filter((m) => m.name.toLowerCase().includes(query) || m.provider.toLowerCase().includes(query));
+
+  const currentModelOption = models.find((m) => m.provider === current.provider && m.id === current.model);
+
+  async function pickModel(m: ModelOption) {
+    const key = `${m.provider}/${m.id}`;
+    setSavingKey(key);
+    setSaveError(null);
+    try {
+      const res = await fetch(`${SERVER_BASE_URL}/api/settings/default-model`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: m.provider, model: m.id }),
+      });
+      const body = (await res.json()) as { provider?: string; model?: string; error?: string };
+      if (!res.ok) {
+        setSaveError(body.error ?? "Could not set this as the default model.");
+        return;
+      }
+      setCurrent({ provider: body.provider ?? m.provider, model: body.model ?? m.id });
+    } catch {
+      setSaveError("Could not reach the server — check it's running.");
+    } finally {
+      setSavingKey(null);
+    }
+  }
+
   return (
     <div style={{ maxWidth: 780 }}>
       <div style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 21, marginBottom: 3 }}>Model defaults</div>
-      <p style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 55%, transparent)", margin: "0 0 18px" }}>
-        Applied to new conversations. Any chat can override these from the model picker.
+      <p style={{ fontSize: 13, margin: "0 0 18px", ...mutedText }}>
+        Applied to new conversations. Any chat can override this from the model picker.
       </p>
+
       <Blueprint style={{ padding: 20, background: "transparent" }}>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
-          <div className="field">
-            <label>Default model</label>
-            <select className="input">
-              <option>pi-2 Sonnet</option>
-              <option>pi-2 Opus</option>
-              <option>pi-2 Mini</option>
-              <option>pi-code-1</option>
-            </select>
-          </div>
-          <div className="field">
-            <label>Fallback model</label>
-            <select className="input">
-              <option>pi-2 Mini</option>
-              <option>pi-2 Sonnet</option>
-              <option>gpt-4o-mini</option>
-            </select>
-          </div>
-          <div className="field">
-            <label>Temperature</label>
-            <div className="seg" style={{ width: "100%" }}>
-              {["Precise", "Balanced", "Creative"].map((label) => (
-                <label key={label} className="seg-opt" style={{ flex: 1, justifyContent: "center" }}>
-                  <input type="radio" name="temp" defaultChecked={label === "Balanced"} />
-                  {label}
-                </label>
-              ))}
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 10,
+            padding: 12,
+            background: "var(--color-accent-100)",
+            border: "1px solid var(--color-accent-300)",
+            marginBottom: 14,
+          }}
+        >
+          {loading ? (
+            <span style={{ fontSize: 13 }}>Loading current default…</span>
+          ) : current.provider && current.model ? (
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", ...mutedText }}>
+                Current default
+              </div>
+              <div style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 15 }}>
+                {currentModelOption?.name ?? current.model}{" "}
+                <span style={{ fontSize: 11, fontWeight: 400, fontFamily: "var(--font-body)", ...mutedText }}>
+                  · {current.provider}
+                </span>
+              </div>
             </div>
-          </div>
-          <div className="field">
-            <label>Max output tokens</label>
-            <input className="input" defaultValue="4096" />
-          </div>
-          <div className="field">
-            <label>Top-p</label>
-            <input className="input" defaultValue="1.0" />
-          </div>
-          <div className="field">
-            <label>Context window</label>
-            <input className="input" defaultValue="200,000" readOnly style={{ color: "color-mix(in srgb, var(--color-text) 55%, transparent)" }} />
-          </div>
-          <div className="field">
-            <label>Streaming</label>
-            <div className="seg" style={{ width: "100%" }}>
-              <label className="seg-opt" style={{ flex: 1, justifyContent: "center" }}>
-                <input type="radio" name="stream" defaultChecked />
-                On
-              </label>
-              <label className="seg-opt" style={{ flex: 1, justifyContent: "center" }}>
-                <input type="radio" name="stream" />
-                Off
-              </label>
+          ) : (
+            <span style={{ fontSize: 13 }}>No default model set yet — pick one below.</span>
+          )}
+        </div>
+
+        {loadError && <p style={{ fontSize: 13, color: "var(--color-danger)", margin: "0 0 14px" }}>{loadError}</p>}
+
+        <div className="field" style={{ marginBottom: 10 }}>
+          <label>Default model</label>
+          <input
+            className="input"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search available models…"
+          />
+        </div>
+
+        {saveError && <p style={{ fontSize: 13, color: "var(--color-danger)", margin: "0 0 10px" }}>{saveError}</p>}
+
+        <div style={{ border: "1px solid var(--color-divider)", maxHeight: 320, overflowY: "auto" }}>
+          {!loading && models.length === 0 ? (
+            <div style={{ padding: 14, fontSize: 13, ...mutedText }}>
+              No available models match your connected providers.
             </div>
-          </div>
-          <div className="field">
-            <label>Tool use</label>
-            <div className="seg" style={{ width: "100%" }}>
-              {["Auto", "Manual", "Off"].map((label) => (
-                <label key={label} className="seg-opt" style={{ flex: 1, justifyContent: "center" }}>
-                  <input type="radio" name="tools" defaultChecked={label === "Auto"} />
-                  {label}
-                </label>
-              ))}
-            </div>
-          </div>
-          <div className="field" style={{ gridColumn: "1 / -1" }}>
-            <label>System prompt</label>
-            <textarea
-              className="input"
-              style={{ minHeight: 110 }}
-              defaultValue="You are pi, a precise, tool-using agent. Prefer verified data from connected MCP servers. Cite sources. Ask before destructive or external actions."
-            />
-          </div>
+          ) : !loading && filtered.length === 0 ? (
+            <div style={{ padding: 14, fontSize: 13, ...mutedText }}>No models match your search.</div>
+          ) : (
+            filtered.map((m) => {
+              const key = `${m.provider}/${m.id}`;
+              const isSelected = m.provider === current.provider && m.id === current.model;
+              const isHovered = hoveredKey === key;
+              const isSaving = savingKey === key;
+              return (
+                <div
+                  key={key}
+                  onClick={() => {
+                    if (!savingKey) void pickModel(m);
+                  }}
+                  onMouseEnter={() => setHoveredKey(key)}
+                  onMouseLeave={() => setHoveredKey((k) => (k === key ? null : k))}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    padding: "10px 12px",
+                    fontSize: 13,
+                    cursor: savingKey ? "default" : "pointer",
+                    borderBottom: "1px solid color-mix(in srgb, var(--color-text) 8%, transparent)",
+                    background: isSelected
+                      ? "var(--color-accent-100)"
+                      : isHovered
+                        ? "color-mix(in srgb, var(--color-text) 4%, transparent)"
+                        : "transparent",
+                    opacity: savingKey && !isSaving ? 0.6 : 1,
+                  }}
+                >
+                  <span>
+                    {m.name}{" "}
+                    <span style={{ fontSize: 11, ...mutedText }}>
+                      {m.provider}
+                      {m.contextWindow ? ` · ${Math.round(m.contextWindow / 1000)}k ctx` : ""}
+                    </span>
+                  </span>
+                  {isSaving ? <span style={{ fontSize: 11, ...mutedText }}>Saving…</span> : isSelected ? <span aria-hidden>✓</span> : null}
+                </div>
+              );
+            })
+          )}
         </div>
       </Blueprint>
     </div>
