@@ -153,32 +153,18 @@ async function handleConnectProvider(req: Request, res: Response): Promise<void>
 
   authStorage.set(id, { type: "api_key", key: apiKey });
 
-  // Per TASKS.md Task 2 / SPEC.md's API Contract: refresh the registry, then check
-  // getError() for a validation failure and roll back if one is found.
-  //
-  // IMPORTANT (investigated against node_modules/@earendil-works/pi-coding-agent's
-  // dist/core/model-registry.js, not assumed): `refresh()` only reloads/re-parses
+  // Connect is optimistic (revised during /tgd-develop — see PRD.md's US-06 revision
+  // note and SPEC.md's POST /providers/:id contract): pi's SDK has no live
+  // credential-validation capability anywhere. `refresh()` only reloads/re-parses
   // <agentDir>/models.json (custom provider/model overrides) and rebuilds the
-  // in-memory model list from that + the built-in catalog; `getError()` returns a
-  // single **global** `string | undefined` — "any error from loading models.json" —
-  // it is not scoped per-provider and has nothing to do with the credential we just
-  // set. Neither AuthStorage nor ModelRegistry makes a live network call anywhere in
-  // this SDK to confirm a key actually authenticates with the provider (confirmed by
-  // reading both classes end-to-end: `set()` just writes JSON to disk, `getApiKey()`/
-  // `hasConfiguredAuth()` only check presence). So in practice this call will only
-  // ever roll back when models.json itself is malformed — never because `apiKey` is
-  // wrong. A syntactically-well-formed but bogus key will pass through as
-  // `configured: true`. This is a real gap versus AC-2.2 that must be flagged to a
-  // human rather than silently "fixed" by adding an out-of-scope network probe call;
-  // implemented here exactly per the documented contract, with this gap called out.
+  // in-memory model list from that + the built-in catalog — it makes no network call
+  // to confirm the key we just set actually authenticates with the provider. We still
+  // call it here so the newly-connected provider's models become visible to a
+  // subsequent GET /models, not as a validation step. There is no getError()-based
+  // rollback: once authStorage.set() + refresh() succeed without throwing, the
+  // provider is always reported Connected. A genuinely bad key is discovered
+  // naturally the first time the agent actually uses that provider, not here.
   modelRegistry.refresh();
-  const loadError = modelRegistry.getError();
-  if (loadError) {
-    console.error(`[settings] provider validation failed for "${id}"`, loadError);
-    authStorage.remove(id);
-    res.status(422).json({ error: "Could not verify this key. Please check it and try again." });
-    return;
-  }
 
   const modelCount = modelRegistry.getAvailable().filter((m) => m.provider === id).length;
   res.json({ provider: buildProviderStatus(id, displayName, authStorage, modelCount) });
