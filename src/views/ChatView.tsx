@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useCopilotChat } from "@copilotkit/react-core";
+import { useCopilotChat, useThreads } from "@copilotkit/react-core";
 import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
 import { Blueprint } from "../components/Blueprint";
 import { AttachIcon, SendIcon } from "../components/icons";
@@ -7,21 +7,49 @@ import { AttachIcon, SendIcon } from "../components/icons";
 const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
 
-export function ChatView({ model }: { model: string }) {
-  // Task 12: verified against the installed @copilotkit/react-core (1.62.3) dist/index.mjs
-  // that `useCopilotChat`'s runtime implementation destructures/returns only
-  // { visibleMessages, appendMessage, reloadMessages, stopGeneration, reset, isLoading,
-  // isAvailable, runChatCompletion, mcpServers, setMcpServers } — `UseCopilotChatOptions.id`
-  // is declared in the .d.ts but is never read by useCopilotChatInternal, and neither
-  // `agent` nor `threadId` are exposed on this hook's return despite appearing on the
-  // richer UseCopilotChatReturn$1 type (that's the Enterprise `useCopilotChatHeadless_c`
-  // hook's shape, not this one's). So there is no real thread-scoping parameter to pass
-  // here; App.tsx instead remounts this component via `key={state.activeConv}` so at
-  // least this component's own local UI state (draft text, scroll position) resets per
-  // conversation switch. See Task 12's completion report for the caveat this doesn't
-  // fully guarantee: with the installed CopilotKit version, the underlying agent handle
-  // is a singleton owned above this component (registered once per `agentId` in
-  // CopilotKit core), so it isn't itself recreated by this remount.
+export function ChatView({ model, conversationId }: { model: string; conversationId: string }) {
+  // Task 12 CRITICAL BUG FIX (found via live E2E reproduction, not just static review):
+  // `useCopilotChat()` (verified against the installed @copilotkit/react-core 1.62.3,
+  // dist/index.mjs) returns only { visibleMessages, appendMessage, reloadMessages,
+  // stopGeneration, reset, isLoading, isAvailable, runChatCompletion, mcpServers,
+  // setMcpServers } — no `agent`/`threadId`. Task 12's original implementation concluded
+  // from that gap that there was "no real thread-scoping parameter to pass" and relied
+  // solely on App.tsx's `key={state.activeConv}` remount. That's insufficient: the
+  // underlying `agent` object is a singleton owned by the un-remounted <CopilotKit> in
+  // App.tsx (`copilotkit.getAgent(agentId)`, see node_modules/@copilotkit/react-core/dist
+  // /copilotkit-ympAovXs.mjs's `useAgent`), and `@ag-ui/client`'s `HttpAgent` sends
+  // whatever `agent.threadId` currently holds on every request — remounting ChatView does
+  // not touch that field. Live-verified impact: two different conversations both sent the
+  // identical threadId to /agui, so every conversation funneled into ONE shared
+  // server-side session (server/src/agui/adapter.ts's `input.threadId ?? "default"`).
+  //
+  // The fix: `useThreads()` (ThreadsContext, installed once at the top of the <CopilotKit>
+  // tree by the library itself) IS exported publicly from @copilotkit/react-core — it's
+  // just not part of `useCopilotChat`'s own return type, so Task 12 missed it. Its
+  // `setThreadId()` marks the id "explicit" on that same top-level context; that value
+  // flows CopilotKitInternal -> CopilotChatConfigurationProvider -> `useAgent()`'s own
+  // effect, which pushes it onto `agent.threadId`, and because
+  // `useCopilotChatInternal`'s connect-effect also depends on that same config threadId,
+  // the id change forces a reconnect whose `isFreshRestore` branch
+  // (@copilotkit/core's RunHandler.connectAgent) clears the previous thread's stale
+  // messages. Net effect: distinct conversations now get distinct, correctly-routed
+  // threadIds, and switching away from a conversation no longer leaves its messages
+  // bleeding into the next one.
+  //
+  // Known remaining gap (does NOT fully satisfy "switching back replays prior history"):
+  // the installed `HttpAgent` has no `connect()` implementation (@ag-ui/client's
+  // `AbstractAgent.connect()` throws `AGUIConnectNotImplementedError` unless a transport
+  // overrides it), and this server exposes no message-history endpoint — so the
+  // isFreshRestore clear above has nothing to refill from. Switching back to a
+  // conversation resets the visible transcript to empty even though the server's pi
+  // session still has full history and will use it correctly on the next turn. Fixing
+  // that needs new backend surface (a history endpoint + a way to seed `agent.messages`),
+  // tracked separately — out of scope for this routing fix.
+  const { setThreadId } = useThreads();
+  useEffect(() => {
+    setThreadId(conversationId);
+  }, [conversationId, setThreadId]);
+
   const { visibleMessages: rawMessages, appendMessage, isLoading } = useCopilotChat();
   const visibleMessages = rawMessages ?? [];
   const [draft, setDraft] = useState("");

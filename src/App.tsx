@@ -75,10 +75,15 @@ function App() {
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
               <MainHeader state={state} actions={actions} conversations={conversations} />
 
-              {/* Task 12: `key={state.activeConv}` forces ChatView to remount on conversation
-                  switch — see ChatView.tsx's call-site comment for why (the installed
-                  @copilotkit/react-core's useCopilotChat has no working thread-scoping param). */}
-              {state.view === "chat" && <ChatView key={state.activeConv} model={state.model} />}
+              {/* Task 12 critical-bug fix: `key={state.activeConv}` alone does NOT scope which
+                  server-side thread ChatView talks to — CopilotKit's `agent` singleton (owned by
+                  the un-remounted <CopilotKit> above) previously kept sending the SAME threadId
+                  for every conversation. ChatView now also receives `conversationId` and pushes it
+                  onto that singleton via `useThreads().setThreadId()` (see ChatView.tsx's call-site
+                  comment for the full mechanism). The `key` remount is kept alongside it — it still
+                  usefully resets ChatView's own local UI state (draft text, scroll position) and the
+                  connect-effect's ref bookkeeping per switch. */}
+              {state.view === "chat" && <ChatView key={state.activeConv} model={state.model} conversationId={state.activeConv} />}
               {state.view === "artifacts" && <ArtifactStoreView />}
               {state.view === "scheduled" && (
                 <ScheduledTasksView
