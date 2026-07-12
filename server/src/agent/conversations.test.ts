@@ -124,6 +124,42 @@ describe("conversations registry", () => {
     expect(first).toBe(second);
   });
 
+  // Task 7 review fix (AC-7.3 wiring gap): AC-7.3 in artifacts/tools.test.ts only
+  // proves createArtifactTools(id)'s own execute() logic works in isolation -- it
+  // never calls through createSession()'s actual wiring line
+  // (`customTools: [...customTools, ...createArtifactTools(id)]`), so a regression
+  // there (e.g. replacing instead of appending, or dropping either side) would pass
+  // the whole suite undetected. This proves the *real* wiring using the SDK's own
+  // introspection API (AgentSession#getActiveToolNames/getToolDefinition, see
+  // node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts)
+  // against a session built by getOrCreateSession() itself, not a hand-rolled copy
+  // of createSession()'s internals.
+  test("Task 7 review fix (AC-7.3 wiring gap): getOrCreateSession() appends publish_artifact onto getAgentDeps()'s customTools, not in place of them", async () => {
+    const meta = conversations.createConversation("wiring-gap conversation");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    const activeToolNames = session.getActiveToolNames();
+
+    // The artifact tool from Task 7 must be present.
+    expect(activeToolNames).toContain("publish_artifact");
+    expect(session.getToolDefinition("publish_artifact")).toBeDefined();
+
+    // At least one tool from getAgentDeps()'s pre-existing customTools bundle
+    // (memory/computer-use/MCP) must still be present too -- proving append, not
+    // replace. In this scratch test env (no MCP servers configured, no real
+    // computer-use dependency), that bundle is exactly the memory tools built
+    // synchronously by createMemoryTools() (see agent/deps.ts), so "remember" and
+    // "recall" are asserted directly rather than assumed generically.
+    const { customTools } = await (await import("./deps.js")).getAgentDeps();
+    const preExistingToolNames = customTools.map((tool) => tool.name);
+    expect(preExistingToolNames).toEqual(expect.arrayContaining(["remember", "recall"]));
+
+    for (const name of preExistingToolNames) {
+      expect(activeToolNames).toContain(name);
+      expect(session.getToolDefinition(name)).toBeDefined();
+    }
+  });
+
   // Task 1 fix (model-sourcing gap): createSession() must resolve a conversation's
   // stored modelId via models.ts's resolveModelById rather than always falling back
   // to getAgentDeps()'s env-var default. Verified end-to-end through
