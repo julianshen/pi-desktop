@@ -73,9 +73,12 @@ function App() {
 
           <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
-              <MainHeader state={state} actions={actions} />
+              <MainHeader state={state} actions={actions} conversations={conversations} />
 
-              {state.view === "chat" && <ChatView model={state.model} />}
+              {/* Task 12: `key={state.activeConv}` forces ChatView to remount on conversation
+                  switch — see ChatView.tsx's call-site comment for why (the installed
+                  @copilotkit/react-core's useCopilotChat has no working thread-scoping param). */}
+              {state.view === "chat" && <ChatView key={state.activeConv} model={state.model} />}
               {state.view === "artifacts" && <ArtifactStoreView />}
               {state.view === "scheduled" && (
                 <ScheduledTasksView
