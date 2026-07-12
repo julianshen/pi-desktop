@@ -18,17 +18,22 @@ interface StubSessionEvent {
 
 interface StubSession {
   isStreaming: boolean;
+  unsubscribed: boolean;
   subscribe(cb: (event: StubSessionEvent) => void): () => void;
   prompt(text: string, opts?: unknown): Promise<void>;
 }
 
 function makeStubSession(): StubSession {
   const listeners = new Set<(event: StubSessionEvent) => void>();
-  return {
+  const session: StubSession = {
     isStreaming: false,
+    unsubscribed: false,
     subscribe(cb) {
       listeners.add(cb);
-      return () => listeners.delete(cb);
+      return () => {
+        listeners.delete(cb);
+        session.unsubscribed = true;
+      };
     },
     async prompt() {
       const emit = (event: StubSessionEvent) => listeners.forEach((cb) => cb(event));
@@ -41,7 +46,14 @@ function makeStubSession(): StubSession {
       emit({ type: "agent_end" });
     },
   };
+  return session;
 }
+
+/**
+ * Task 3 fix (review finding): id that makes the mocked touchConversation() below
+ * throw, simulating a registry write failure during the agent_end bookkeeping step.
+ */
+const THROW_ON_TOUCH_ID = "conv-touch-throws";
 
 const sessionsById = new Map<string, StubSession>();
 const metaById = new Map<string, { title: string }>();
@@ -61,6 +73,9 @@ mock.module("../agent/conversations.js", () => ({
   getConversationMeta: (id: string) => metaById.get(id) ?? { title: "New conversation" },
   touchConversation: (id: string, patch?: unknown) => {
     touchConversationCalls.push([id, patch]);
+    if (id === THROW_ON_TOUCH_ID) {
+      throw new Error("simulated registry write failure");
+    }
     const existing = metaById.get(id) ?? { title: "New conversation" };
     metaById.set(id, { ...existing, ...(patch as { title?: string } | undefined) });
   },
@@ -173,5 +188,31 @@ describe("handleAguiRun", () => {
     await handleAguiRun(makeReq(makeInput({ threadId: "conv-named" })), res as unknown as Response);
 
     expect(touchConversationCalls).toEqual([["conv-named", undefined]]);
+  });
+
+  // Task 3 fix (review finding): a bookkeeping failure inside the agent_end handler
+  // (touchConversationAfterTurn -> touchConversation throwing, e.g. a registry write
+  // failure) must not prevent the SSE stream from being torn down cleanly.
+  // unsubscribe() and finish()/res.end() must still run, or the connection leaks.
+  test("Task 3 fix: touchConversation throwing during agent_end still tears down the stream (unsubscribe + finish)", async () => {
+    const res = new MockResponse();
+    await handleAguiRun(makeReq(makeInput({ threadId: THROW_ON_TOUCH_ID })), res as unknown as Response);
+
+    // touchConversation was attempted (and threw) rather than being skipped.
+    expect(touchConversationCalls.length).toBe(1);
+    expect(touchConversationCalls[0]![0]).toBe(THROW_ON_TOUCH_ID);
+
+    // Despite the throw, teardown still happened: the stream was ended...
+    expect(res.ended).toBe(true);
+    // ...and the session's subscription was torn down (unsubscribe() ran).
+    const session = sessionsById.get(THROW_ON_TOUCH_ID);
+    expect(session?.unsubscribed).toBe(true);
+
+    // The throw was caught locally within the agent_end case, not by prompt()'s
+    // outer try/catch — proven by the absence of a spurious RUN_ERROR event after
+    // RUN_FINISHED (a fallback via the outer catch would emit both).
+    const allChunks = res.chunks.join("");
+    expect(allChunks).toContain("RUN_FINISHED");
+    expect(allChunks).not.toContain("RUN_ERROR");
   });
 });

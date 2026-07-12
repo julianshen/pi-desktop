@@ -145,7 +145,17 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
       }
       case "agent_end": {
         write({ type: EventType.RUN_FINISHED, threadId: input.threadId, runId: input.runId } as BaseEvent);
-        touchConversationAfterTurn(conversationId, input);
+        /**
+         * Task 3 fix (review finding): bookkeeping must never block stream teardown.
+         * If touchConversationAfterTurn throws (e.g. registry write failure), RUN_FINISHED
+         * has already reached the client — unsubscribe()/finish() still need to run so the
+         * SSE connection doesn't leak.
+         */
+        try {
+          touchConversationAfterTurn(conversationId, input);
+        } catch (error) {
+          console.error("[agui] touchConversationAfterTurn failed", error);
+        }
         unsubscribe();
         finish();
         break;

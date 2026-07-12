@@ -98,12 +98,33 @@ export function conversationCwd(id: string): string {
 }
 
 /**
+ * Task 3 fix (review finding): "default" is a real pre-existing conversation
+ * (conversationCwd("default") resolves to env.workspaceDir, see above) but it is
+ * never created via createConversation(), so without this it would never gain a
+ * registry entry — leaving getConversationMeta("default") undefined and
+ * touchConversation("default", ...) a silent no-op forever, and "default" would
+ * never show up in listConversations(). Lazily inserts a registry entry the first
+ * time "default" is touched, using the same default-title convention as
+ * createConversation(). Idempotent: a no-op once the entry exists.
+ */
+function ensureDefaultConversation(): void {
+  const entries = readRegistry();
+  if (entries.some((entry) => entry.id === "default")) return;
+
+  const now = new Date().toISOString();
+  entries.push({ id: "default", title: "New conversation", createdAt: now, updatedAt: now });
+  writeRegistry(entries);
+}
+
+/**
  * Generalizes session.ts's single sessionPromise to a per-id map, mirroring the
  * per-task session isolation scheduler/index.ts already does for scheduled agents —
  * each conversation id gets its own persisted AgentSession, memoized so concurrent
  * callers for the same id share one in-flight creation.
  */
 export function getOrCreateSession(id: string): Promise<AgentSession> {
+  if (id === "default") ensureDefaultConversation();
+
   let promise = sessionPromises.get(id);
   if (!promise) {
     promise = createSession(id);

@@ -286,4 +286,28 @@ describe("default conversation migration", () => {
       }),
     ).toBe(true);
   });
+
+  // Task 3 fix (review finding): "default" was never createConversation()'d, so
+  // without ensureDefaultConversation() (called lazily from getOrCreateSession()),
+  // getConversationMeta("default") stays undefined and touchConversation("default",
+  // ...) silently no-ops forever, and "default" never shows up in
+  // listConversations() -- breaking Task 10's sidebar wiring later. Proves the
+  // registry bookkeeping gap is closed once "default" has been touched at least once
+  // (getOrCreateSession("default") was already exercised above in AC-2.1).
+  test('Task 3 fix: getOrCreateSession("default") registers a real "default" entry in the registry', async () => {
+    await conversations.getOrCreateSession("default");
+
+    const meta = conversations.getConversationMeta("default");
+    expect(meta).toBeDefined();
+    expect(meta?.id).toBe("default");
+    expect(meta?.title).toBeTruthy();
+    expect(meta?.createdAt).toBeTruthy();
+    expect(meta?.updatedAt).toBeTruthy();
+
+    expect(conversations.listConversations().some((c) => c.id === "default")).toBe(true);
+
+    // touchConversation("default", ...) must now actually persist, not silently no-op.
+    conversations.touchConversation("default", { title: "Renamed default" });
+    expect(conversations.getConversationMeta("default")?.title).toBe("Renamed default");
+  });
 });
