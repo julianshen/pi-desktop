@@ -91,20 +91,22 @@ export function Sidebar({
         <span style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 16 }}>
           {SIDEBAR_TITLES[view]}
         </span>
-        <button
-          style={{
-            width: 28,
-            height: 28,
-            display: "grid",
-            placeItems: "center",
-            border: "1px solid var(--color-divider)",
-            background: "transparent",
-            color: "var(--color-text)",
-            cursor: "pointer",
-          }}
-        >
-          <PlusIcon size={15} />
-        </button>
+        {view !== "settings" && (
+          <button
+            style={{
+              width: 28,
+              height: 28,
+              display: "grid",
+              placeItems: "center",
+              border: "1px solid var(--color-divider)",
+              background: "transparent",
+              color: "var(--color-text)",
+              cursor: "pointer",
+            }}
+          >
+            <PlusIcon size={15} />
+          </button>
+        )}
       </div>
 
       {isChat && (
