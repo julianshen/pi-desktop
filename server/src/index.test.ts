@@ -344,4 +344,20 @@ describe("GET /api/conversations/:id/artifacts/latest", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(artifact);
   });
+
+  // Task 8 fix (path-traversal error handling): a malformed/path-traversal-style id
+  // fails conversations.ts's SAFE_ID_PATTERN, so getLatestArtifact() ->
+  // artifactsPath() -> conversationCwd() throws synchronously
+  // (assertSafeConversationId). Before the fix that throw was uncaught by this
+  // route's handler and fell through to Express's default error handler — an
+  // unhandled 500 with a full stack trace (including absolute local file paths)
+  // leaked in the response body. It must now be a clean 400 with no stack trace.
+  test("Task 8 fix: malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/artifacts/latest`);
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
 });

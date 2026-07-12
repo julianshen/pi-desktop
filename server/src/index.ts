@@ -110,8 +110,24 @@ export function createApp(options?: CreateAppOptions): Express {
   // getLatestArtifact() returns undefined when none has been published yet — per
   // spec that's an expected state, not an error, so it's normalized to 200 null
   // rather than 404.
+  //
+  // Task 8 review fix: getLatestArtifact() -> artifactsPath() -> conversationCwd()
+  // throws *synchronously* for a malformed id (path-traversal guard, see
+  // agent/conversations.ts's assertSafeConversationId) — unlike the async routes
+  // above, there's no promise here for a bare .catch() to hang off, so the throw
+  // must be caught explicitly or it reaches Express's default error handler and
+  // leaks a stack trace (with absolute local paths) in a 500 response. A malformed
+  // id is a client error, so this normalizes to a plain 400, matching this file's
+  // other "no JSON body" error responses; genuinely unexpected errors are still
+  // logged via console.error first, same convention as the .catch() blocks above,
+  // so they stay debuggable rather than being silently swallowed.
   app.get("/api/conversations/:id/artifacts/latest", (req, res) => {
-    res.json(getLatestArtifact(req.params.id) ?? null);
+    try {
+      res.json(getLatestArtifact(req.params.id) ?? null);
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/artifacts/latest] unhandled error", error);
+      if (!res.headersSent) res.status(400).end();
+    }
   });
 
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
