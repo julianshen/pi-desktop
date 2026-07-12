@@ -13,6 +13,7 @@ import { McpServersView } from "./views/McpServersView";
 import { SkillsLibraryView } from "./views/SkillsLibraryView";
 import { SettingsView } from "./views/SettingsView";
 import { useShellState, type ViewKey } from "./state/useShellState";
+import { useConversations } from "./state/useConversations";
 
 const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
 
@@ -29,6 +30,16 @@ const WINDOW_TITLES: Record<ViewKey, string> = {
 function App() {
   const { state, actions, railViews } = useShellState();
   const showCanvas = state.view === "chat" && state.artifactOpen;
+  // Task 10: single useConversations() call, lifted here (not called inside
+  // Sidebar) so it can be shared by whichever other views end up needing the same
+  // fetched conversation list/active id (MainHeader/ChatView/ArtifactCanvas are
+  // landing concurrently) without triggering independent, out-of-sync fetches.
+  // "Active conversation" itself stays driven by useShellState's existing
+  // `activeConv`/`setActiveConv` (unchanged below) rather than this hook's own
+  // `activeId` — Sidebar reconciles the two by calling `onSelectConv` whenever a
+  // conversation is selected or created, so ArtifactCanvas's pre-existing
+  // `conversationId={state.activeConv}` wiring keeps working unmodified.
+  const conversations = useConversations();
 
   return (
     <CopilotKit runtimeUrl={RUNTIME_URL} showDevConsole={false} enableInspector={false}>
@@ -57,6 +68,7 @@ function App() {
             onSelectFilter={actions.setActiveFilter}
             settingsSection={state.settingsSection}
             onSelectSettingsSection={actions.setSettingsSection}
+            conversations={conversations}
           />
 
           <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
@@ -81,7 +93,15 @@ function App() {
             </div>
 
             {showCanvas && (
-              <ArtifactCanvas tab={state.canvasTab} onSetTab={actions.setCanvasTab} onClose={actions.toggleArtifact} />
+              // `refreshSignal` intentionally left unwired here (Task 13 follow-up): it
+              // should fire when ChatView's isLoading transitions true -> false, but
+              // ChatView.tsx's isLoading is owned by the concurrently-landing Task 12.
+              <ArtifactCanvas
+                tab={state.canvasTab}
+                onSetTab={actions.setCanvasTab}
+                onClose={actions.toggleArtifact}
+                conversationId={state.activeConv}
+              />
             )}
           </div>
         </div>
