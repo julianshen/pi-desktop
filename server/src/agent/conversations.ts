@@ -5,6 +5,7 @@ import { createAgentSession, SessionManager, type AgentSession } from "@earendil
 import { env } from "../config/env.js";
 import { getAgentDeps } from "./deps.js";
 import { resolveModelById } from "./models.js";
+import { createArtifactTools } from "../artifacts/tools.js";
 
 export interface ConversationMeta {
   id: string;
@@ -149,13 +150,19 @@ async function createSession(id: string): Promise<AgentSession> {
   const modelId = getConversationMeta(id)?.modelId;
   const model = modelId ? (await resolveModelById(modelId, modelRegistry)) ?? defaultModel : defaultModel;
 
+  /**
+   * Task 7: artifact tools are per-conversation (publish_artifact closes over this
+   * conversation's id so it always saves to *this* conversation's artifacts.json),
+   * so they're built here per-session rather than being part of getAgentDeps()'s
+   * memoized, conversation-agnostic bundle — appended on top, not replacing it.
+   */
   const { session } = await createAgentSession({
     cwd,
     agentDir: env.agentDir,
     model,
     authStorage,
     modelRegistry,
-    customTools,
+    customTools: [...customTools, ...createArtifactTools(id)],
     sessionManager: SessionManager.continueRecent(cwd),
   });
 
