@@ -1,9 +1,20 @@
+import { useEffect, useState } from "react";
 import { CanvasIcon, CheckIcon, ChevronDownIcon, PlusIcon, SearchIcon } from "./icons";
-import { filterConfig, models } from "../data/mockData";
+import { filterConfig } from "../data/mockData";
 import type { ShellActions, ShellState, ViewKey } from "../state/useShellState";
+import type { UseConversationsResult } from "../state/useConversations";
+import { API_BASE } from "../state/apiBase";
 
-const CRUMBS: Record<ViewKey, string> = {
-  chat: "Chat / July investor update",
+/** Mirrors server/src/agent/models.ts's ModelSummary exactly (Task 11). */
+interface ModelSummary {
+  id: string;
+  label: string;
+  provider: string;
+}
+
+// "chat" is intentionally absent here now — its crumb/title are derived from the
+// active conversation's real title below (Task 11, AC-11.3), not a hardcoded string.
+const CRUMBS: Partial<Record<ViewKey, string>> = {
   artifacts: "Workspace / Artifacts",
   scheduled: "Automation / Scheduled",
   coding: "Development / Agents",
@@ -12,8 +23,7 @@ const CRUMBS: Record<ViewKey, string> = {
   settings: "Account / Settings",
 };
 
-const MAIN_TITLES: Record<ViewKey, string> = {
-  chat: "July investor update",
+const MAIN_TITLES: Partial<Record<ViewKey, string>> = {
   artifacts: "Artifact Store",
   scheduled: "Scheduled Tasks",
   coding: "Coding Agents",
@@ -38,20 +48,124 @@ const PRIMARY_ACTIONS: Partial<Record<ViewKey, string>> = {
   skills: "New skill",
 };
 
-export function MainHeader({ state, actions }: { state: ShellState; actions: ShellActions }) {
+export function MainHeader({
+  state,
+  actions,
+  conversations,
+}: {
+  state: ShellState;
+  actions: ShellActions;
+  /** Task 9's hook result, lifted to App.tsx (Task 10) so it fetches once and is
+   * shared across Sidebar/MainHeader instead of each component re-fetching. */
+  conversations: UseConversationsResult;
+}) {
   const { view } = state;
   const isChat = view === "chat";
   const isSettings = view === "settings";
   const isFiltered = !isChat && !isSettings;
 
+  // `state.activeConv` is App.tsx's canonical "active conversation id" (same field
+  // Sidebar/ArtifactCanvas already key off of — see Sidebar.tsx's comment on its own
+  // `activeConv` prop). Falling back to the first fetched conversation covers the
+  // window before anything has been explicitly selected (useShellState's initial
+  // `activeConv` is a mock id that won't match any real conversation).
+  const activeConversation =
+    conversations.conversations.find((c) => c.id === state.activeConv) ?? conversations.conversations[0];
+
+  const [models, setModels] = useState<ModelSummary[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
+  const [switching, setSwitching] = useState(false);
+  const [switchError, setSwitchError] = useState<string | null>(null);
+
+  // AC-11.1: fetch the real model list on mount instead of importing mockData's
+  // hardcoded `models` array.
+  useEffect(() => {
+    let cancelled = false;
+
+    fetch(`${API_BASE}/api/models`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`GET /api/models failed: ${res.status}`);
+        return res.json() as Promise<ModelSummary[]>;
+      })
+      .then((data) => {
+        if (cancelled) return;
+        setModels(data);
+        setModelsLoading(false);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        console.error("[MainHeader] failed to load models", err);
+        setModelsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Once the model list and the active conversation are both available, show that
+  // conversation's real model selection. Skipped while a switch is in flight so it
+  // can't clobber the optimistic-looking "Switching model…" state.
+  useEffect(() => {
+    if (modelsLoading || switching || models.length === 0) return;
+    const fromConversation = activeConversation?.modelId;
+    if (fromConversation && models.some((m) => m.id === fromConversation)) {
+      setSelectedModelId(fromConversation);
+    } else if (!selectedModelId) {
+      setSelectedModelId(models[0]?.id ?? null);
+    }
+  }, [modelsLoading, switching, models, activeConversation?.modelId, selectedModelId]);
+
+  const selectedModel = models.find((m) => m.id === selectedModelId);
+
+  // AC-11.2: selecting a different model shows the pulsing "Switching model…"
+  // state, PATCHes the active conversation's model, then updates to the new
+  // model id on success. On failure the selection reverts and an inline error is
+  // shown (DESIGN.md: "do not silently revert without telling the user").
+  function handleSelectModel(modelId: string) {
+    actions.toggleModelMenu();
+    if (!activeConversation || modelId === selectedModelId) return;
+
+    const previous = selectedModelId;
+    setSwitchError(null);
+    setSwitching(true);
+
+    fetch(`${API_BASE}/api/conversations/${activeConversation.id}/model`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ modelId }),
+    })
+      .then((res) => {
+        if (!res.ok) throw new Error(`PATCH /api/conversations/:id/model failed: ${res.status}`);
+        return res.json();
+      })
+      .then(() => {
+        setSelectedModelId(modelId);
+        setSwitching(false);
+      })
+      .catch((err: unknown) => {
+        console.error("[MainHeader] failed to switch model", err);
+        setSelectedModelId(previous);
+        setSwitching(false);
+        setSwitchError("Couldn't switch model — try again.");
+      });
+  }
+
+  const modelLabel = modelsLoading ? "Loading models…" : switching ? "Switching model…" : (selectedModel?.label ?? "Select model");
+
+  // AC-11.3: real active-conversation title, never the hardcoded "July investor update".
+  const crumbText = isChat ? `Chat / ${activeConversation?.title ?? "Chat"}` : (CRUMBS[view] ?? "");
+  const titleText = isChat ? (activeConversation?.title ?? "Chat") : (MAIN_TITLES[view] ?? "");
+
   return (
     <div style={{ height: 52, flex: "none", display: "flex", alignItems: "center", gap: 14, padding: "0 20px", borderBottom: "1px solid var(--color-divider)" }}>
       <div style={{ minWidth: 0, flex: 1 }}>
         <div style={{ fontSize: 11, letterSpacing: "0.02em", color: "color-mix(in srgb, var(--color-text) 45%, transparent)" }}>
-          {CRUMBS[view]}
+          {crumbText}
         </div>
         <div style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 17, lineHeight: 1.1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {MAIN_TITLES[view]}
+          {titleText}
         </div>
       </div>
 
@@ -60,6 +174,8 @@ export function MainHeader({ state, actions }: { state: ShellState; actions: She
           <div style={{ position: "relative" }}>
             <button
               onClick={actions.toggleModelMenu}
+              disabled={modelsLoading}
+              aria-label="Model picker"
               style={{
                 display: "flex",
                 alignItems: "center",
@@ -69,17 +185,25 @@ export function MainHeader({ state, actions }: { state: ShellState; actions: She
                 border: "1px solid var(--color-divider)",
                 background: "transparent",
                 color: "var(--color-text)",
-                cursor: "pointer",
+                cursor: modelsLoading ? "default" : "pointer",
                 fontFamily: "var(--font-heading)",
                 fontWeight: 600,
                 fontSize: 13,
               }}
             >
-              <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--color-accent)" }} />
-              {state.model}
+              <span
+                style={{
+                  width: 7,
+                  height: 7,
+                  borderRadius: "50%",
+                  background: switching ? "var(--color-accent-300)" : "var(--color-accent)",
+                  animation: switching ? "pulse 0.8s infinite" : undefined,
+                }}
+              />
+              {modelLabel}
               <ChevronDownIcon size={13} />
             </button>
-            {state.modelOpen && (
+            {state.modelOpen && !modelsLoading && (
               <div
                 style={{
                   position: "absolute",
@@ -94,11 +218,11 @@ export function MainHeader({ state, actions }: { state: ShellState; actions: She
                 }}
               >
                 {models.map((m) => {
-                  const on = m.name === state.model;
+                  const on = m.id === selectedModelId;
                   return (
                     <button
-                      key={m.name}
-                      onClick={() => actions.setModel(m.name)}
+                      key={m.id}
+                      onClick={() => handleSelectModel(m.id)}
                       style={{
                         width: "100%",
                         display: "flex",
@@ -113,13 +237,31 @@ export function MainHeader({ state, actions }: { state: ShellState; actions: She
                       }}
                     >
                       <span style={{ minWidth: 0, flex: 1 }}>
-                        <span style={{ display: "block", fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 13 }}>{m.name}</span>
-                        <span style={{ display: "block", fontSize: 11, color: "color-mix(in srgb, var(--color-text) 50%, transparent)" }}>{m.note}</span>
+                        <span style={{ display: "block", fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 13 }}>{m.label}</span>
+                        <span style={{ display: "block", fontSize: 11, color: "color-mix(in srgb, var(--color-text) 50%, transparent)" }}>{m.provider}</span>
                       </span>
                       <span style={{ color: "var(--color-accent)", fontSize: 13, visibility: on ? "visible" : "hidden" }}>✓</span>
                     </button>
                   );
                 })}
+              </div>
+            )}
+            {switchError && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: 38,
+                  right: 0,
+                  width: 240,
+                  fontSize: 11,
+                  color: "color-mix(in srgb, var(--color-text) 55%, transparent)",
+                  background: "var(--color-bg)",
+                  border: "1px solid var(--color-divider)",
+                  padding: "6px 9px",
+                  zIndex: 20,
+                }}
+              >
+                {switchError}
               </div>
             )}
           </div>

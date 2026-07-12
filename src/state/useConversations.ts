@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { API_BASE } from "./apiBase.js";
 
 /** Mirrors server/src/agent/conversations.ts's ConversationMeta exactly (Task 9). */
 export interface ConversationMeta {
@@ -8,16 +9,6 @@ export interface ConversationMeta {
   updatedAt: string;
   modelId?: string;
 }
-
-/**
- * Same derivation App.tsx already uses for the CopilotKit runtime URL
- * (`VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit"`), stripping the
- * `/copilotkit` suffix rather than introducing a second, independently-configurable env
- * var — the REST API and the AG-UI endpoint are the same server (server/src/index.ts),
- * so there is exactly one base URL to point at, not two knobs that could drift apart.
- */
-const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
-const API_BASE = RUNTIME_URL.replace(/\/copilotkit\/?$/, "");
 
 export interface UseConversationsResult {
   conversations: ConversationMeta[];
