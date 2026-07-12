@@ -1,0 +1,6 @@
+[test]
+# Task 9: frontend test harness precedent. Scoped to `bun test src` (see root
+# package.json's "test" script) so this preload never applies to server/'s own
+# `bun test` run (server/bunfig.toml is authoritative there) — the two suites
+# stay isolated even though both ultimately resolve to the same `bun test` binary.
+preload = ["./test-setup.ts"]
