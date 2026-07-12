@@ -8,6 +8,20 @@ const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
 
 export function ChatView({ model }: { model: string }) {
+  // Task 12: verified against the installed @copilotkit/react-core (1.62.3) dist/index.mjs
+  // that `useCopilotChat`'s runtime implementation destructures/returns only
+  // { visibleMessages, appendMessage, reloadMessages, stopGeneration, reset, isLoading,
+  // isAvailable, runChatCompletion, mcpServers, setMcpServers } — `UseCopilotChatOptions.id`
+  // is declared in the .d.ts but is never read by useCopilotChatInternal, and neither
+  // `agent` nor `threadId` are exposed on this hook's return despite appearing on the
+  // richer UseCopilotChatReturn$1 type (that's the Enterprise `useCopilotChatHeadless_c`
+  // hook's shape, not this one's). So there is no real thread-scoping parameter to pass
+  // here; App.tsx instead remounts this component via `key={state.activeConv}` so at
+  // least this component's own local UI state (draft text, scroll position) resets per
+  // conversation switch. See Task 12's completion report for the caveat this doesn't
+  // fully guarantee: with the installed CopilotKit version, the underlying agent handle
+  // is a singleton owned above this component (registered once per `agentId` in
+  // CopilotKit core), so it isn't itself recreated by this remount.
   const { visibleMessages: rawMessages, appendMessage, isLoading } = useCopilotChat();
   const visibleMessages = rawMessages ?? [];
   const [draft, setDraft] = useState("");
