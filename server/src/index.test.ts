@@ -296,3 +296,52 @@ describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("GET /api/conversations/:id/artifacts/latest", () => {
+  // AC-8.1: Given a conversation with no published artifacts, when the endpoint is
+  // called, then it returns 200 null — "no artifact yet" is an expected state, not
+  // an error, so this must not be a 404.
+  test("AC-8.1: conversation with no published artifacts returns 200 null", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "no artifacts yet" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/artifacts/latest`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toBeNull();
+  });
+
+  // AC-8.2 [R]: Given a conversation with a published artifact, when the endpoint is
+  // called, then it returns 200 with that artifact's full content. Publishes via
+  // artifacts/store.ts's saveArtifact() directly (same thing publish_artifact's
+  // execute() does under the hood, per Task 7) rather than driving a real agent
+  // turn, since the tool call itself is already covered by
+  // server/src/artifacts/store.test.ts.
+  test("AC-8.2: conversation with a published artifact returns 200 with its full content", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "has an artifact" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { saveArtifact } = await import("./artifacts/store.js");
+    const artifact = {
+      id: "chart-1",
+      title: "WAU chart",
+      language: "tsx",
+      code: "export const Chart = () => null;",
+      publishedAt: new Date().toISOString(),
+    };
+    saveArtifact(created.id, artifact);
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/artifacts/latest`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(artifact);
+  });
+});

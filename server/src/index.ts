@@ -7,6 +7,7 @@ import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
 import { listConversations, createConversation, getConversationMeta, touchConversation } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
+import { getLatestArtifact } from "./artifacts/store.js";
 
 /**
  * Task 6: both models.ts functions already accept an optional ModelRegistry
@@ -103,6 +104,14 @@ export function createApp(options?: CreateAppOptions): Express {
         console.error("[api/conversations/:id/model] unhandled error", error);
         if (!res.headersSent) res.status(500).end();
       });
+  });
+
+  // Task 8 (AC-8.1/AC-8.2): latest published artifact for a conversation.
+  // getLatestArtifact() returns undefined when none has been published yet — per
+  // spec that's an expected state, not an error, so it's normalized to 200 null
+  // rather than 404.
+  app.get("/api/conversations/:id/artifacts/latest", (req, res) => {
+    res.json(getLatestArtifact(req.params.id) ?? null);
   });
 
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
