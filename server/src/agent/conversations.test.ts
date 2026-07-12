@@ -1,7 +1,8 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { Model, Api } from "@earendil-works/pi-ai";
 
 /**
  * env.ts reads process.env into a module-level constant at import time, so the
@@ -13,12 +14,40 @@ let conversations: typeof import("./conversations.js");
 let env: typeof import("../config/env.js").env;
 let tmpRoot: string;
 
+/**
+ * Task 1 fix regression test seam: conversations.ts's createSession() resolves a
+ * conversation's model via models.ts's resolveModelById(modelId, modelRegistry). The
+ * real modelRegistry built from a scratch agentDir has no configured provider auth,
+ * so resolveCliModel would never resolve anything real — following this test file's
+ * existing dynamic-import-after-env-setup pattern, mock.module() swaps out
+ * "./models.js"'s resolveModelById for a stub *before* conversations.js is imported,
+ * so createSession's real (non-injectable) call site can still be exercised.
+ */
+const STUB_MODEL_ID = "test-provider/test-model";
+const STUB_MODEL = {
+  id: "test-model",
+  provider: "test-provider",
+  name: "Test Model",
+  api: "anthropic-messages",
+  baseUrl: "https://example.invalid",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0 },
+  contextWindow: 100_000,
+  maxTokens: 4096,
+} as Model<Api>;
+
 beforeAll(async () => {
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-desktop-conversations-test-"));
   process.env.PI_DESKTOP_AGENT_DIR = path.join(tmpRoot, "agent");
   process.env.PI_DESKTOP_DATA_DIR = path.join(tmpRoot, "data");
   process.env.PI_DESKTOP_WORKSPACE_DIR = path.join(tmpRoot, "workspace");
   delete process.env.PI_DESKTOP_MODEL;
+
+  mock.module("./models.js", () => ({
+    resolveModelById: async (id: string) => (id === STUB_MODEL_ID ? STUB_MODEL : undefined),
+    listAvailableModels: async () => [],
+  }));
 
   ({ env } = await import("../config/env.js"));
   conversations = await import("./conversations.js");
@@ -93,5 +122,57 @@ describe("conversations registry", () => {
     ]);
 
     expect(first).toBe(second);
+  });
+
+  // Task 1 fix (model-sourcing gap): createSession() must resolve a conversation's
+  // stored modelId via models.ts's resolveModelById rather than always falling back
+  // to getAgentDeps()'s env-var default. Verified end-to-end through
+  // getOrCreateSession() -> AgentSession#model, using the mock.module() stub for
+  // "./models.js" installed in beforeAll (no real provider auth is configured in
+  // this scratch environment, so the real resolution path would never resolve
+  // anything to assert against).
+  test("Task 1 fix: getOrCreateSession() resolves a conversation's modelId via models.ts, not the env-var default", async () => {
+    const meta = conversations.createConversation("model-scoped conversation");
+    conversations.touchConversation(meta.id, { modelId: STUB_MODEL_ID });
+
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    expect(session.model?.id).toBe(STUB_MODEL.id);
+    expect(session.model?.provider).toBe(STUB_MODEL.provider);
+  });
+
+  // Task 1 fix (model-sourcing gap), fallback branch: an unresolvable modelId must
+  // never throw (matches Task 5's AC-5.3 contract) and must fall back to
+  // getAgentDeps()'s default model instead of leaving session creation broken.
+  test("Task 1 fix: getOrCreateSession() falls back to the default model when modelId is unresolvable", async () => {
+    // Control: a conversation with no modelId at all gets whatever getAgentDeps()'s
+    // default model resolution yields in this scratch env (no configured provider
+    // auth, so createAgentSession's own findInitialModel fallback applies).
+    const control = conversations.createConversation("no modelId conversation");
+    const controlSession = await conversations.getOrCreateSession(control.id);
+
+    const meta = conversations.createConversation("unresolvable model conversation");
+    conversations.touchConversation(meta.id, { modelId: "nonexistent/does-not-exist" });
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    // An unresolvable modelId must never throw and must never resolve to the stub
+    // model — it should fall back to exactly the same default the control got.
+    expect(session.model?.id).not.toBe(STUB_MODEL.id);
+    expect(session.model).toEqual(controlSession.model);
+  });
+
+  // Task 1 fix (path-traversal guard): conversationCwd(id)/getOrCreateSession(id)
+  // must reject ids that aren't safe path segments, since Task 3 will feed
+  // client-controlled input.threadId straight into these functions.
+  test("Task 1 fix: conversationCwd() rejects a path-traversal-style id", () => {
+    expect(() => conversations.conversationCwd("../../etc")).toThrow();
+    expect(() => conversations.conversationCwd("../../../tmp/evil")).toThrow();
+  });
+
+  test("Task 1 fix: getOrCreateSession() rejects a path-traversal-style id instead of escaping dataDir/conversations", async () => {
+    // Rejection must happen before any mkdir/session-creation side effect — i.e.
+    // conversationCwd()'s guard runs first, so the malicious id never gets a chance
+    // to create a directory outside dataDir/conversations in the first place.
+    await expect(conversations.getOrCreateSession("../../../tmp/evil")).rejects.toThrow();
   });
 });

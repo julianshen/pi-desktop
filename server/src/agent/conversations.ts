@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createAgentSession, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { env } from "../config/env.js";
 import { getAgentDeps } from "./deps.js";
+import { resolveModelById } from "./models.js";
 
 export interface ConversationMeta {
   id: string;
@@ -67,12 +68,31 @@ export function touchConversation(id: string, patch?: Partial<Pick<ConversationM
 }
 
 /**
+ * Task 1 fix (path-traversal guard): ids ultimately reach conversationCwd() from
+ * client-controlled input (Task 3 wires input.threadId from the AG-UI protocol
+ * straight through to getOrCreateSession/conversationCwd), so an id like
+ * "../../../../tmp/evil" must never be allowed to escape dataDir/conversations via
+ * path.join. Reject anything that isn't a safe single path segment rather than
+ * silently stripping/truncating characters — matching this module's existing style
+ * of throwing on invariant violations rather than best-effort coercion. "default" and
+ * randomUUID()-generated ids both satisfy this pattern.
+ */
+const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+function assertSafeConversationId(id: string): void {
+  if (!SAFE_ID_PATTERN.test(id)) {
+    throw new Error(`Invalid conversation id: "${id}"`);
+  }
+}
+
+/**
  * "default" maps to the pre-existing shared session's cwd (env.workspaceDir) verbatim,
  * not a subdirectory — this keeps that session's already-persisted history from being
  * orphaned when it's adopted into the registry as conversation id "default" (see Task 2).
  * Every other id gets its own directory under dataDir/conversations.
  */
 export function conversationCwd(id: string): string {
+  assertSafeConversationId(id);
   if (id === "default") return env.workspaceDir;
   return path.join(env.dataDir, "conversations", id);
 }
@@ -96,7 +116,17 @@ async function createSession(id: string): Promise<AgentSession> {
   const cwd = conversationCwd(id);
   fs.mkdirSync(cwd, { recursive: true });
 
-  const { authStorage, modelRegistry, model, customTools } = await getAgentDeps();
+  const { authStorage, modelRegistry, model: defaultModel, customTools } = await getAgentDeps();
+
+  /**
+   * Task 1 fix (model-sourcing gap): a conversation with a modelId set should get
+   * that specific model, resolved via models.ts's resolveModelById — falling back to
+   * getAgentDeps()'s env-var default only when modelId is unset OR resolveModelById
+   * can't resolve it (unknown id — resolveModelById never throws, per Task 5's
+   * AC-5.3 contract, so this is a plain undefined check, not a try/catch).
+   */
+  const modelId = getConversationMeta(id)?.modelId;
+  const model = modelId ? (await resolveModelById(modelId, modelRegistry)) ?? defaultModel : defaultModel;
 
   const { session } = await createAgentSession({
     cwd,
