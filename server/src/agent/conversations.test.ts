@@ -176,3 +176,114 @@ describe("conversations registry", () => {
     await expect(conversations.getOrCreateSession("../../../tmp/evil")).rejects.toThrow();
   });
 });
+
+/**
+ * Task 2 (US-03 regression guard): the pre-existing shared session that this app's
+ * real users already have on disk under env.workspaceDir becomes conversation id
+ * "default" (AC-1.2 already pins conversationCwd("default") === env.workspaceDir).
+ * This block is the dedicated, test-only proof that getOrCreateSession("default")
+ * genuinely *resumes* that pre-existing session rather than silently starting a
+ * fresh, empty one -- the single highest-risk gap named in the feature's PRD, and
+ * the gate Task 3 (routing the live /agui endpoint through conversations.ts) is not
+ * allowed to proceed without.
+ */
+describe("default conversation migration", () => {
+  // AC-2.1 [R]: Given env.workspaceDir already contains a persisted session
+  // directory (as it does today in any real install), when
+  // getOrCreateSession("default") is called, then the resulting session's
+  // persisted history is the pre-existing one -- not a fresh/empty session.
+  test('AC-2.1: getOrCreateSession("default") resumes the pre-existing env.workspaceDir session, not a fresh one', async () => {
+    const { createAgentSession, SessionManager } = await import("@earendil-works/pi-coding-agent");
+    const { getAgentDeps } = await import("./deps.js");
+
+    const cwd = conversations.conversationCwd("default");
+    expect(cwd).toBe(env.workspaceDir);
+
+    /**
+     * Simulate "a real pre-existing install": build a session against
+     * env.workspaceDir via the exact same createAgentSession() +
+     * SessionManager.continueRecent(cwd) mechanism the now-deleted session.ts
+     * used (and conversations.ts's createSession() still uses internally,
+     * per Task 1's Technical Design) -- this stands in for the user's real
+     * chat history already sitting on disk before "default" is ever routed
+     * through conversations.ts.
+     */
+    const { authStorage, modelRegistry, model, customTools } = await getAgentDeps();
+    const { session: preExisting } = await createAgentSession({
+      cwd,
+      agentDir: env.agentDir,
+      model,
+      authStorage,
+      modelRegistry,
+      customTools,
+      sessionManager: SessionManager.continueRecent(cwd),
+    });
+
+    /**
+     * Append directly through the SessionManager's own on-disk persistence --
+     * this repo's own session persistence mechanism, not an LLM API call -- so
+     * the "pre-existing" session ends up with identifiable, disk-persisted
+     * history that a freshly-created session would never have. A *completed*
+     * turn (user + assistant entry) is required here: SessionManager only
+     * flushes entries to disk once an assistant message is present (see the
+     * installed package's session-manager.js _persist()) -- a lone user
+     * message stays in-memory-only, which would make this proof vacuous
+     * against a genuinely fresh SessionManager.continueRecent(cwd) call.
+     */
+    preExisting.sessionManager.appendMessage({
+      role: "user",
+      content: "AC-2.1 pre-existing history marker",
+      timestamp: Date.now(),
+    });
+    preExisting.sessionManager.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "AC-2.1 pre-existing assistant reply" }],
+      api: "anthropic-messages",
+      provider: "test-provider",
+      model: "test-model",
+      usage: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+
+    const preExistingSessionId = preExisting.sessionManager.getSessionId();
+    const preExistingSessionFile = preExisting.sessionManager.getSessionFile();
+    const preExistingEntryCount = preExisting.sessionManager.getEntries().length;
+
+    // Sanity: the "pre-existing" session really did reach disk (not just
+    // in-memory state) before we ever touch conversations.ts.
+    expect(preExistingSessionFile).toBeTruthy();
+    expect(fs.existsSync(preExistingSessionFile!)).toBe(true);
+    expect(preExistingEntryCount).toBeGreaterThanOrEqual(2);
+
+    preExisting.dispose();
+
+    // The real production path: exactly what Task 3 will call for a request
+    // with no threadId (or an explicit threadId of "default").
+    const resumed = await conversations.getOrCreateSession("default");
+
+    // Proof of continuity, not a fresh session: same persisted session id,
+    // same session file, and the same (non-empty) entry history -- including
+    // the marker appended above. A brand-new SessionManager.continueRecent(cwd)
+    // call against an empty/unseen cwd would instead generate a new random
+    // session id with zero entries, which is exactly what this test would
+    // catch if getOrCreateSession("default") silently started a fresh session.
+    expect(resumed.sessionManager.getSessionId()).toBe(preExistingSessionId);
+    expect(resumed.sessionManager.getSessionFile()).toBe(preExistingSessionFile);
+    expect(resumed.sessionManager.getEntries().length).toBe(preExistingEntryCount);
+    expect(
+      resumed.sessionManager.getEntries().some((entry) => {
+        if (entry.type !== "message") return false;
+        const message = entry.message as { role?: string; content?: unknown };
+        return message.role === "user" && message.content === "AC-2.1 pre-existing history marker";
+      }),
+    ).toBe(true);
+  });
+});
