@@ -1,10 +1,25 @@
 import express, { type Express } from "express";
 import cors from "cors";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
 import { handleAguiRun } from "./agui/adapter.js";
 import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
-import { listConversations, createConversation, getConversationMeta } from "./agent/conversations.js";
+import { listConversations, createConversation, getConversationMeta, touchConversation } from "./agent/conversations.js";
+import { listAvailableModels, resolveModelById } from "./agent/models.js";
+
+/**
+ * Task 6: both models.ts functions already accept an optional ModelRegistry
+ * override (built for exactly this — see models.ts's own comment), so createApp()
+ * forwards one through rather than always falling back to the real
+ * getAgentDeps()-sourced registry. Lets index.test.ts exercise GET /api/models and
+ * PATCH /api/conversations/:id/model against a stubbed registry with configured
+ * models, mirroring agent/models.test.ts's makeRegistryStub pattern, instead of a
+ * real provider-less registry that would always resolve empty/undefined.
+ */
+export interface CreateAppOptions {
+  modelRegistry?: ModelRegistry;
+}
 
 /**
  * Builds the Express app without binding a port, so tests (index.test.ts) can
@@ -12,7 +27,7 @@ import { listConversations, createConversation, getConversationMeta } from "./ag
  * of duplicating route logic or mocking Express. main() below is the only caller
  * that actually binds env.port.
  */
-export function createApp(): Express {
+export function createApp(options?: CreateAppOptions): Express {
   const app = express();
   app.use(cors());
 
@@ -44,6 +59,50 @@ export function createApp(): Express {
       return;
     }
     res.json(meta);
+  });
+
+  // Task 6 (AC-6.1): list available models. listAvailableModels() forwards to
+  // getAgentDeps()'s real modelRegistry when options.modelRegistry is unset (the
+  // production default); index.test.ts injects a stub via options for a
+  // deterministic, non-empty response.
+  app.get("/api/models", (_req, res) => {
+    listAvailableModels(options?.modelRegistry)
+      .then((models) => res.json(models))
+      .catch((error: unknown) => {
+        console.error("[api/models] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
+  });
+
+  // Task 6 (AC-6.2/AC-6.3): switch a conversation's model. 404 for an unknown
+  // conversation id (checked first, same pattern as GET /api/conversations/:id
+  // above). 400 for a modelId that resolveModelById can't resolve — per Task 5's
+  // AC-5.3 contract resolveModelById returns undefined rather than throwing, so this
+  // is a plain undefined check; per SPEC.md, touchConversation is deliberately not
+  // called in that case, leaving the conversation's modelId unchanged.
+  app.patch("/api/conversations/:id/model", express.json(), (req, res) => {
+    const meta = getConversationMeta(req.params.id);
+    if (!meta) {
+      res.status(404).end();
+      return;
+    }
+
+    const body = req.body as { modelId?: unknown } | undefined;
+    const modelId = typeof body?.modelId === "string" ? body.modelId : undefined;
+
+    (modelId ? resolveModelById(modelId, options?.modelRegistry) : Promise.resolve(undefined))
+      .then((resolved) => {
+        if (!resolved) {
+          res.status(400).end();
+          return;
+        }
+        touchConversation(req.params.id, { modelId });
+        res.json(getConversationMeta(req.params.id));
+      })
+      .catch((error: unknown) => {
+        console.error("[api/conversations/:id/model] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
   });
 
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).

@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Server } from "node:http";
+import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ConversationMeta } from "./agent/conversations.js";
 
 /**
@@ -153,5 +155,144 @@ describe("GET /api/conversations/:id", () => {
     const meta = (await res.json()) as ConversationMeta;
     expect(meta.id).toBe(created.id);
     expect(meta.title).toBe("lookup me");
+  });
+});
+
+/**
+ * Task 6: GET /api/models and PATCH /api/conversations/:id/model.
+ *
+ * A real (unstubbed) modelRegistry, built from the scratch agentDir the rest of this
+ * file's beforeAll points at, has no configured provider auth and would always
+ * resolve empty/undefined — useless for proving AC-6.1's "non-empty list" or
+ * AC-6.2's "valid modelId resolves". So this describe block spins up its own
+ * createApp() instance (own ephemeral port) with an injected stub ModelRegistry,
+ * mirroring agent/models.test.ts's makeModel/makeRegistryStub helpers exactly —
+ * createApp()'s new `options.modelRegistry` (Task 6, index.ts) exists specifically
+ * to make this injection possible without touching models.ts.
+ */
+describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
+  let modelServer: Server;
+  let modelBaseUrl: string;
+
+  function makeModel(overrides: Partial<Model<Api>> & { id: string; provider: string }): Model<Api> {
+    return {
+      name: overrides.id,
+      api: "anthropic-messages",
+      baseUrl: "https://example.invalid",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0 },
+      contextWindow: 100_000,
+      maxTokens: 4096,
+      ...overrides,
+    } as Model<Api>;
+  }
+
+  const STUB_MODEL = makeModel({ id: "claude-opus-4-5", name: "Claude Opus 4.5", provider: "anthropic" });
+  const STUB_MODEL_ID = `${STUB_MODEL.provider}/${STUB_MODEL.id}`;
+
+  function makeRegistryStub(): ModelRegistry {
+    return {
+      getAll: () => [STUB_MODEL],
+      getAvailable: () => [STUB_MODEL],
+    } as unknown as ModelRegistry;
+  }
+
+  beforeAll(async () => {
+    const { createApp } = await import("./index.js");
+    const app = createApp({ modelRegistry: makeRegistryStub() });
+
+    await new Promise<void>((resolve) => {
+      modelServer = app.listen(0, "127.0.0.1", () => resolve());
+    });
+
+    const address = modelServer.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected server.address() to be a net.AddressInfo");
+    }
+    modelBaseUrl = `http://127.0.0.1:${address.port}`;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve, reject) => {
+      modelServer.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+
+  // AC-6.1: Given at least one configured model (stubbed registry, see above), when
+  // GET /api/models is called, then it returns 200 with a non-empty list.
+  test("AC-6.1: GET /api/models returns 200 with a non-empty list", async () => {
+    const res = await fetch(`${modelBaseUrl}/api/models`);
+    expect(res.status).toBe(200);
+
+    const models = (await res.json()) as { id: string; label: string; provider: string }[];
+    expect(models.length).toBeGreaterThan(0);
+    expect(models).toContainEqual({ id: STUB_MODEL_ID, label: STUB_MODEL.name, provider: STUB_MODEL.provider });
+  });
+
+  // AC-6.2 [R]: Given an existing conversation and a valid modelId, when PATCH
+  // /api/conversations/:id/model is called, then it returns 200 and
+  // getConversationMeta(id).modelId reflects the change (checked here via the
+  // response body and a follow-up GET, since this describe block's server instance
+  // is the only one with the stub registry that can resolve STUB_MODEL_ID).
+  test("AC-6.2: valid modelId returns 200 with the conversation's modelId updated", async () => {
+    const created = (await (
+      await fetch(`${modelBaseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "model switch target" }),
+      })
+    ).json()) as ConversationMeta;
+    expect(created.modelId).toBeUndefined();
+
+    const patchRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}/model`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ modelId: STUB_MODEL_ID }),
+    });
+    expect(patchRes.status).toBe(200);
+    const patched = (await patchRes.json()) as ConversationMeta;
+    expect(patched.modelId).toBe(STUB_MODEL_ID);
+
+    const getRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}`);
+    const refetched = (await getRes.json()) as ConversationMeta;
+    expect(refetched.modelId).toBe(STUB_MODEL_ID);
+  });
+
+  // AC-6.3 [R]: Given an invalid modelId, when PATCH /api/conversations/:id/model is
+  // called, then it returns 400, and the conversation's modelId is unchanged (no
+  // silent no-op success) — proven by asserting the pre-PATCH state (undefined) is
+  // still exactly what a follow-up GET returns.
+  test("AC-6.3: invalid modelId returns 400 and leaves the conversation's modelId unchanged", async () => {
+    const created = (await (
+      await fetch(`${modelBaseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "bad model switch" }),
+      })
+    ).json()) as ConversationMeta;
+    expect(created.modelId).toBeUndefined();
+
+    const patchRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}/model`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ modelId: "nonexistent/does-not-exist" }),
+    });
+    expect(patchRes.status).toBe(400);
+
+    const getRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}`);
+    const refetched = (await getRes.json()) as ConversationMeta;
+    expect(refetched.modelId).toBeUndefined();
+  });
+
+  // AC-6.2 (contrast): unknown conversation id returns 404, not a silent 400, even
+  // with a resolvable modelId — matching /api/conversations/:id's own 404 pattern.
+  test("AC-6.2 (contrast): unknown conversation id returns 404", async () => {
+    const res = await fetch(`${modelBaseUrl}/api/conversations/does-not-exist/model`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ modelId: STUB_MODEL_ID }),
+    });
+    expect(res.status).toBe(404);
   });
 });
