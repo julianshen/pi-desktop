@@ -242,4 +242,21 @@ describe("ChatView", () => {
     });
     expect(onTurnCompleteCalls).toBe(1);
   });
+
+  // Regression test for a bug found LIVE via /tgd-verify (a real running app in a real
+  // browser): useShellState.ts used to initialize `model: "pi-2 Sonnet"`, a stale mock
+  // default, and this composer footer rendered it verbatim (`<span>{model}</span>`)
+  // even before any real model was ever selected — visibly inconsistent with
+  // MainHeader's own picker, which correctly showed the honest "Select model" empty
+  // state directly above it in the same live check. The fix: `model` now starts as ""
+  // (App.tsx passes `state.model` straight through), and this component must render
+  // nothing in the footer rather than ever falling back to a fake name.
+  test("composer footer renders nothing (no fake model name) when model is empty on initial load", () => {
+    render(<ChatView key="default" model="" conversationId="default" />);
+
+    expect(screen.queryByText("pi-2 Sonnet")).toBeNull();
+    // The textarea and send button must still render normally — only the model label
+    // span is conditionally omitted.
+    expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
+  });
 });

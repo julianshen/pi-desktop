@@ -238,7 +238,16 @@ export function ChatView({
                 <AttachIcon size={16} />
               </button>
               <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ fontSize: 11, color: "color-mix(in srgb, var(--color-text) 42%, transparent)" }}>{model}</span>
+                {/* Bug found live via /tgd-verify: `model` used to default to a hardcoded
+                 * fake name ("pi-2 Sonnet", src/state/useShellState.ts's old mock leftover)
+                 * that rendered here verbatim even before any real model was ever selected —
+                 * visibly inconsistent with MainHeader's own picker, which correctly showed
+                 * the honest "Select model" empty state right above it. Now that the shared
+                 * `model` value starts empty and only becomes real once a switch actually
+                 * happens, render nothing rather than ever showing a fake label. */}
+                {model && (
+                  <span style={{ fontSize: 11, color: "color-mix(in srgb, var(--color-text) 42%, transparent)" }}>{model}</span>
+                )}
                 <button onClick={submit} disabled={isLoading || !draft.trim()} className="btn btn-primary btn-icon">
                   <SendIcon size={17} />
                 </button>

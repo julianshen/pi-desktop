@@ -66,7 +66,18 @@ export function useShellState(initialView: ViewKey = "chat") {
     artifactOpen: true,
     canvasTab: "code",
     modelOpen: false,
-    model: "pi-2 Sonnet",
+    // Empty, not a fake name like the old "pi-2 Sonnet" mock leftover: there is no
+    // server-exposed "default model" concept (GET /api/models's ModelSummary is just
+    // { id, label, provider } — no current/default flag), so the only real "current
+    // model" is MainHeader's own per-conversation `modelId` lookup, which it already
+    // owns and renders locally. Until a real switch happens (MainHeader.tsx's
+    // handleSelectModel success path calls actions.setModel), this must stay honestly
+    // empty rather than show a name nothing configured. ChatView.tsx's composer
+    // footer renders nothing when this is falsy instead of ever showing a fake label
+    // (bug found live via /tgd-verify: the real MainHeader picker showed "Select
+    // model" while this composer footer simultaneously showed the fake
+    // "pi-2 Sonnet" underneath it).
+    model: "",
     activeFilter: DEFAULT_FILTER[initialView] ?? "All",
     settingsSection: "providers",
     taskOpen: null,

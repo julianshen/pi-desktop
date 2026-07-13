@@ -30,4 +30,23 @@ describe("useShellState", () => {
     const { result } = renderHook(() => useShellState());
     expect(result.current.state.view).toBe("chat");
   });
+
+  /**
+   * Regression test for a bug found LIVE via /tgd-verify (a real running app in a real
+   * browser), not just a mocked-test-only issue: `state.model` was hardcoded to
+   * "pi-2 Sonnet", a stale mock default from before this feature was wired to a real
+   * backend. MainHeader.tsx's own model picker correctly showed the honest "Select
+   * model" empty state (verified live, in an environment with no configured models),
+   * but ChatView.tsx's composer footer — which renders `state.model` directly — showed
+   * the fake "pi-2 Sonnet" name at the same time, immediately below it. There is no
+   * server-exposed "default model" (GET /api/models's ModelSummary has no
+   * current/default flag), so the only honest initial value is empty; ChatView.tsx
+   * renders nothing in the composer footer when `model` is falsy instead of ever
+   * showing a fake name.
+   */
+  test("initial model is empty, never the stale fake 'pi-2 Sonnet' mock default", () => {
+    const { result } = renderHook(() => useShellState());
+    expect(result.current.state.model).toBe("");
+    expect(result.current.state.model).not.toBe("pi-2 Sonnet");
+  });
 });
