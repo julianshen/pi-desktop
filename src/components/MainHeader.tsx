@@ -77,20 +77,45 @@ export function MainHeader({
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [switching, setSwitching] = useState(false);
   const [switchError, setSwitchError] = useState<string | null>(null);
+  // The provider-model-settings feature's Settings > Providers view lets a provider
+  // be connected/disconnected from a completely separate component with no direct
+  // channel back to this one. Without a refetch trigger, connecting a provider there
+  // then returning to Chat left this model list stuck at whatever it was on first
+  // mount (often empty, if no provider was connected yet when the app first loaded)
+  // — the picker showed zero options until a full app reload. Re-fetching on every
+  // `state.view` change is the same "refetch on a meaningful signal" pattern already
+  // used for conversation titles/artifacts elsewhere in this app; cheap enough to run
+  // on every navigation.
+  const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
 
-  // AC-11.1: fetch the real model list on mount instead of importing mockData's
-  // hardcoded `models` array.
+  // AC-11.1: fetch the real model list instead of importing mockData's hardcoded
+  // `models` array. Depends on `view` (see comment above `defaultModelId`) rather
+  // than running once on mount only.
   useEffect(() => {
     let cancelled = false;
+    setModelsLoading(true);
 
-    fetch(`${API_BASE}/api/models`)
-      .then((res) => {
+    Promise.all([
+      fetch(`${API_BASE}/api/models`).then((res) => {
         if (!res.ok) throw new Error(`GET /api/models failed: ${res.status}`);
         return res.json() as Promise<ModelSummary[]>;
-      })
-      .then((data) => {
+      }),
+      fetch(`${API_BASE}/api/settings/default-model`).then((res) => {
+        if (!res.ok) throw new Error(`GET /api/settings/default-model failed: ${res.status}`);
+        return res.json() as Promise<{ provider: string | null; model: string | null }>;
+      }),
+    ])
+      .then(([modelData, defaultModelData]) => {
         if (cancelled) return;
-        setModels(data);
+        setModels(modelData);
+        // /api/settings/default-model returns { provider, model } as separate bare
+        // fields (provider-model-settings' own convention), but /api/models' `id`
+        // is the combined `${provider}/${model.id}` form (models.ts's
+        // listAvailableModels()) — comparing the bare `model` field directly against
+        // `models[].id` never matches. Reconstruct the combined form here.
+        setDefaultModelId(
+          defaultModelData.provider && defaultModelData.model ? `${defaultModelData.provider}/${defaultModelData.model}` : null,
+        );
         setModelsLoading(false);
       })
       .catch((err: unknown) => {
@@ -102,20 +127,25 @@ export function MainHeader({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [view]);
 
   // Once the model list and the active conversation are both available, show that
-  // conversation's real model selection. Skipped while a switch is in flight so it
-  // can't clobber the optimistic-looking "Switching model…" state.
+  // conversation's real model selection — falling back to the real global default
+  // configured via Settings > Model Defaults (never an arbitrary `models[0]`, which
+  // could display a different model than what a fresh conversation will actually
+  // use). Skipped while a switch is in flight so it can't clobber the
+  // optimistic-looking "Switching model…" state.
   useEffect(() => {
     if (modelsLoading || switching || models.length === 0) return;
     const fromConversation = activeConversation?.modelId;
     if (fromConversation && models.some((m) => m.id === fromConversation)) {
       setSelectedModelId(fromConversation);
-    } else if (!selectedModelId) {
-      setSelectedModelId(models[0]?.id ?? null);
+    } else if (defaultModelId && models.some((m) => m.id === defaultModelId)) {
+      setSelectedModelId(defaultModelId);
+    } else {
+      setSelectedModelId(null);
     }
-  }, [modelsLoading, switching, models, activeConversation?.modelId, selectedModelId]);
+  }, [modelsLoading, switching, models, activeConversation?.modelId, defaultModelId]);
 
   const selectedModel = models.find((m) => m.id === selectedModelId);
 

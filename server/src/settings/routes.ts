@@ -1,7 +1,7 @@
 import express, { type Request, type Response, type Router } from "express";
 import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { getAgentDeps } from "../agent/deps.js";
-import { getSharedSession } from "../agent/session.js";
+import { getOrCreateSession, setLiveSessionModel } from "../agent/conversations.js";
 
 /**
  * Hardcoded copy of the SDK's built-in provider id -> display name map.
@@ -246,30 +246,41 @@ async function handleGetModels(_req: Request, res: Response): Promise<void> {
 settingsRouter.get("/models", guarded("GET /models", handleGetModels));
 
 /*
- * Open question resolved (Task 3, per TASKS.md's "Before writing code" instruction):
- * does `(await getSharedSession()).model` return a sensible value on a cold server
- * start, before any explicit setModel() call / chat turn?
+ * Reconciled with wire-chat-backend's multi-conversation session registry (merged
+ * after this feature was originally built against the old single-shared-session
+ * `agent/session.ts`, since deleted). "The default model" now reads/writes through
+ * `getOrCreateSession("default")` — the conversation id wire-chat-backend's Task 2
+ * migration proved is backed by the same persisted state the old
+ * `getSharedSession()` pointed at, so this is not a behavior change for the
+ * single-conversation case this feature was designed around.
  *
- * Traced through the SDK source (not just the .d.ts prose) to confirm:
+ * Crucially, this remains a genuinely *global* default, not something scoped only to
+ * the "default" conversation: `AgentSession.setModel()` writes through to the pi
+ * SDK's own `SettingsManager`, which persists to `<agentDir>/settings.json` —
+ * a single file shared by every conversation's session, not a per-conversation
+ * store. Any *new* conversation created without its own explicit `modelId` override
+ * (`agent/conversations.ts`'s `createSession()`, when `getAgentDeps()`'s `model` is
+ * unset) resolves its starting model via the SDK's own `findInitialModel()`, which
+ * reads that same `SettingsManager`-persisted default. So calling `setModel()` here
+ * on the "default" conversation's session correctly sets what every future
+ * newly-created conversation will start with, exactly matching this feature's
+ * original single-session "global default" intent — traced through the SDK source
+ * (not just .d.ts prose) during the original implementation:
  *
  *   - model-resolver.d.ts's findInitialModel() documents priority order:
  *     1. CLI args, 2. first scoped model (non-continuing only), 3. restored from
  *     session, 4. SettingsManager saved default, 5. first available model with a
  *     configured key.
- *   - dist/core/sdk.js's createAgentSession() (the function server/src/agent/session.ts's
- *     createSession() calls) shows this isn't just documentation: when no `model` option
- *     is passed in (our case — agent/deps.ts's `model` is only set if PI_DESKTOP_MODEL is
- *     set) and there's no existing session to restore from, it calls
- *     `findInitialModel({ defaultProvider: settingsManager.getDefaultProvider(),
- *     defaultModelId: settingsManager.getDefaultModel(), ... })` and assigns the result to
- *     `model` BEFORE constructing the Agent/AgentSession — i.e. resolution happens
- *     synchronously during `createAgentSession()`, not lazily on first prompt.
+ *   - dist/core/sdk.js's createAgentSession() shows this isn't just documentation:
+ *     when no `model` option is passed in and there's no existing session to restore
+ *     from, it calls `findInitialModel({ defaultProvider:
+ *     settingsManager.getDefaultProvider(), defaultModelId:
+ *     settingsManager.getDefaultModel(), ... })` and assigns the result to `model`
+ *     BEFORE constructing the Agent/AgentSession.
  *   - dist/core/agent-session.js's `setModel()` confirms the write path: it calls
- *     `this.settingsManager.setDefaultModelAndProvider(model.provider, model.id)` on the
- *     *same* `SettingsManager` instance `createAgentSession()` constructed internally and
- *     handed to `new AgentSession({ ..., settingsManager })` — so reads and writes go
- *     through one consistent object, persisted to disk under `<agentDir>/settings.json`
- *     via `FileSettingsStorage`. No gap, no need for a second, competing `SettingsManager`.
+ *     `this.settingsManager.setDefaultModelAndProvider(model.provider, model.id)` on
+ *     the *same* `SettingsManager` instance `createAgentSession()` constructed
+ *     internally — reads and writes go through one consistent object.
  *
  * BUT: live-verified (not just .d.ts-verified) that `session.model` is *never actually
  * `undefined`*, contradicting agent-session.d.ts's "(may be undefined if not yet
@@ -285,7 +296,7 @@ settingsRouter.get("/models", guarded("GET /models", handleGetModels));
  * doesn't require importing pi-agent-core's unexported DEFAULT_MODEL to compare against.
  */
 async function handleGetDefaultModel(_req: Request, res: Response): Promise<void> {
-  const session = await getSharedSession();
+  const session = await getOrCreateSession("default");
   const { modelRegistry } = await getAgentDeps();
   const current = session.model;
   const registered = current && modelRegistry.find(current.provider, current.id);
@@ -308,11 +319,11 @@ async function handleSetDefaultModel(req: Request, res: Response): Promise<void>
     return;
   }
 
-  const session = await getSharedSession();
-  // setModel() is the SDK's own documented write path — "Validates that auth is
-  // configured, saves to session and settings" (agent-session.d.ts) — and it's the
-  // only writer we ever want touching AgentSession/SettingsManager state (see the
-  // open-question resolution above). Its *auth-validation* failure ("No API key for
+  // setLiveSessionModel() (agent/conversations.ts, added by wire-chat-backend's
+  // Critical model-switch fix) resolves the "default" conversation's live cached
+  // AgentSession and calls its setModel() — the SDK's own documented write path
+  // ("Validates that auth is configured, saves to session and settings",
+  // agent-session.d.ts). Its *auth-validation* failure ("No API key for
   // {provider}/{id}", thrown verbatim from agent-session.js's setModel() — confirmed
   // by reading the SDK source, not just its .d.ts) is an expected, user-correctable
   // condition (the model was found in the registry but has no configured auth), not a
@@ -327,7 +338,8 @@ async function handleSetDefaultModel(req: Request, res: Response): Promise<void>
   // re-thrown to fall through to the outer `guarded()` .catch(), which already logs
   // server-side and returns a generic, non-leaking 500.
   try {
-    await session.setModel(found);
+    await getOrCreateSession("default");
+    await setLiveSessionModel("default", found);
   } catch (error: unknown) {
     if (error instanceof Error && error.message.startsWith("No API key for")) {
       res.status(422).json({ error: error.message });
