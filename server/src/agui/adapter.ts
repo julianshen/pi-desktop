@@ -88,22 +88,34 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
   if (!session) return;
 
   let currentMessageId: string | undefined;
+  // pi's own agentic loop routinely emits an assistant message that carries only
+  // "thinking"/toolcall content and zero text_delta (e.g. the turn where the model
+  // decides to call a tool, before any user-visible text) — its message_start/
+  // message_end pair has no text between them. Eagerly writing TEXT_MESSAGE_START on
+  // message_start rendered these as a visible empty chat bubble ("empty lines in
+  // chat"). Fix: defer TEXT_MESSAGE_START until the first real text_delta arrives for
+  // this message, and only close it with TEXT_MESSAGE_END if it was actually opened.
+  let textMessageStarted = false;
 
   const unsubscribe = session.subscribe((event) => {
     switch (event.type) {
       case "message_start": {
         if (event.message.role === "assistant") {
           currentMessageId = randomUUID();
-          write({
-            type: EventType.TEXT_MESSAGE_START,
-            messageId: currentMessageId,
-            role: "assistant",
-          } as BaseEvent);
+          textMessageStarted = false;
         }
         break;
       }
       case "message_update": {
         if (event.assistantMessageEvent.type === "text_delta" && currentMessageId) {
+          if (!textMessageStarted) {
+            write({
+              type: EventType.TEXT_MESSAGE_START,
+              messageId: currentMessageId,
+              role: "assistant",
+            } as BaseEvent);
+            textMessageStarted = true;
+          }
           write({
             type: EventType.TEXT_MESSAGE_CONTENT,
             messageId: currentMessageId,
@@ -114,8 +126,11 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
       }
       case "message_end": {
         if (event.message.role === "assistant" && currentMessageId) {
-          write({ type: EventType.TEXT_MESSAGE_END, messageId: currentMessageId } as BaseEvent);
+          if (textMessageStarted) {
+            write({ type: EventType.TEXT_MESSAGE_END, messageId: currentMessageId } as BaseEvent);
+          }
           currentMessageId = undefined;
+          textMessageStarted = false;
         }
         break;
       }
