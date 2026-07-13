@@ -361,3 +361,65 @@ describe("GET /api/conversations/:id/artifacts/latest", () => {
     expect(text).not.toContain(".ts:");
   });
 });
+
+// Security-review finding (Critical, /tgd-review security-auditor): createApp() used
+// to mount `cors()` with no options, which is the `cors` package's wildcard default
+// (Access-Control-Allow-Origin: *). Combined with zero auth on any route, that let any
+// web page open in the user's regular browser cross-origin POST into /agui (arbitrary
+// prompt injection, including resuming the well-known "default" conversation id) — see
+// config/env.ts's DEFAULT_CORS_ORIGINS for the fix and full origin-allowlist rationale.
+//
+// `Content-Type: application/json` POSTs are not CORS-"simple" requests, so browsers
+// preflight them with an OPTIONS request first; these tests drive that same preflight
+// directly against the real app.listen() instance (matching this file's existing
+// pattern of exercising real HTTP rather than mocking) to prove a disallowed Origin
+// does not get a permissive response, and an allowlisted one does.
+describe("CORS", () => {
+  test("preflight from a disallowed origin does not get a permissive Access-Control-Allow-Origin", async () => {
+    const res = await fetch(`${baseUrl}/agui`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "https://evil.example",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+      },
+    });
+
+    const allowOrigin = res.headers.get("access-control-allow-origin");
+    expect(allowOrigin).not.toBe("*");
+    expect(allowOrigin).not.toBe("https://evil.example");
+  });
+
+  // Proves the fix isn't so restrictive it breaks the app's own frontend: the Vite
+  // dev-server origin (src-tauri/tauri.conf.json's build.devUrl, which the packaged
+  // webview navigates to directly in `tauri dev` — see config/env.ts's comment) must
+  // still get a real preflight approval, not just "not blocked".
+  test("preflight from the app's own dev-server origin is allowed", async () => {
+    const res = await fetch(`${baseUrl}/agui`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "http://localhost:1420",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+      },
+    });
+
+    expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:1420");
+  });
+
+  // Same check for the packaged macOS/Linux webview's tauri://localhost origin, so a
+  // regression here (e.g. someone "simplifying" the allowlist down to just the dev
+  // origin) is caught by tests rather than only discovered in a packaged build.
+  test("preflight from the packaged macOS/Linux webview origin is allowed", async () => {
+    const res = await fetch(`${baseUrl}/agui`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: "tauri://localhost",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type",
+      },
+    });
+
+    expect(res.headers.get("access-control-allow-origin")).toBe("tauri://localhost");
+  });
+});

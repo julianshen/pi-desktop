@@ -30,7 +30,11 @@ export interface CreateAppOptions {
  */
 export function createApp(options?: CreateAppOptions): Express {
   const app = express();
-  app.use(cors());
+  // Security-review finding (Critical, /tgd-review security-auditor): restrict CORS to
+  // this app's own frontend origins (see config/env.ts's DEFAULT_CORS_ORIGINS for the
+  // full rationale) instead of the `cors` package's wildcard default. Scoped mitigation
+  // only — no request auth is added here, that's a separate tracked initiative.
+  app.use(cors({ origin: env.corsOrigins }));
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
