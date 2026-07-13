@@ -22,6 +22,31 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * MainHeader now fetches GET /api/models and GET /api/settings/default-model
+ * concurrently (Promise.all) on every `view` change, not just once on mount, so it
+ * can show the real Settings-configured default when a conversation has no
+ * per-conversation model override. A mock that returns the SAME Response instance
+ * (or the same already-resolved promise) for both calls breaks with
+ * "Body has already been used" once both `.json()` calls run — each call below
+ * must produce a FRESH Response. `defaultModel` defaults to the not-yet-set shape.
+ */
+function mockFetchForModels(
+  models: unknown[],
+  options: { defaultModel?: { provider: string | null; model: string | null }; onPatch?: (init?: RequestInit) => Response } = {},
+): typeof fetch {
+  const defaultModel = options.defaultModel ?? { provider: null, model: null };
+  return mock((url: string, init?: RequestInit) => {
+    if (init?.method === "PATCH") {
+      return Promise.resolve(options.onPatch ? options.onPatch(init) : jsonResponse({}, 500));
+    }
+    if (url.includes("/api/settings/default-model")) {
+      return Promise.resolve(jsonResponse(defaultModel));
+    }
+    return Promise.resolve(jsonResponse(models));
+  }) as unknown as typeof fetch;
+}
+
 function makeMeta(overrides: Partial<ConversationMeta> = {}): ConversationMeta {
   return {
     id: overrides.id ?? "conv-1",
@@ -57,14 +82,16 @@ function Harness({
   conversations,
   activeConv = "conv-1",
   onSetModel,
+  view = "chat",
 }: {
   conversations: UseConversationsResult;
   activeConv?: string;
   onSetModel?: (name: string) => void;
+  view?: ShellState["view"];
 }) {
   const [modelOpen, setModelOpen] = useState(false);
   const state: ShellState = {
-    view: "chat",
+    view,
     activeConv,
     artifactOpen: false,
     canvasTab: "code",
@@ -110,7 +137,12 @@ describe("MainHeader", () => {
     const pending = new Promise<Response>((resolve) => {
       resolveFetch = resolve;
     });
-    global.fetch = mock(() => pending) as unknown as typeof fetch;
+    // MainHeader awaits both /api/models and /api/settings/default-model
+    // (Promise.all) — give each its own never-shared pending promise so resolving
+    // one doesn't try to read the other's already-consumed body.
+    global.fetch = mock((url: string) =>
+      url.includes("/api/settings/default-model") ? Promise.resolve(jsonResponse({ provider: null, model: null })) : pending,
+    ) as unknown as typeof fetch;
 
     render(
       <Harness
@@ -137,12 +169,9 @@ describe("MainHeader", () => {
     ];
     const conv = makeMeta({ id: "conv-1", title: "Sprint planning", modelId: models[0]?.id });
 
-    global.fetch = mock((_url: string, init?: RequestInit) => {
-      if (init?.method === "PATCH") {
-        return Promise.resolve(jsonResponse({ ...conv, modelId: models[1]?.id }));
-      }
-      return Promise.resolve(jsonResponse(models));
-    }) as unknown as typeof fetch;
+    global.fetch = mockFetchForModels(models, {
+      onPatch: () => jsonResponse({ ...conv, modelId: models[1]?.id }),
+    });
 
     render(
       <Harness
@@ -175,12 +204,7 @@ describe("MainHeader", () => {
     ];
     const conv = makeMeta({ id: "conv-1", title: "Sprint planning", modelId: models[0]?.id });
 
-    global.fetch = mock((_url: string, init?: RequestInit) => {
-      if (init?.method === "PATCH") {
-        return Promise.resolve(jsonResponse({}, 500));
-      }
-      return Promise.resolve(jsonResponse(models));
-    }) as unknown as typeof fetch;
+    global.fetch = mockFetchForModels(models, { onPatch: () => jsonResponse({}, 500) });
 
     render(
       <Harness
@@ -208,12 +232,9 @@ describe("MainHeader", () => {
     ];
     const conv = makeMeta({ id: "conv-1", title: "Sprint planning", modelId: models[0]?.id });
 
-    global.fetch = mock((_url: string, init?: RequestInit) => {
-      if (init?.method === "PATCH") {
-        return Promise.resolve(jsonResponse({ ...conv, modelId: models[1]?.id }));
-      }
-      return Promise.resolve(jsonResponse(models));
-    }) as unknown as typeof fetch;
+    global.fetch = mockFetchForModels(models, {
+      onPatch: () => jsonResponse({ ...conv, modelId: models[1]?.id }),
+    });
 
     const setModelCalls: string[] = [];
 
@@ -255,5 +276,78 @@ describe("MainHeader", () => {
     expect(screen.queryByText("July investor update")).toBeNull();
 
     await waitFor(() => expect(screen.queryByText("Loading models…")).toBeNull());
+  });
+
+  // Bug fix (live-usage report: "provider and model settings work not as expected"):
+  // connecting a provider happens in a completely separate view (Settings >
+  // Providers) with no direct channel back to MainHeader. Before this fix,
+  // MainHeader fetched /api/models exactly once on mount, so returning to Chat
+  // after connecting a provider elsewhere left the picker showing zero models
+  // until a full app reload — reproduced live against a real running app.
+  test("bug fix: model list is refetched when navigating back to Chat (view change), not just once on mount", async () => {
+    const models = [{ id: "anthropic/claude-opus-4-5", label: "Claude Opus 4.5", provider: "anthropic" }];
+    let fetchCount = 0;
+    global.fetch = mock((url: string) => {
+      if (url.includes("/api/settings/default-model")) {
+        return Promise.resolve(jsonResponse({ provider: null, model: null }));
+      }
+      fetchCount += 1;
+      // First mount: no provider connected yet, so the real backend would return [].
+      // After navigating away to Settings and back, a provider is now connected.
+      return Promise.resolve(jsonResponse(fetchCount === 1 ? [] : models));
+    }) as unknown as typeof fetch;
+
+    const conv = makeMeta({ id: "conv-1", title: "Sprint planning" });
+    const { rerender } = render(
+      <Harness conversations={makeConversationsResult({ conversations: [conv], activeId: "conv-1" })} activeConv="conv-1" view="chat" />,
+    );
+
+    await waitFor(() => expect(screen.queryByText("Loading models…")).toBeNull());
+    expect(screen.getByText("Select model")).toBeTruthy();
+
+    // Navigate to Settings, then back to Chat — simulates connecting a provider
+    // there and returning, without a full page reload.
+    rerender(
+      <Harness conversations={makeConversationsResult({ conversations: [conv], activeId: "conv-1" })} activeConv="conv-1" view="settings" />,
+    );
+    rerender(
+      <Harness conversations={makeConversationsResult({ conversations: [conv], activeId: "conv-1" })} activeConv="conv-1" view="chat" />,
+    );
+
+    // No per-conversation override and no configured default in this test, so the
+    // header label correctly stays the honest "Select model" (a separate, deliberate
+    // fix — see the next test) — the refetch itself is proven by opening the
+    // dropdown and seeing the newly-available model as an option.
+    await waitFor(() => expect(fetchCount).toBeGreaterThan(1));
+    fireEvent.click(screen.getByLabelText("Model picker"));
+    await waitFor(() => expect(screen.getByText("Claude Opus 4.5")).toBeTruthy());
+  });
+
+  // Bug fix (same live-usage report): a fresh conversation with no explicit
+  // per-conversation model override must show the real global default configured
+  // via Settings > Model Defaults, not an arbitrary first entry from the model
+  // list — falling back to `models[0]` could display (and the user could then
+  // send a message against) a different model than what the conversation will
+  // actually use, since the SDK resolves the real starting model from the
+  // Settings-configured default, not list order.
+  test("bug fix: a conversation with no modelId override shows the real Settings-configured default, not an arbitrary models[0]", async () => {
+    const models = [
+      { id: "anthropic/claude-opus-4-5", label: "Claude Opus 4.5", provider: "anthropic" },
+      { id: "anthropic/claude-haiku-4-5", label: "Claude Haiku 4.5", provider: "anthropic" },
+    ];
+    // /api/settings/default-model returns { provider, model } with a BARE model id
+    // (provider-model-settings' own convention) — deliberately NOT pre-combined with
+    // the provider prefix here, to prove MainHeader reconstructs `${provider}/${model}`
+    // itself rather than assuming the two endpoints share an id format.
+    global.fetch = mockFetchForModels(models, {
+      defaultModel: { provider: "anthropic", model: "claude-haiku-4-5" },
+    });
+
+    const conv = makeMeta({ id: "conv-1", title: "New conversation" });
+    render(<Harness conversations={makeConversationsResult({ conversations: [conv], activeId: "conv-1" })} activeConv="conv-1" />);
+
+    // Not "Claude Opus 4.5" (models[0]) — the actual configured default.
+    await waitFor(() => expect(screen.getByText("Claude Haiku 4.5")).toBeTruthy());
+    expect(screen.queryByText("Claude Opus 4.5")).toBeNull();
   });
 });

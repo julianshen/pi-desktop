@@ -153,24 +153,6 @@ export const codeRuns: CodeRun[] = [
   { repo: "infra", branch: "feat/cron-agents", task: "Provision scheduled-agent workers", status: "Blocked", added: "+130", removed: "−4", step: "Waiting on approval · terraform plan" },
 ];
 
-export interface Provider {
-  name: string;
-  note: string;
-  status: Status;
-  models: number;
-  url: string;
-}
-
-export const providersList: Provider[] = [
-  { name: "pi Cloud", note: "Native · hosted", status: "Connected", models: 6, url: "api.pi.dev" },
-  { name: "OpenAI", note: "", status: "Connected", models: 14, url: "api.openai.com/v1" },
-  { name: "Anthropic", note: "", status: "Connected", models: 8, url: "api.anthropic.com" },
-  { name: "Ollama", note: "Local runtime", status: "Connected", models: 11, url: "localhost:11434" },
-  { name: "Google Vertex", note: "", status: "Not connected", models: 0, url: "—" },
-  { name: "Mistral", note: "", status: "Not connected", models: 0, url: "—" },
-  { name: "OpenRouter", note: "", status: "Not connected", models: 0, url: "—" },
-];
-
 export const filterConfig: Record<string, { heading: string; items: [string, string][] }> = {
   artifacts: { heading: "Type", items: [["All", "24"], ["Apps", "7"], ["Documents", "9"], ["Charts", "5"], ["Datasets", "3"]] },
   scheduled: { heading: "Status", items: [["All", "6"], ["Active", "4"], ["Paused", "1"], ["Failed", "1"]] },
