@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { useCopilotChat, useThreads } from "@copilotkit/react-core";
-import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
+import { useCopilotChatInternal, useThreads } from "@copilotkit/react-core";
+import { Role, TextMessage, aguiToGQL } from "@copilotkit/runtime-client-gql";
 import { Blueprint } from "../components/Blueprint";
 import { AttachIcon, SendIcon } from "../components/icons";
 
@@ -50,8 +50,38 @@ export function ChatView({ model, conversationId }: { model: string; conversatio
     setThreadId(conversationId);
   }, [conversationId, setThreadId]);
 
-  const { visibleMessages: rawMessages, appendMessage, isLoading } = useCopilotChat();
-  const visibleMessages = rawMessages ?? [];
+  // Pre-existing bug fix (unrelated to Task 12's thread-routing work above, found while
+  // verifying that fix live): `useCopilotChat()` in this installed
+  // @copilotkit/react-core@1.62.3 destructures `visibleMessages` from its internal hook
+  // (dist/index.mjs's `useCopilotChat`), but that internal hook (`useCopilotChatInternal`)
+  // only ever returns a key named `messages` — it never computes or returns
+  // `visibleMessages` at all. So `useCopilotChat().visibleMessages` is unconditionally
+  // `undefined`, and the old `rawMessages ?? []` fallback silently rendered an empty
+  // transcript regardless of real chat content.
+  //
+  // `messages` (what the internal hook actually returns, aliased to its own
+  // `resolvedMessages`, itself sourced from `agent.messages`) is real AG-UI-format data —
+  // but it's a *different shape* than what this file's render logic below expects: plain
+  // `@ag-ui/core` `Message` objects (`{ role, content, toolCalls? }`), not the
+  // `@copilotkit/runtime-client-gql` `Message` classes (`TextMessage`/
+  // `ActionExecutionMessage`, with `.isTextMessage()`/`.isActionExecutionMessage()`
+  // methods) this file's `.map()` below relies on. `visibleMessages`'s own doc comment
+  // (`UseCopilotChatReturn$1` in the package's `.d.mts`) confirms that's exactly what it
+  // was supposed to be: "the visible messages, not the raw messages from the runtime
+  // client" — i.e. the GQL-shaped conversion of `messages`, which this version of the
+  // library forgot to actually produce.
+  //
+  // Fix: call `useCopilotChatInternal()` directly (also exported from
+  // `@copilotkit/react-core`, and the same hook `useCopilotChat()` wraps) to get the real,
+  // working `messages` field, then reconstruct the missing conversion ourselves via
+  // `aguiToGQL()` — a public export of `@copilotkit/runtime-client-gql` that performs
+  // exactly this AG-UI-to-GQL mapping (confirmed in
+  // node_modules/@copilotkit/runtime-client-gql/dist/message-conversion/agui-to-gql.mjs).
+  // This keeps every downstream `.isTextMessage()`/`.isActionExecutionMessage()` call
+  // below unchanged, since `aguiToGQL()` returns real `TextMessage`/`ActionExecutionMessage`
+  // instances.
+  const { messages: rawMessages, appendMessage, isLoading } = useCopilotChatInternal();
+  const visibleMessages = aguiToGQL(rawMessages ?? []);
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
 

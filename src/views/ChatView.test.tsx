@@ -37,7 +37,7 @@ import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
 type MockMessage = InstanceType<typeof TextMessage>;
 
 interface ThreadState {
-  visibleMessages: MockMessage[];
+  messages: MockMessage[];
   isLoading: boolean;
 }
 
@@ -48,7 +48,7 @@ const threadIdRequestLog: string[] = [];
 function threadFor(id: string): ThreadState {
   let state = threadStore.get(id);
   if (!state) {
-    state = { visibleMessages: [], isLoading: false };
+    state = { messages: [], isLoading: false };
     threadStore.set(id, state);
   }
   return state;
@@ -60,14 +60,26 @@ function resetThreads(): void {
   threadIdRequestLog.length = 0;
 }
 
+// Task 12.1 critical-bug-fix note: `useCopilotChat()` itself is never called by
+// ChatView.tsx anymore — the component reads messages via `useCopilotChatInternal()`
+// instead, because the real installed @copilotkit/react-core@1.62.3 only populates a
+// `messages` field there (not the `visibleMessages` field `useCopilotChat()` wraps it in,
+// which is unconditionally `undefined` at runtime; see ChatView.tsx's call-site comment).
+// This mock therefore mirrors `useCopilotChatInternal()`'s real shape — returning raw
+// AG-UI-format messages under `messages` — and ChatView.tsx itself is responsible for
+// running `aguiToGQL()` over them, same as it does against the real library. Mocking under
+// the old `visibleMessages` key (as this file originally did) would validate nothing: it
+// would pass even if ChatView.tsx regressed back to reading the always-`undefined`
+// `visibleMessages` field, because the mock — not the real library's actual behavior —
+// would be supplying the data.
 mock.module("@copilotkit/react-core", () => ({
-  useCopilotChat: () => {
+  useCopilotChatInternal: () => {
     const state = threadFor(activeThreadId);
     return {
-      visibleMessages: state.visibleMessages,
+      messages: state.messages,
       isLoading: state.isLoading,
       appendMessage: async (message: MockMessage) => {
-        state.visibleMessages = [...state.visibleMessages, message];
+        state.messages = [...state.messages, message];
       },
     };
   },
@@ -148,7 +160,33 @@ describe("ChatView", () => {
   test("AC-12.2: the active conversation's pre-existing messages show on load, not an empty greeting", async () => {
     const priorUser = new TextMessage({ id: "u1", content: "What's the weather API key stored as?", role: Role.User });
     const priorAssistant = new TextMessage({ id: "a1", content: "It's WEATHER_API_KEY in your .env.", role: Role.Assistant });
-    threadFor("default").visibleMessages = [priorUser, priorAssistant];
+    threadFor("default").messages = [priorUser, priorAssistant];
+
+    render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
+
+    expect(screen.getByText("What's the weather API key stored as?")).toBeTruthy();
+    expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
+    expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
+  });
+
+  // Regression test for the "chat transcript always renders empty" bug (found live,
+  // fixed alongside Task 12's routing work). The real @copilotkit/react-core's
+  // `agent.messages` — what `useCopilotChatInternal()`'s `messages` field is actually
+  // sourced from — holds plain `@ag-ui/core` message objects (`{ role, content, id }`),
+  // NOT `@copilotkit/runtime-client-gql` `TextMessage`/`ActionExecutionMessage` class
+  // instances. This test feeds the mock exactly that plain AG-UI shape (unlike the other
+  // tests above, which use GQL `TextMessage` instances directly) to prove ChatView.tsx's
+  // `aguiToGQL()` conversion step actually runs and produces objects with working
+  // `.isTextMessage()` methods. Before the fix, this would have failed two ways: (1) the
+  // old code read `useCopilotChat().visibleMessages`, which this mock never populates
+  // (it only backs `useCopilotChatInternal()`), so nothing would render; and (2) even a
+  // naive `visibleMessages` -> `messages` rename without the `aguiToGQL()` conversion
+  // would crash calling `.isTextMessage()` on a plain object that doesn't have it.
+  test("renders plain AG-UI-shaped messages (agent.messages' real shape) via the aguiToGQL conversion", async () => {
+    threadFor("default").messages = [
+      { id: "u1", role: "user", content: "What's the weather API key stored as?" },
+      { id: "a1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
+    ] as unknown as MockMessage[];
 
     render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
 
