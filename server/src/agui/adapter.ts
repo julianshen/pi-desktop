@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import type { Request, Response } from "express";
 import { EventType, type RunAgentInput, type BaseEvent } from "@ag-ui/core";
 import { EventEncoder } from "@ag-ui/encoder";
-import { getSharedSession } from "../agent/session.js";
+import { getOrCreateSession, getConversationMeta, touchConversation } from "../agent/conversations.js";
+
+const DEFAULT_CONVERSATION_TITLE = "New conversation";
+const DERIVED_TITLE_MAX_LENGTH = 60;
 
 function extractLatestUserText(input: RunAgentInput): string {
   for (let i = input.messages.length - 1; i >= 0; i -= 1) {
@@ -12,6 +15,38 @@ function extractLatestUserText(input: RunAgentInput): string {
     }
   }
   return "";
+}
+
+function extractFirstUserText(input: RunAgentInput): string {
+  for (const message of input.messages) {
+    if (message.role === "user") {
+      return typeof message.content === "string" ? message.content : "";
+    }
+  }
+  return "";
+}
+
+function deriveTitle(text: string): string {
+  const collapsed = text.trim().replace(/\s+/g, " ");
+  if (!collapsed) return DEFAULT_CONVERSATION_TITLE;
+  return collapsed.length > DERIVED_TITLE_MAX_LENGTH
+    ? `${collapsed.slice(0, DERIVED_TITLE_MAX_LENGTH)}…`
+    : collapsed;
+}
+
+/**
+ * End-of-turn bookkeeping (Task 3): always bumps updatedAt via touchConversation,
+ * and — only while the conversation still has the default title — derives one from
+ * the first user message so freshly-created conversations pick up a real title after
+ * their first turn without the user having to rename them manually.
+ */
+function touchConversationAfterTurn(conversationId: string, input: RunAgentInput): void {
+  const meta = getConversationMeta(conversationId);
+  if (meta?.title === DEFAULT_CONVERSATION_TITLE) {
+    touchConversation(conversationId, { title: deriveTitle(extractFirstUserText(input)) });
+  } else {
+    touchConversation(conversationId);
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -44,7 +79,8 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
 
   write({ type: EventType.RUN_STARTED, threadId: input.threadId, runId: input.runId } as BaseEvent);
 
-  const session = await getSharedSession().catch((error: unknown) => {
+  const conversationId = input.threadId ?? "default";
+  const session = await getOrCreateSession(conversationId).catch((error: unknown) => {
     write({ type: EventType.RUN_ERROR, message: errorMessage(error) } as BaseEvent);
     finish();
     return undefined;
@@ -109,6 +145,17 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
       }
       case "agent_end": {
         write({ type: EventType.RUN_FINISHED, threadId: input.threadId, runId: input.runId } as BaseEvent);
+        /**
+         * Task 3 fix (review finding): bookkeeping must never block stream teardown.
+         * If touchConversationAfterTurn throws (e.g. registry write failure), RUN_FINISHED
+         * has already reached the client — unsubscribe()/finish() still need to run so the
+         * SSE connection doesn't leak.
+         */
+        try {
+          touchConversationAfterTurn(conversationId, input);
+        } catch (error) {
+          console.error("[agui] touchConversationAfterTurn failed", error);
+        }
         unsubscribe();
         finish();
         break;

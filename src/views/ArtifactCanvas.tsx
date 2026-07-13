@@ -1,42 +1,98 @@
-import { Blueprint } from "../components/Blueprint";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CloseIcon } from "../components/icons";
-import { bars } from "../data/mockData";
 import type { CanvasTab } from "../state/useShellState";
+import { API_BASE } from "../state/apiBase.js";
 
-const KW = "color:var(--color-accent-700)";
-const ST = "color:#5f7a52";
-const CM = "color:color-mix(in srgb,var(--color-text) 38%,transparent)";
+/** Mirrors server/src/artifacts/store.ts's Artifact exactly (Task 13). */
+export interface Artifact {
+  id: string;
+  title: string;
+  language: string;
+  code: string;
+  publishedAt: string;
+}
 
-const CODE_LINES = [
-  `<span style="${KW}">import</span> { useMemo } <span style="${KW}">from</span> <span style="${ST}">"react"</span>;`,
-  `<span style="${KW}">import</span> { Bar } <span style="${KW}">from</span> <span style="${ST}">"./charts"</span>;`,
-  ``,
-  `<span style="${CM}">// WAU pulled live from postgres-prod</span>`,
-  `<span style="${KW}">export function</span> WAUDashboard({ rows }) {`,
-  `  <span style="${KW}">const</span> total = useMemo(`,
-  `    () =&gt; rows.at(-1).wau, [rows]`,
-  `  );`,
-  `  <span style="${KW}">return</span> (`,
-  `    &lt;<span style="${KW}">section</span> className=<span style="${ST}">"card"</span>&gt;`,
-  `      &lt;<span style="${KW}">h3</span>&gt;Weekly Active Users&lt;/<span style="${KW}">h3</span>&gt;`,
-  `      &lt;<span style="${KW}">strong</span>&gt;{total.toLocaleString()}&lt;/<span style="${KW}">strong</span>&gt;`,
-  `      &lt;<span style="${KW}">Bar</span> data={rows} x=<span style="${ST}">"wk"</span> y=<span style="${ST}">"wau"</span> /&gt;`,
-  `    &lt;/<span style="${KW}">section</span>&gt;`,
-  `  );`,
-  `}`,
-];
+type Status = "loading" | "empty" | "populated" | "updating";
 
-const MAX_BAR = 55;
+async function fetchLatestArtifact(conversationId: string): Promise<Artifact | null> {
+  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/artifacts/latest`);
+  if (!res.ok) throw new Error(`GET artifacts/latest failed: ${res.status}`);
+  return (await res.json()) as Artifact | null;
+}
 
 export function ArtifactCanvas({
   tab,
   onSetTab,
   onClose,
+  conversationId,
+  refreshSignal,
 }: {
   tab: CanvasTab;
   onSetTab: (tab: CanvasTab) => void;
   onClose: () => void;
+  /** Active conversation to fetch the latest artifact for. */
+  conversationId: string | null;
+  /**
+   * Any value that changes to signal "a chat turn just completed, re-check for a new
+   * artifact" (Task 13 / TASKS.md: "when ChatView's isLoading transitions true -> false").
+   * Wired in App.tsx: an incrementing counter, bumped from ChatView's
+   * `onTurnComplete` callback (fired on the true -> false edge of its own
+   * `isLoading`), is passed straight through here.
+   */
+  refreshSignal?: unknown;
 }) {
+  const [artifact, setArtifact] = useState<Artifact | null>(null);
+  const [status, setStatus] = useState<Status>("loading");
+  const isFirstRefreshRender = useRef(true);
+
+  const load = useCallback((id: string, mode: "loading" | "updating") => {
+    let cancelled = false;
+    setStatus(mode);
+    fetchLatestArtifact(id)
+      .then((data) => {
+        if (cancelled) return;
+        setArtifact(data);
+        setStatus(data ? "populated" : "empty");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Honest fallback: don't invent content on a failed fetch, just fall back to
+        // whatever we already had (or empty, on a failed initial load).
+        setStatus((prev) => (prev === "loading" ? "empty" : prev === "updating" ? "populated" : prev));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Initial mount + conversation switch: reset and fetch fresh.
+  useEffect(() => {
+    if (!conversationId) {
+      setArtifact(null);
+      setStatus("empty");
+      return;
+    }
+    setArtifact(null);
+    return load(conversationId, "loading");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId]);
+
+  // Turn-completion refresh signal: keep existing content visible, dim it, refetch.
+  // Skips the mount render so it doesn't double-fetch alongside the effect above.
+  useEffect(() => {
+    if (isFirstRefreshRender.current) {
+      isFirstRefreshRender.current = false;
+      return;
+    }
+    if (!conversationId) return;
+    return load(conversationId, "updating");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshSignal]);
+
+  const isUpdating = status === "updating";
+  const isEmpty = status === "empty";
+  const isLoading = status === "loading";
+
   return (
     <div
       style={{
@@ -49,13 +105,21 @@ export function ArtifactCanvas({
         minHeight: 0,
       }}
     >
+      <style>{"@keyframes artifactCanvasSpin { to { transform: rotate(360deg); } }"}</style>
+
       <div style={{ height: 52, flex: "none", display: "flex", alignItems: "center", gap: 10, padding: "0 14px", borderBottom: "1px solid var(--color-divider)" }}>
         <svg width={15} height={15} viewBox="0 0 24 24" fill="none" stroke="var(--color-accent)" strokeWidth={1.6}>
           <path d="M3 3h18v18H3z" />
           <path d="M8 17v-5M12 17V8M16 17v-3" />
         </svg>
-        <span style={{ fontFamily: "ui-monospace,Menlo,monospace", fontSize: 13 }}>WAU_dashboard.tsx</span>
-        <span className="tag tag-accent" style={{ padding: "1px 6px" }}>v3</span>
+        <span style={{ fontFamily: "ui-monospace,Menlo,monospace", fontSize: 13 }}>
+          {artifact ? artifact.title : "No artifact yet"}
+        </span>
+        {artifact && (
+          <span className="tag tag-accent" style={{ padding: "1px 6px" }}>
+            {artifact.language}
+          </span>
+        )}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 2 }}>
           <button
             onClick={onClose}
@@ -66,90 +130,138 @@ export function ArtifactCanvas({
         </div>
       </div>
 
-      <div style={{ flex: "none", display: "flex", gap: 2, padding: "8px 12px", borderBottom: "1px solid var(--color-divider)" }}>
-        <button
-          onClick={() => onSetTab("code")}
-          style={{
-            padding: "6px 14px",
-            border: "none",
-            cursor: "pointer",
-            fontFamily: "var(--font-heading)",
-            fontWeight: 600,
-            fontSize: 13,
-            background: tab === "code" ? "var(--color-accent)" : "transparent",
-            color: tab === "code" ? "var(--color-bg)" : "color-mix(in srgb, var(--color-text) 55%, transparent)",
-          }}
-        >
-          Code
-        </button>
-        <button
-          onClick={() => onSetTab("preview")}
-          style={{
-            padding: "6px 14px",
-            border: "none",
-            cursor: "pointer",
-            fontFamily: "var(--font-heading)",
-            fontWeight: 600,
-            fontSize: 13,
-            background: tab === "preview" ? "var(--color-accent)" : "transparent",
-            color: tab === "preview" ? "var(--color-bg)" : "color-mix(in srgb, var(--color-text) 55%, transparent)",
-          }}
-        >
-          Preview
-        </button>
-      </div>
-
-      {tab === "code" ? (
-        <div style={{ flex: 1, overflow: "auto", padding: "12px 0", fontFamily: "ui-monospace,'SF Mono',Menlo,monospace", fontSize: 12, lineHeight: 1.7 }}>
-          {CODE_LINES.map((html, i) => (
-            <div key={i} style={{ display: "flex" }}>
-              <span style={{ width: 38, flex: "none", textAlign: "right", paddingRight: 12, color: "color-mix(in srgb, var(--color-text) 30%, transparent)", userSelect: "none" }}>
-                {i + 1}
-              </span>
-              {/* Source is a fixed, hand-authored constant above — not user/network-derived. */}
-              <span style={{ whiteSpace: "pre", paddingRight: 16 }} dangerouslySetInnerHTML={{ __html: html }} />
-            </div>
-          ))}
-        </div>
-      ) : (
-        <div style={{ flex: 1, overflow: "auto", padding: 22 }}>
-          <Blueprint style={{ padding: 18, background: "var(--color-bg)" }}>
-            <div style={{ fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--color-accent)" }}>Weekly Active Users</div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 8, margin: "4px 0 16px" }}>
-              <span style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 30 }}>51,904</span>
-              <span style={{ fontSize: 12, color: "var(--color-accent-700)" }}>▲ 22.7%</span>
-            </div>
-            <div style={{ display: "flex", alignItems: "flex-end", gap: 10, height: 130 }}>
-              {bars.map((b) => (
-                <div key={b.label} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 6, height: "100%", justifyContent: "flex-end" }}>
-                  <div
-                    style={{
-                      width: "100%",
-                      height: `${(b.value / MAX_BAR) * 100}%`,
-                      background: b.isLast ? "var(--color-accent)" : "var(--color-accent-400)",
-                    }}
-                  />
-                  <span style={{ fontSize: 9, color: "color-mix(in srgb, var(--color-text) 45%, transparent)" }}>{b.label}</span>
-                </div>
-              ))}
-            </div>
-          </Blueprint>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 14 }}>
-            <Blueprint style={{ padding: 12 }}>
-              <div style={{ fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", color: "color-mix(in srgb, var(--color-text) 45%, transparent)" }}>
-                Retention 4-wk
-              </div>
-              <div style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 22 }}>68.4%</div>
-            </Blueprint>
-            <Blueprint style={{ padding: 12 }}>
-              <div style={{ fontSize: 10, letterSpacing: "0.08em", textTransform: "uppercase", color: "color-mix(in srgb, var(--color-text) 45%, transparent)" }}>
-                New this week
-              </div>
-              <div style={{ fontFamily: "var(--font-heading)", fontWeight: 600, fontSize: 22 }}>+3,182</div>
-            </Blueprint>
-          </div>
+      {!isEmpty && !isLoading && (
+        <div style={{ flex: "none", display: "flex", gap: 2, padding: "8px 12px", borderBottom: "1px solid var(--color-divider)" }}>
+          <button
+            onClick={() => onSetTab("code")}
+            style={{
+              padding: "6px 14px",
+              border: "none",
+              cursor: "pointer",
+              fontFamily: "var(--font-heading)",
+              fontWeight: 600,
+              fontSize: 13,
+              background: tab === "code" ? "var(--color-accent)" : "transparent",
+              color: tab === "code" ? "var(--color-bg)" : "color-mix(in srgb, var(--color-text) 55%, transparent)",
+            }}
+          >
+            Code
+          </button>
+          <button
+            onClick={() => onSetTab("preview")}
+            style={{
+              padding: "6px 14px",
+              border: "none",
+              cursor: "pointer",
+              fontFamily: "var(--font-heading)",
+              fontWeight: 600,
+              fontSize: 13,
+              background: tab === "preview" ? "var(--color-accent)" : "transparent",
+              color: tab === "preview" ? "var(--color-bg)" : "color-mix(in srgb, var(--color-text) 55%, transparent)",
+            }}
+          >
+            Preview
+          </button>
         </div>
       )}
+
+      <div style={{ flex: 1, overflow: "auto", padding: 22, position: "relative" }}>
+        {isUpdating && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              background: "color-mix(in srgb, var(--color-surface) 55%, transparent)",
+              backdropFilter: "blur(1px)",
+              zIndex: 1,
+            }}
+          />
+        )}
+        {isUpdating && (
+          <div
+            role="status"
+            style={{
+              position: "absolute",
+              top: 10,
+              right: 10,
+              display: "flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: 11,
+              color: "var(--color-accent-700)",
+              background: "var(--color-bg)",
+              border: "1px solid var(--color-divider)",
+              padding: "4px 10px",
+              zIndex: 2,
+            }}
+          >
+            <span
+              style={{
+                width: 11,
+                height: 11,
+                border: "2px solid var(--color-accent-300)",
+                borderTopColor: "var(--color-accent-700)",
+                borderRadius: "50%",
+                animation: "artifactCanvasSpin 0.7s linear infinite",
+              }}
+            />
+            updating
+          </div>
+        )}
+
+        {isLoading && (
+          <div style={{ padding: "40px 20px", textAlign: "center", fontSize: 13, color: "color-mix(in srgb, var(--color-text) 55%, transparent)" }}>
+            Loading artifact…
+          </div>
+        )}
+
+        {isEmpty && !isLoading && (
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center", gap: 10, padding: "46px 20px" }}>
+            <div
+              style={{
+                width: 44,
+                height: 44,
+                borderRadius: "50%",
+                background: "var(--color-accent-100)",
+                display: "grid",
+                placeItems: "center",
+                color: "var(--color-accent-700)",
+              }}
+            >
+              <svg width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}>
+                <path d="M14 3v18M3 5h18M3 19h18" />
+              </svg>
+            </div>
+            <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 60%, transparent)", maxWidth: 230 }}>
+              Nothing published to the canvas yet in this conversation.
+            </div>
+            <div style={{ fontSize: 11, color: "color-mix(in srgb, var(--color-text) 45%, transparent)" }}>
+              Ask pi to build something — code, a chart, a doc — and it'll appear here.
+            </div>
+          </div>
+        )}
+
+        {artifact && !isEmpty && !isLoading && tab === "code" && (
+          <pre
+            style={{
+              margin: 0,
+              fontFamily: "ui-monospace,'SF Mono',Menlo,monospace",
+              fontSize: 12,
+              lineHeight: 1.7,
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+            }}
+          >
+            {artifact.code}
+          </pre>
+        )}
+
+        {artifact && !isEmpty && !isLoading && tab === "preview" && (
+          <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 55%, transparent)", padding: "20px 0" }}>
+            No rich preview available for this artifact type — showing code only.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

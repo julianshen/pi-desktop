@@ -182,3 +182,15 @@ a:hover { color: var(--color-accent-700); }
 
 @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+/* Task 10 (wire-chat-backend): DESIGN.md's sidebar/model-picker spinner treatment
+   ("animation: spin 0.7s linear infinite") — same linear-rotation convention as the
+   strong-fit prototype's tokens.css, added here since design-system.css only had
+   `pulse`/`blink` before this feature needed a loading spinner. */
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* DESIGN.md Accessibility: spin/pulse are non-essential feedback — freeze to a
+   static state under reduced-motion rather than force everyone through the same
+   spinner, per general accessibility practice (still cheap for a single-user app). */
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; }
+}

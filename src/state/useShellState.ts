@@ -53,11 +53,31 @@ const RAIL_VIEWS: { key: ViewKey; label: string }[] = [
 export function useShellState(initialView: ViewKey = "chat") {
   const [state, setState] = useState<ShellState>({
     view: initialView,
-    activeConv: "c1",
+    // "default" is always a safe, correct initial conversation id: it maps 1:1 to
+    // env.workspaceDir (server/src/agent/conversations.ts's conversationCwd()) and is
+    // lazily registered by ensureDefaultConversation() on first touch regardless of
+    // whether GET /api/conversations has returned yet. It must NEVER be a mock id like
+    // "c1" (src/data/mockData.ts) — that was a real production bug (AC-12.2 regression):
+    // App.tsx renders ChatView/ArtifactCanvas keyed on this value before any real fetch
+    // completes, and the server has no registry-membership check, so an unrecognized id
+    // silently spins up a brand-new empty session instead of resolving to the user's
+    // real history.
+    activeConv: "default",
     artifactOpen: true,
     canvasTab: "code",
     modelOpen: false,
-    model: "pi-2 Sonnet",
+    // Empty, not a fake name like the old "pi-2 Sonnet" mock leftover: there is no
+    // server-exposed "default model" concept (GET /api/models's ModelSummary is just
+    // { id, label, provider } — no current/default flag), so the only real "current
+    // model" is MainHeader's own per-conversation `modelId` lookup, which it already
+    // owns and renders locally. Until a real switch happens (MainHeader.tsx's
+    // handleSelectModel success path calls actions.setModel), this must stay honestly
+    // empty rather than show a name nothing configured. ChatView.tsx's composer
+    // footer renders nothing when this is falsy instead of ever showing a fake label
+    // (bug found live via /tgd-verify: the real MainHeader picker showed "Select
+    // model" while this composer footer simultaneously showed the fake
+    // "pi-2 Sonnet" underneath it).
+    model: "",
     activeFilter: DEFAULT_FILTER[initialView] ?? "All",
     settingsSection: "providers",
     taskOpen: null,

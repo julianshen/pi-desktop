@@ -1,7 +1,8 @@
-import type { CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { PlusIcon, SearchIcon } from "./icons";
-import { convToday, convYesterday, filterConfig } from "../data/mockData";
+import { filterConfig } from "../data/mockData";
 import type { SettingsSection, ViewKey } from "../state/useShellState";
+import type { ConversationMeta, UseConversationsResult } from "../state/useConversations";
 
 const SIDEBAR_TITLES: Record<ViewKey, string> = {
   chat: "Conversations",
@@ -44,6 +45,153 @@ function convDot(active: boolean): CSSProperties {
   };
 }
 
+function Spinner({ size = 18 }: { size?: number }) {
+  return (
+    <span
+      style={{
+        width: size,
+        height: size,
+        flex: "none",
+        display: "inline-block",
+        border: "2px solid var(--color-accent-300)",
+        borderTopColor: "var(--color-accent-700)",
+        borderRadius: "50%",
+        animation: "spin 0.7s linear infinite",
+      }}
+    />
+  );
+}
+
+/**
+ * DESIGN.md's empty-state badge icon (Sidebar + Canvas share the same visual
+ * treatment: circular `--color-accent-100` bg, `--color-accent-700` icon).
+ */
+function EmptyBadgeIcon() {
+  return (
+    <svg width={20} height={20} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}>
+      <path d="M21 11.5a8.4 8.4 0 0 1-1.1 4.1L21 20l-4.4-1a8.5 8.5 0 1 1 4.4-7.5Z" />
+    </svg>
+  );
+}
+
+/** AC-10.1: DESIGN.md's `ConversationListLoading` — spinner + text, not a skeleton. */
+function ConversationListLoading() {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+        padding: "40px 20px",
+        color: "color-mix(in srgb, var(--color-text) 55%, transparent)",
+        fontSize: 13,
+      }}
+    >
+      <Spinner size={18} />
+      <span>Loading conversations…</span>
+    </div>
+  );
+}
+
+/** AC-10.2: DESIGN.md's `ConversationListEmpty` — badge + message + primary CTA. */
+function ConversationListEmpty({ onCreate, creating }: { onCreate: () => void; creating: boolean }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center", gap: 10, padding: "46px 20px" }}>
+      <div
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: "50%",
+          background: "var(--color-accent-100)",
+          display: "grid",
+          placeItems: "center",
+          color: "var(--color-accent-700)",
+        }}
+      >
+        <EmptyBadgeIcon />
+      </div>
+      <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 60%, transparent)" }}>
+        No conversations yet — start one to begin.
+      </div>
+      <button
+        onClick={onCreate}
+        disabled={creating}
+        style={{
+          marginTop: 4,
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          fontFamily: "var(--font-heading)",
+          fontWeight: 600,
+          fontSize: 13,
+          padding: "8px 16px",
+          background: "var(--color-accent)",
+          color: "var(--color-bg)",
+          border: "none",
+          cursor: creating ? "default" : "pointer",
+        }}
+      >
+        {creating && <Spinner size={13} />}+ New conversation
+      </button>
+    </div>
+  );
+}
+
+/**
+ * DESIGN.md States table: "Sidebar searching, zero matches" — not separately
+ * mocked in the prototype, so this reuses the empty-state badge/copy pattern with
+ * matching-specific copy instead of inventing a new treatment.
+ */
+function ConversationListNoMatches({ query }: { query: string }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", textAlign: "center", gap: 10, padding: "46px 20px" }}>
+      <div
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: "50%",
+          background: "var(--color-accent-100)",
+          display: "grid",
+          placeItems: "center",
+          color: "var(--color-accent-700)",
+        }}
+      >
+        <EmptyBadgeIcon />
+      </div>
+      <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 60%, transparent)" }}>
+        No conversations match &quot;{query}&quot;
+      </div>
+    </div>
+  );
+}
+
+function isSameLocalDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+}
+
+/**
+ * Task 10: simple recency-bucket grouping ("Today"/"Earlier" by `updatedAt`'s
+ * local calendar day) — TASKS.md's Open Questions explicitly defers a richer
+ * scheme (yesterday/last 7 days/older) to a post-launch refinement, and this is
+ * the minimal scheme that satisfies DESIGN.md's `ConversationGroup` shape
+ * (label + items) without inventing UI states nobody asked for yet. Assumes
+ * `list` already arrives sorted `updatedAt` desc (per Task 4's API contract), so
+ * within each bucket items stay in that order.
+ */
+function groupByRecency(list: ConversationMeta[]): { label: string; items: ConversationMeta[] }[] {
+  const now = new Date();
+  const today: ConversationMeta[] = [];
+  const earlier: ConversationMeta[] = [];
+  for (const c of list) {
+    (isSameLocalDay(new Date(c.updatedAt), now) ? today : earlier).push(c);
+  }
+  const groups: { label: string; items: ConversationMeta[] }[] = [];
+  if (today.length) groups.push({ label: "Today", items: today });
+  if (earlier.length) groups.push({ label: "Earlier", items: earlier });
+  return groups;
+}
+
 export function Sidebar({
   view,
   activeConv,
@@ -52,19 +200,51 @@ export function Sidebar({
   onSelectFilter,
   settingsSection,
   onSelectSettingsSection,
+  conversations,
 }: {
   view: ViewKey;
+  /** Canonical "active conversation id", owned by App.tsx's useShellState (unchanged
+   * prop shape) so ArtifactCanvas/MainHeader's own wiring to the same field keeps
+   * working — Sidebar just makes sure real conversation ids flow through it now. */
   activeConv: string;
   onSelectConv: (id: string) => void;
   activeFilter: string;
   onSelectFilter: (label: string) => void;
   settingsSection: SettingsSection;
   onSelectSettingsSection: (section: SettingsSection) => void;
+  /** Task 9's hook result, lifted to App.tsx so it fetches once and can be shared. */
+  conversations: UseConversationsResult;
 }) {
   const isChat = view === "chat";
   const isSettings = view === "settings";
   const isFiltered = !isChat && !isSettings;
   const cfg = filterConfig[view] ?? { heading: "", items: [] };
+
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  // AC-10.3: "+" creates a new conversation and it becomes active. `create()`'s
+  // Promise rejects on failure (network error/non-2xx) without touching the
+  // hook's own `error` state (see useConversations.ts) — so this is the one
+  // place responsible for catching that rejection and surfacing it. On success
+  // we route the new id through `onSelectConv` (App.tsx's shared "active
+  // conversation" state), not the hook's own `activeId`, to keep working the
+  // way ArtifactCanvas/MainHeader already read active-conversation state.
+  function handleCreate() {
+    setCreating(true);
+    setCreateError(null);
+    conversations
+      .create()
+      .then((created) => {
+        onSelectConv(created.id);
+      })
+      .catch((err: unknown) => {
+        setCreateError(err instanceof Error ? err.message : "Failed to create conversation.");
+      })
+      .finally(() => {
+        setCreating(false);
+      });
+  }
 
   return (
     <div
@@ -93,6 +273,10 @@ export function Sidebar({
         </span>
         {view !== "settings" && (
           <button
+            onClick={isChat ? handleCreate : undefined}
+            disabled={isChat ? creating : undefined}
+            aria-label={isChat ? "New conversation" : undefined}
+            title={isChat ? "New conversation" : undefined}
             style={{
               width: 28,
               height: 28,
@@ -101,10 +285,10 @@ export function Sidebar({
               border: "1px solid var(--color-divider)",
               background: "transparent",
               color: "var(--color-text)",
-              cursor: "pointer",
+              cursor: isChat && creating ? "default" : "pointer",
             }}
           >
-            <PlusIcon size={15} />
+            {isChat && creating ? <Spinner size={13} /> : <PlusIcon size={15} />}
           </button>
         )}
       </div>
@@ -121,75 +305,73 @@ export function Sidebar({
                 padding: "0 10px",
                 background: "var(--color-surface)",
                 border: "1px solid var(--color-divider)",
-                color: "color-mix(in srgb, var(--color-text) 55%, transparent)",
-                fontSize: 12,
               }}
             >
-              <SearchIcon size={13} />
-              <span>Search conversations</span>
+              <SearchIcon size={13} style={{ color: "color-mix(in srgb, var(--color-text) 55%, transparent)", flex: "none" }} />
+              <input
+                type="text"
+                value={conversations.searchQuery}
+                onChange={(e) => conversations.setSearchQuery(e.target.value)}
+                placeholder="Search conversations"
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  outline: "none",
+                  font: "inherit",
+                  fontSize: 12,
+                  color: "var(--color-text)",
+                  width: "100%",
+                }}
+              />
             </div>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: "0 10px 14px" }}>
-            <div style={{ fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--color-accent)", padding: "8px 6px 6px" }}>
-              Pinned
-            </div>
-            <button
-              style={{
-                width: "100%",
-                textAlign: "left",
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                padding: "8px 8px",
-                border: "none",
-                background: "transparent",
-                color: "var(--color-text)",
-                cursor: "pointer",
-                fontSize: 13,
-              }}
-            >
-              <svg width={13} height={13} viewBox="0 0 24 24" fill="none" stroke="var(--color-accent)" strokeWidth={1.6}>
-                <path d="m12 2 3 7 7 .5-5.3 4.6L18 21l-6-4-6 4 1.3-6.9L2 9.5 9 9z" />
-              </svg>
-              Model eval rubric
-            </button>
-            <div style={{ fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "color-mix(in srgb, var(--color-text) 45%, transparent)", padding: "12px 6px 6px" }}>
-              Today
-            </div>
-            {convToday.map((c) => {
-              const active = c.id === activeConv;
-              return (
-                <button key={c.id} onClick={() => onSelectConv(c.id)} style={convStyle(active)}>
-                  <span style={convDot(active)} />
-                  <span style={{ minWidth: 0, flex: 1 }}>
-                    <span style={{ display: "block", fontSize: 13, lineHeight: 1.25, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {c.title}
-                    </span>
-                    {c.preview && (
-                      <span style={{ display: "block", fontSize: 11, color: "color-mix(in srgb, var(--color-text) 45%, transparent)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                        {c.preview}
-                      </span>
-                    )}
-                  </span>
-                  <span style={{ fontSize: 10, color: "color-mix(in srgb, var(--color-text) 40%, transparent)" }}>{c.time}</span>
-                </button>
-              );
-            })}
-            <div style={{ fontSize: 10, letterSpacing: "0.1em", textTransform: "uppercase", color: "color-mix(in srgb, var(--color-text) 45%, transparent)", padding: "12px 6px 6px" }}>
-              Yesterday
-            </div>
-            {convYesterday.map((c) => {
-              const active = c.id === activeConv;
-              return (
-                <button key={c.id} onClick={() => onSelectConv(c.id)} style={convStyle(active)}>
-                  <span style={convDot(active)} />
-                  <span style={{ minWidth: 0, flex: 1, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {c.title}
-                  </span>
-                  <span style={{ fontSize: 10, color: "color-mix(in srgb, var(--color-text) 40%, transparent)" }}>{c.time}</span>
-                </button>
-              );
-            })}
+            {conversations.loading ? (
+              <ConversationListLoading />
+            ) : conversations.conversations.length === 0 ? (
+              <ConversationListEmpty onCreate={handleCreate} creating={creating} />
+            ) : conversations.filtered.length === 0 ? (
+              <ConversationListNoMatches query={conversations.searchQuery} />
+            ) : (
+              groupByRecency(conversations.filtered).map((group) => (
+                <div key={group.label}>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      letterSpacing: "0.1em",
+                      textTransform: "uppercase",
+                      color: "color-mix(in srgb, var(--color-text) 45%, transparent)",
+                      padding: "12px 6px 6px",
+                    }}
+                  >
+                    {group.label}
+                  </div>
+                  {group.items.map((c) => {
+                    const active = c.id === activeConv;
+                    return (
+                      <button key={c.id} onClick={() => onSelectConv(c.id)} style={convStyle(active)}>
+                        <span style={convDot(active)} />
+                        <span
+                          style={{
+                            minWidth: 0,
+                            flex: 1,
+                            fontSize: 13,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {c.title}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))
+            )}
+            {createError && (
+              <div style={{ fontSize: 11, color: "#b4463f", padding: "8px 6px" }}>{createError}</div>
+            )}
           </div>
         </>
       )}

@@ -32,8 +32,9 @@ function appendLog(taskId: string, entry: Record<string, unknown>): void {
 
 /**
  * Each scheduled task gets its own persisted session (keyed by task id under
- * dataDir), separate from the interactive chat session in agent/session.ts, so a
- * background run's history doesn't intermix with the live conversation.
+ * dataDir), separate from the interactive chat session (agent/conversations.ts's
+ * getOrCreateSession("default")), so a background run's history doesn't intermix
+ * with the live conversation.
  */
 async function runTask(task: ScheduledAgentConfig): Promise<void> {
   const taskCwd = path.join(env.dataDir, "scheduled", task.id);

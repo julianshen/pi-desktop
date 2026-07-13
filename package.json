@@ -15,25 +15,30 @@
     "server:build": "npm run build -w server",
     "sidecar:build": "npm run sidecar -w server",
     "lint": "tsc --noEmit && npm run lint -w server",
-    "typecheck": "tsc --noEmit && npm run typecheck -w server"
+    "typecheck": "tsc --noEmit && npm run typecheck -w server",
+    "test": "bun test ./src"
   },
   "dependencies": {
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
+    "@copilotkit/react-core": "^1.62.3",
+    "@copilotkit/react-ui": "^1.62.3",
+    "@copilotkit/runtime-client-gql": "^1.62.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
     "@tauri-apps/plugin-shell": "^2",
-    "@copilotkit/react-core": "^1.62.3",
-    "@copilotkit/react-ui": "^1.62.3",
-    "@copilotkit/runtime-client-gql": "^1.62.3"
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.10.6",
+    "@tauri-apps/cli": "^2",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "concurrently": "^9.1.2",
+    "happy-dom": "^20.10.6",
     "typescript": "~5.8.3",
-    "vite": "^7.0.4",
-    "@tauri-apps/cli": "^2",
-    "concurrently": "^9.1.2"
+    "vite": "^7.0.4"
   }
 }
