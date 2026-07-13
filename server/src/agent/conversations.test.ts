@@ -558,6 +558,64 @@ describe("toAGUIHistory (pi AgentMessage -> @ag-ui/core Message mapping)", () =>
     expect(result[0]).not.toHaveProperty("content");
   });
 
+  // Bug fix (live-usage report: a real conversation showed a stack of empty chat
+  // bubbles after a reload/reconnect). pi's agentic loop records a content-free
+  // assistant message for the turn where the model decides to call a tool — no
+  // text, and (unlike the "maps an assistant message with a tool call" case above)
+  // no toolCall content part either, since the tool call itself surfaces as a
+  // separate mechanism, not nested in this message. The live-streaming path
+  // (adapter.ts) already skips opening a bubble for these; history replay must not
+  // resurrect one as a bare `{id, role: "assistant"}` entry with neither `content`
+  // nor `toolCalls`.
+  test("drops an assistant message with neither text nor tool calls (thinking-only turn), never producing an empty bubble", () => {
+    const result = conversations.toAGUIHistory([
+      { role: "user", content: "run pwd", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "thinking", thinking: "I should call the bash tool" }],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
+        timestamp: 2,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "It's /Users/julianshen." }],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 3,
+      },
+    ]);
+
+    // Only the user message and the real final answer survive — the empty
+    // thinking-only assistant turn in between is dropped entirely, not pushed as
+    // a content-free entry.
+    expect(result).toEqual([
+      { id: "history-0", role: "user", content: "run pwd" },
+      { id: "history-2", role: "assistant", content: "It's /Users/julianshen." },
+    ]);
+    expect(result.some((m) => m.role === "assistant" && !("content" in m) && !("toolCalls" in m))).toBe(false);
+  });
+
   test("maps a toolResult message to an AG-UI tool message", () => {
     const result = conversations.toAGUIHistory([
       {
