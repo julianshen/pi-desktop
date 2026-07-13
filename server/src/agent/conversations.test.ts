@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -210,6 +210,47 @@ describe("conversations registry", () => {
     // conversationCwd()'s guard runs first, so the malicious id never gets a chance
     // to create a directory outside dataDir/conversations in the first place.
     await expect(conversations.getOrCreateSession("../../../tmp/evil")).rejects.toThrow();
+  });
+
+  // Code-review finding (Important, /tgd-review): sessionPromises.set(id, promise)
+  // used to run synchronously *before* the async createSession(id) body had a chance
+  // to reject, so every subsequent call for the same id returned the exact same
+  // permanently-rejected promise instance -- a malformed/attacker-supplied id (or a
+  // transient failure) would "brick" that id forever and grow the map unboundedly.
+  // Proves the fix: a second call for the same malformed id gets a genuinely fresh
+  // rejected promise (not `===` the first), and that fresh call still correctly
+  // rejects on retry rather than silently succeeding.
+  test("getOrCreateSession() evicts a rejected promise so a repeated malformed id retries fresh instead of replaying a cached rejection", async () => {
+    const id = "../../../tmp/evil-retry";
+
+    const first = conversations.getOrCreateSession(id);
+    await expect(first).rejects.toThrow();
+
+    const second = conversations.getOrCreateSession(id);
+    expect(second).not.toBe(first);
+    await expect(second).rejects.toThrow();
+  });
+
+  // Same finding, transient-failure variant: unlike a permanently-invalid id, a
+  // transient failure (e.g. a blip in fs.mkdirSync) must not permanently brick the
+  // conversation either -- once the transient cause is gone, a retry for the same id
+  // must succeed, proving the map entry was evicted rather than left caching the
+  // earlier rejection.
+  test("getOrCreateSession() recovers from a transient createSession() failure on retry instead of staying permanently rejected", async () => {
+    const meta = conversations.createConversation("transient failure conversation");
+
+    const mkdirSpy = spyOn(fs, "mkdirSync").mockImplementationOnce(() => {
+      throw new Error("simulated transient failure");
+    });
+
+    await expect(conversations.getOrCreateSession(meta.id)).rejects.toThrow("simulated transient failure");
+
+    mkdirSpy.mockRestore();
+
+    // The transient cause is gone; a fresh retry for the same id must now succeed
+    // rather than replaying the earlier cached rejection.
+    const session = await conversations.getOrCreateSession(meta.id);
+    expect(session).toBeDefined();
   });
 });
 

@@ -129,6 +129,22 @@ export function getOrCreateSession(id: string): Promise<AgentSession> {
   let promise = sessionPromises.get(id);
   if (!promise) {
     promise = createSession(id);
+    /**
+     * Code-review finding (Important, /tgd-review): Map.set() happens synchronously
+     * here, before createSession()'s async body has a chance to throw/reject — so a
+     * transient failure (or a malformed id tripping assertSafeConversationId) would
+     * otherwise cache a permanently-rejected promise for `id` forever, "bricking" that
+     * conversation until server restart and letting attacker-supplied malformed ids
+     * grow this map unboundedly. Evict the entry on rejection so the next call for the
+     * same id retries fresh instead of replaying the same stale rejection. The .catch()
+     * here only removes the cache entry; it re-throws so callers of getOrCreateSession()
+     * still observe the original rejection undisturbed.
+     */
+    promise.catch(() => {
+      if (sessionPromises.get(id) === promise) {
+        sessionPromises.delete(id);
+      }
+    });
     sessionPromises.set(id, promise);
   }
   return promise;
