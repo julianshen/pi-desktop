@@ -143,6 +143,15 @@ export function MainHeader({
       .then(() => {
         setSelectedModelId(modelId);
         setSwitching(false);
+        // Bug fix (found in final review): this only ever updated MainHeader's own
+        // local `selectedModelId`/`selectedModel` state, never useShellState's shared
+        // `state.model` — so ChatView's composer footer (`<span>{model}</span>`, which
+        // reads `state.model` directly) stayed stuck on the initial placeholder label
+        // forever, even after a successful switch here. Push the newly active model's
+        // display label into shell state too so every consumer of `state.model` agrees
+        // with what MainHeader itself is now showing.
+        const newModel = models.find((m) => m.id === modelId);
+        actions.setModel(newModel?.label ?? modelId);
       })
       .catch((err: unknown) => {
         console.error("[MainHeader] failed to switch model", err);

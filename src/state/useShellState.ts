@@ -53,7 +53,16 @@ const RAIL_VIEWS: { key: ViewKey; label: string }[] = [
 export function useShellState(initialView: ViewKey = "chat") {
   const [state, setState] = useState<ShellState>({
     view: initialView,
-    activeConv: "c1",
+    // "default" is always a safe, correct initial conversation id: it maps 1:1 to
+    // env.workspaceDir (server/src/agent/conversations.ts's conversationCwd()) and is
+    // lazily registered by ensureDefaultConversation() on first touch regardless of
+    // whether GET /api/conversations has returned yet. It must NEVER be a mock id like
+    // "c1" (src/data/mockData.ts) — that was a real production bug (AC-12.2 regression):
+    // App.tsx renders ChatView/ArtifactCanvas keyed on this value before any real fetch
+    // completes, and the server has no registry-membership check, so an unrecognized id
+    // silently spins up a brand-new empty session instead of resolving to the user's
+    // real history.
+    activeConv: "default",
     artifactOpen: true,
     canvasTab: "code",
     modelOpen: false,

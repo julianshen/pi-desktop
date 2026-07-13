@@ -55,9 +55,11 @@ function noop() {}
 function Harness({
   conversations,
   activeConv = "conv-1",
+  onSetModel,
 }: {
   conversations: UseConversationsResult;
   activeConv?: string;
+  onSetModel?: (name: string) => void;
 }) {
   const [modelOpen, setModelOpen] = useState(false);
   const state: ShellState = {
@@ -79,7 +81,7 @@ function Harness({
     openArtifact: noop,
     setCanvasTab: noop,
     toggleModelMenu: () => setModelOpen((o) => !o),
-    setModel: noop,
+    setModel: onSetModel ?? noop,
     setActiveFilter: noop,
     setSettingsSection: noop,
     openTask: noop,
@@ -196,6 +198,41 @@ describe("MainHeader", () => {
 
     await waitFor(() => expect(screen.getByLabelText("Model picker").textContent).toContain("Claude Opus 4.5"));
     await waitFor(() => expect(screen.getByText(/Couldn.t switch model/)).toBeTruthy());
+  });
+
+  test("MEDIUM bug fix: a successful model switch also calls actions.setModel with the newly active model's label, so shared shell state (and ChatView's composer footer) doesn't stay stuck on the initial placeholder label", async () => {
+    const models = [
+      { id: "anthropic/claude-opus-4-5", label: "Claude Opus 4.5", provider: "anthropic" },
+      { id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5", provider: "anthropic" },
+    ];
+    const conv = makeMeta({ id: "conv-1", title: "Sprint planning", modelId: models[0]?.id });
+
+    global.fetch = mock((_url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        return Promise.resolve(jsonResponse({ ...conv, modelId: models[1]?.id }));
+      }
+      return Promise.resolve(jsonResponse(models));
+    }) as unknown as typeof fetch;
+
+    const setModelCalls: string[] = [];
+
+    render(
+      <Harness
+        conversations={makeConversationsResult({ conversations: [conv], activeId: "conv-1" })}
+        activeConv="conv-1"
+        onSetModel={(name) => setModelCalls.push(name)}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByText("Claude Opus 4.5")).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText("Model picker"));
+    await waitFor(() => expect(screen.getByText("Claude Sonnet 5")).toBeTruthy());
+    fireEvent.click(screen.getByText("Claude Sonnet 5"));
+
+    await waitFor(() => expect(screen.getByLabelText("Model picker").textContent).toContain("Claude Sonnet 5"));
+
+    expect(setModelCalls).toEqual(["Claude Sonnet 5"]);
   });
 
   test('AC-11.3: breadcrumb and title reflect the active conversation\'s real title, never the hardcoded "July investor update"', async () => {
