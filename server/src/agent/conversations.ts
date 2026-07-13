@@ -297,6 +297,16 @@ export function toAGUIHistory(messages: SessionMessage[]): AGUIMessage[] {
     if (message.role === "assistant") {
       const text = extractText(message.content);
       const toolCalls = extractToolCalls(message.content);
+      // Live-usage bug fix (same root cause as adapter.ts's "empty lines in chat"
+      // fix): pi's agentic loop records a content-free assistant message for the
+      // turn where the model decides to call a tool — no text_delta, and the tool
+      // call itself surfaces as a separate top-level event, not nested in this
+      // message's own content array, so extractToolCalls() finds nothing here
+      // either. The live-streaming path already skips opening a bubble for these;
+      // history replay must not resurrect them as an empty `{id, role:
+      // "assistant"}` entry on every reload/conversation-switch — confirmed live
+      // via a real conversation showing a stack of empty bubbles after a reload.
+      if (!text && toolCalls.length === 0) return;
       result.push({
         id,
         role: "assistant",
