@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "build": "echo 'no build step: bun runs TypeScript directly. Run \"bun run sidecar\" (from repo root: npm run sidecar:build) to compile the packaged binary.'",
