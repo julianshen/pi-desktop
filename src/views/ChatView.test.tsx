@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { useCallback, useState } from "react";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useCallback, useReducer, useState } from "react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
 
 /**
@@ -24,14 +24,26 @@ import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
  * conceptually (a single shared value, since CopilotKit's `agent` is a singleton), and
  * forces a re-render the way the real ThreadsProvider's `useState` would.
  *
- * This still does NOT model the real HttpAgent's actual message-persistence behavior
- * (the real `agent.messages` singleton gets cleared, with nothing to refill it from, on
- * every thread switch — see ChatView.tsx's "known remaining gap" comment). This mock's
- * per-thread store deliberately keeps each thread's messages indefinitely so these tests
- * can prove ChatView's own rendering logic (greeting vs. transcript, local draft-state
- * reset) is correct given each thread's data — full-fidelity proof that the real app's
- * history persists across a switch-and-back requires the live E2E check documented in
- * the Task 12 critical-fix commit, not this file.
+ * This does NOT model the real HttpAgent's actual isFreshRestore clear-on-switch timing
+ * (see ChatView.tsx's now-updated seeding-effect comment for the real mechanics). This
+ * mock's per-thread store deliberately keeps each thread's messages indefinitely by
+ * default so the tests above (AC-12.1/AC-12.2) can prove ChatView's own rendering logic
+ * (greeting vs. transcript, local draft-state reset) is correct given each thread's data,
+ * independent of CopilotKit's own clear/reconnect lifecycle — full-fidelity proof that
+ * the real app's history survives a same-session switch-and-back requires the live E2E
+ * check documented in the Task 12 critical-fix commit, not this file.
+ *
+ * Critical fix (/tgd-review — closes US-03's P0 acceptance criterion / TASKS.md's
+ * AC-12.2): `useCopilotChatInternal()` also returns `isAvailable` (mocked constant
+ * `true` here — this file's own docstring above already explains why full connect-
+ * lifecycle timing isn't modeled) and `setMessages` (mocked below to mirror the real
+ * `agent.setMessages()`: it writes into whichever thread is *currently* active, matching
+ * the real singleton-agent's behavior of not caring which conversationId the caller
+ * thinks it's writing for). The dedicated test below drives a thread that starts with an
+ * empty local store (modeling the post-clear state after a reload) and a mocked
+ * `fetch()` standing in for the new `GET /api/conversations/:id/messages` endpoint, to
+ * prove ChatView's seeding effect actually calls `setMessages()` with the fetched
+ * history rather than leaving the transcript empty.
  */
 
 type MockMessage = InstanceType<typeof TextMessage>;
@@ -74,12 +86,39 @@ function resetThreads(): void {
 // would be supplying the data.
 mock.module("@copilotkit/react-core", () => ({
   useCopilotChatInternal: () => {
+    // Real @copilotkit/react-core re-renders on message changes via a subscription
+    // (`agent.setMessages()`/`addMessage()` notify `onMessagesChanged`, which
+    // `useAgent()` turns into a `forceUpdate`) — this module-level thread store is
+    // plain mutable state with no such subscription of its own, so this mock needs its
+    // own forceUpdate to reproduce that: without it, mutating `state.messages` from
+    // `setMessages()` (below) would update the store but never schedule a re-render,
+    // and screen assertions would hang waiting for text that's in the data but not on
+    // screen. (AC-12.1's `appendMessage` case happens to work without this too, but
+    // only incidentally — because `submit()` also calls the real `setDraft("")`, which
+    // triggers ChatView's own re-render as a side effect. `setMessages` has no such
+    // incidental trigger, so it needs its own.)
+    const [, forceRender] = useReducer((x: number) => x + 1, 0);
     const state = threadFor(activeThreadId);
     return {
       messages: state.messages,
       isLoading: state.isLoading,
       appendMessage: async (message: MockMessage) => {
         state.messages = [...state.messages, message];
+        forceRender();
+      },
+      // Real @copilotkit/react-core flips this false->true around the isFreshRestore
+      // clear+swallowed-connect settling (see ChatView.tsx's seeding-effect comment).
+      // This file's docstring above explains why that timing isn't modeled — constant
+      // `true` still exercises the seeding effect's `conversationId` dependency on every
+      // switch, which is what the dedicated seeding test below needs.
+      isAvailable: true,
+      // Mirrors the real `agent.setMessages()`: writes into whichever thread is
+      // *currently* active at call time (not whichever thread was active when
+      // useCopilotChatInternal() was invoked) — a real singleton `agent.messages` has no
+      // notion of "which conversationId asked for this."
+      setMessages: (messages: MockMessage[]) => {
+        threadFor(activeThreadId).messages = messages;
+        forceRender();
       },
     };
   },
@@ -110,11 +149,24 @@ mock.module("@copilotkit/react-core", () => ({
 // the real (unmocked) module instead.
 const { ChatView } = await import("./ChatView.js");
 
+let originalFetch: typeof fetch;
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
 beforeEach(() => {
   resetThreads();
+  originalFetch = global.fetch;
+  // Default stub for the seeding effect's GET /api/conversations/:id/messages call
+  // (added by the US-03 fix below) so tests that don't care about history-seeding
+  // don't hit the real network / log noisy ECONNREFUSED errors. Tests that DO care
+  // override global.fetch themselves before rendering.
+  global.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
 });
 
 afterEach(() => {
+  global.fetch = originalFetch;
   cleanup();
 });
 
@@ -241,6 +293,73 @@ describe("ChatView", () => {
       );
     });
     expect(onTurnCompleteCalls).toBe(1);
+  });
+
+  // Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
+  // criterion / TASKS.md's AC-12.2): "switching to a previously-open conversation shows
+  // an empty transcript, not its real prior messages." Unlike AC-12.1/AC-12.2 above
+  // (which pre-populate the mock's idealized per-thread store to prove ChatView's
+  // *rendering* logic), this test starts the thread's local store genuinely empty — the
+  // real post-isFreshRestore-clear state — and proves ChatView's *seeding effect* is what
+  // repopulates it: a mocked `fetch()` stands in for the new
+  // `GET /api/conversations/:id/messages` endpoint, and the assertion is that the fetched
+  // history actually reaches the screen via the mock's `setMessages()` (which, like the
+  // real `agent.setMessages()`, is the only thing that can put messages into the thread
+  // store here — nothing else in this test ever populates it).
+  test("US-03 fix: switching to a conversation with server-side history replays it via fetch + setMessages, not an empty greeting", async () => {
+    threadFor("conv-with-history").messages = [];
+
+    const fetchCalls: string[] = [];
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push(url);
+      if (url.endsWith("/api/conversations/conv-with-history/messages")) {
+        return Promise.resolve(
+          jsonResponse([
+            { id: "history-0", role: "user", content: "What's the weather API key stored as?" },
+            { id: "history-1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
+          ]),
+        );
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    render(<ChatView key="conv-with-history" model="pi-2 Sonnet" conversationId="conv-with-history" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("What's the weather API key stored as?")).toBeTruthy();
+    });
+    expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
+    expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
+    expect(fetchCalls.some((url) => url.endsWith("/api/conversations/conv-with-history/messages"))).toBe(true);
+  });
+
+  // Contrast case: a conversation the server genuinely has no history for (a brand-new
+  // conversation) must stay on the greeting, not error out or render anything from a
+  // dangling previous fetch — `setMessages()` must not even be called for an empty
+  // response (see ChatView.tsx's seeding-effect comment on why: avoiding a no-op notify).
+  test("US-03 fix (contrast): an empty server-side history leaves the greeting shown, not a crash or stale content", async () => {
+    threadFor("conv-empty-history").messages = [];
+
+    const fetchCalls: string[] = [];
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push(url);
+      if (url.endsWith("/api/conversations/conv-empty-history/messages")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    render(<ChatView key="conv-empty-history" model="pi-2 Sonnet" conversationId="conv-empty-history" />);
+
+    // Confirm the seeding effect actually ran (fetched) before asserting on its
+    // aftermath — otherwise this test would trivially pass even if the effect never
+    // fired at all, since the greeting is already what an untouched empty thread shows.
+    await waitFor(() => {
+      expect(fetchCalls.some((url) => url.endsWith("/api/conversations/conv-empty-history/messages"))).toBe(true);
+    });
+    expect(screen.getByText(GREETING_SNIPPET, { exact: false })).toBeTruthy();
   });
 
   // Regression test for a bug found LIVE via /tgd-verify (a real running app in a real

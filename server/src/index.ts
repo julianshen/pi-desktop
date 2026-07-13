@@ -11,6 +11,7 @@ import {
   getConversationMeta,
   touchConversation,
   setLiveSessionModel,
+  getConversationMessages,
 } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact } from "./artifacts/store.js";
@@ -124,6 +125,35 @@ export function createApp(options?: CreateAppOptions): Express {
       })
       .catch((error: unknown) => {
         console.error("[api/conversations/:id/model] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
+  });
+
+  // Critical fix (/tgd-review code-reviewer finding — US-03 P0 / TASKS.md's
+  // AC-12.2): "switching to a previously-open conversation shows an empty
+  // transcript, not its real prior messages" — root-caused in ChatView.tsx's
+  // "Known remaining gap" comment (now updated) to two things: the installed
+  // `@ag-ui/client` HttpAgent has no real connect()/replay implementation, and
+  // (until now) this server exposed no way for the frontend to fetch a
+  // conversation's history and seed the client-side agent state itself.
+  // SPEC.md anticipated this exact contingency and named this route/shape.
+  //
+  // getConversationMessages() (agent/conversations.ts) does the mapping from
+  // pi's internal AgentMessage[] to the @ag-ui/core Message[] wire shape
+  // ChatView.tsx feeds straight into `agent.setMessages()`. Same malformed-id
+  // handling convention as GET /api/conversations/:id/artifacts/latest below:
+  // conversations.ts's assertSafeConversationId guard normalizes to a plain 400
+  // (a client error, no stack trace leaked), everything else is an unexpected
+  // 500 logged via console.error first.
+  app.get("/api/conversations/:id/messages", (req, res) => {
+    getConversationMessages(req.params.id)
+      .then((messages) => res.json(messages))
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.message.startsWith("Invalid conversation id")) {
+          res.status(400).end();
+          return;
+        }
+        console.error("[api/conversations/:id/messages] unhandled error", error);
         if (!res.headersSent) res.status(500).end();
       });
   });

@@ -3,6 +3,7 @@ import { useCopilotChatInternal, useThreads } from "@copilotkit/react-core";
 import { Role, TextMessage, aguiToGQL } from "@copilotkit/runtime-client-gql";
 import { Blueprint } from "../components/Blueprint";
 import { AttachIcon, SendIcon } from "../components/icons";
+import { API_BASE } from "../state/apiBase.js";
 
 const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
@@ -53,15 +54,40 @@ export function ChatView({
   // threadIds, and switching away from a conversation no longer leaves its messages
   // bleeding into the next one.
   //
-  // Known remaining gap (does NOT fully satisfy "switching back replays prior history"):
-  // the installed `HttpAgent` has no `connect()` implementation (@ag-ui/client's
-  // `AbstractAgent.connect()` throws `AGUIConnectNotImplementedError` unless a transport
-  // overrides it), and this server exposes no message-history endpoint — so the
-  // isFreshRestore clear above has nothing to refill from. Switching back to a
-  // conversation resets the visible transcript to empty even though the server's pi
-  // session still has full history and will use it correctly on the next turn. Fixing
-  // that needs new backend surface (a history endpoint + a way to seed `agent.messages`),
-  // tracked separately — out of scope for this routing fix.
+  // Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
+  // criterion / TASKS.md's AC-12.2), closing what used to be documented here as a
+  // "known remaining gap": the installed `HttpAgent` genuinely has no working
+  // `connect()` (@ag-ui/client's `AbstractAgent.connect()` throws
+  // `AGUIConnectNotImplementedError` unless a transport overrides it — confirmed in
+  // node_modules/@ag-ui/client/dist/index.d.ts, and swallowed internally by
+  // @copilotkit/core's RunHandler.connectAgent, which is why no console error was ever
+  // visible for this). So the `isFreshRestore` clear above (`agent.setMessages([])`,
+  // @copilotkit/core's RunHandler.connectAgent) really does leave the transcript with
+  // nothing to refill from via the AG-UI connect path — the server previously exposed no
+  // other way to fetch a conversation's history.
+  //
+  // Fix: server/src/index.ts now exposes `GET /api/conversations/:id/messages` (SPEC.md's
+  // own anticipated contingency for exactly this gap), returning the conversation's
+  // AgentSession#messages mapped to `@ag-ui/core`'s `Message[]` wire shape
+  // (agent/conversations.ts's `toAGUIHistory`/`getConversationMessages`). On the frontend,
+  // `useCopilotChatInternal()` already returns a public, sanctioned way to seed history —
+  // `setMessages()` (confirmed in node_modules/@copilotkit/react-core/dist/index.mjs;
+  // it wraps `agent.setMessages()`, which both replaces `agent.messages` AND notifies the
+  // `onMessagesChanged` subscription `useAgent()` sets up, so assigning through it,
+  // unlike a bare `agent.messages = [...]`, actually triggers a re-render) — no need to
+  // reach for the internal, non-exported `useAgent()` hook.
+  //
+  // Sequencing matters here (this feature has already been bitten twice by exactly this
+  // kind of CopilotKit lifecycle subtlety — see the Task 12 fix above and the stale-
+  // initial-state bug). `agent.setMessages([])` inside the isFreshRestore clear happens
+  // asynchronously, *inside* the same `connectAgent()` call whose failure this file's own
+  // `useCopilotChatInternal` effect swallows before flipping `isAvailable` from false back
+  // to true (see @copilotkit/react-core's `useCopilotChatInternal`: `setAgentAvailable(false)`
+  // synchronously at the start of every (re)connect, `setAgentAvailable(true)` only after
+  // `copilotkit.connectAgent()` — which performs the clear — settles). Seeding on
+  // `conversationId` change alone would race that clear and could get wiped out
+  // immediately after; gating the fetch+seed on `isAvailable` (below) guarantees it only
+  // runs once the clear has already happened for this thread.
   const { setThreadId } = useThreads();
   useEffect(() => {
     setThreadId(conversationId);
@@ -97,10 +123,48 @@ export function ChatView({
   // This keeps every downstream `.isTextMessage()`/`.isActionExecutionMessage()` call
   // below unchanged, since `aguiToGQL()` returns real `TextMessage`/`ActionExecutionMessage`
   // instances.
-  const { messages: rawMessages, appendMessage, isLoading } = useCopilotChatInternal();
+  const {
+    messages: rawMessages,
+    appendMessage,
+    isLoading,
+    isAvailable,
+    setMessages,
+  } = useCopilotChatInternal();
   const visibleMessages = aguiToGQL(rawMessages ?? []);
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+
+  // See the seeding-effect comment above (Critical /tgd-review fix, US-03/AC-12.2):
+  // once `isAvailable` flips true for this thread — meaning the isFreshRestore clear
+  // has already happened — fetch this conversation's real history and seed it in. A
+  // brand-new/never-messaged conversation legitimately returns [], in which case there
+  // is nothing to seed (the clear already left `agent.messages` empty) and setMessages
+  // is deliberately not called, to avoid an extra no-op notify on every mount/switch.
+  useEffect(() => {
+    if (!isAvailable) return;
+    let cancelled = false;
+
+    fetch(`${API_BASE}/api/conversations/${conversationId}/messages`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`GET conversations/:id/messages failed: ${res.status}`);
+        return res.json();
+      })
+      .then((history: unknown) => {
+        if (cancelled || !Array.isArray(history) || history.length === 0) return;
+        setMessages(history as Parameters<typeof setMessages>[0]);
+      })
+      .catch((error: unknown) => {
+        // Honest fallback (matches ArtifactCanvas.tsx's convention): a failed history
+        // fetch leaves the transcript exactly as the isFreshRestore clear left it
+        // (empty) rather than inventing content — the next turn still works correctly
+        // regardless, since the server's pi session has the real history either way.
+        console.error("[ChatView] failed to load conversation history", error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, isAvailable, setMessages]);
 
   // Task 13 follow-up: fire `onTurnComplete` exactly on the true -> false edge of
   // `isLoading`, not merely "whenever isLoading is false" (which would also fire on

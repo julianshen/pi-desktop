@@ -478,3 +478,176 @@ describe("default conversation migration", () => {
     expect(conversations.getConversationMeta("default")?.title).toBe("Renamed default");
   });
 });
+
+/**
+ * Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
+ * criterion / TASKS.md's AC-12.2): "switching to a previously-open conversation
+ * shows an empty transcript instead of its real prior messages." Backend half of
+ * the fix — see index.test.ts for the route-level (GET
+ * /api/conversations/:id/messages) coverage, and src/views/ChatView.test.tsx for
+ * the frontend seeding-effect coverage.
+ */
+describe("toAGUIHistory (pi AgentMessage -> @ag-ui/core Message mapping)", () => {
+  test("maps a user message (string content) to an AG-UI user message", () => {
+    const result = conversations.toAGUIHistory([
+      { role: "user", content: "What's the weather API key stored as?", timestamp: 1 },
+    ]);
+
+    expect(result).toEqual([
+      { id: "history-0", role: "user", content: "What's the weather API key stored as?" },
+    ]);
+  });
+
+  test("maps an assistant text message, extracting text and dropping non-text parts", () => {
+    const result = conversations.toAGUIHistory([
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "let me check" },
+          { type: "text", text: "It's WEATHER_API_KEY in your .env." },
+        ],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 2,
+      },
+    ]);
+
+    expect(result).toEqual([
+      { id: "history-0", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
+    ]);
+  });
+
+  test("maps an assistant message with a tool call to AG-UI toolCalls, with no content key when there's no text", () => {
+    const result = conversations.toAGUIHistory([
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "read_file", arguments: { path: "a.txt" } }],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
+        timestamp: 3,
+      },
+    ]);
+
+    expect(result).toEqual([
+      {
+        id: "history-0",
+        role: "assistant",
+        toolCalls: [{ type: "function", id: "call-1", function: { name: "read_file", arguments: '{"path":"a.txt"}' } }],
+      },
+    ]);
+    expect(result[0]).not.toHaveProperty("content");
+  });
+
+  test("maps a toolResult message to an AG-UI tool message", () => {
+    const result = conversations.toAGUIHistory([
+      {
+        role: "toolResult",
+        toolCallId: "call-1",
+        toolName: "read_file",
+        content: [{ type: "text", text: "file contents" }],
+        isError: false,
+        timestamp: 4,
+      },
+    ]);
+
+    expect(result).toEqual([{ id: "history-0", role: "tool", toolCallId: "call-1", content: "file contents" }]);
+  });
+
+  // Known, documented simplification (see conversations.ts's own comment): pi's
+  // non-chat AgentMessage roles have no AG-UI/ChatView representation and are
+  // dropped, not mapped to an invented shape. Indices in the returned array are
+  // NOT expected to line up with the input array once a message is dropped —
+  // only uniqueness within the response matters (see toAGUIHistory's doc
+  // comment), so this asserts the dropped-count and surviving content, not a
+  // specific id.
+  test("drops pi-internal message roles with no AG-UI representation (e.g. bashExecution)", () => {
+    const result = conversations.toAGUIHistory([
+      {
+        role: "bashExecution",
+        command: "ls",
+        output: "a.txt",
+        exitCode: 0,
+        cancelled: false,
+        truncated: false,
+        timestamp: 1,
+      } as unknown as Parameters<typeof conversations.toAGUIHistory>[0][number],
+      { role: "user", content: "hello", timestamp: 2 },
+    ]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ role: "user", content: "hello" });
+  });
+});
+
+describe("getConversationMessages (US-03 P0 fix)", () => {
+  test("a brand-new conversation with no turns yet returns an empty array", async () => {
+    const meta = conversations.createConversation("fresh, no history yet");
+
+    const messages = await conversations.getConversationMessages(meta.id);
+
+    expect(messages).toEqual([]);
+  });
+
+  test("a conversation with real session history returns it mapped to AG-UI shape", async () => {
+    const meta = conversations.createConversation("has real history");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    // AgentState#messages has a public setter (agent-session.d.ts's AgentState
+    // interface) — same access pattern index.test.ts and this file's own
+    // setLiveSessionModel tests already use for session.state.model, applied here
+    // to session.state.messages instead of round-tripping through a real LLM turn.
+    session.state.messages = [
+      { role: "user", content: "What's the weather API key stored as?", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "It's WEATHER_API_KEY in your .env." }],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 2,
+      },
+    ];
+
+    const messages = await conversations.getConversationMessages(meta.id);
+
+    expect(messages).toEqual([
+      { id: "history-0", role: "user", content: "What's the weather API key stored as?" },
+      { id: "history-1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
+    ]);
+  });
+
+  test("a malformed/path-traversal-style id rejects instead of escaping dataDir/conversations", async () => {
+    await expect(conversations.getConversationMessages("../../../tmp/evil")).rejects.toThrow(
+      "Invalid conversation id",
+    );
+  });
+});

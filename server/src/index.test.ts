@@ -398,6 +398,83 @@ describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
   });
 });
 
+/**
+ * Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
+ * criterion / TASKS.md's AC-12.2): "switching to a previously-open conversation
+ * shows an empty transcript, not its real prior messages." This is the new route
+ * SPEC.md anticipated as a contingency (`GET /api/conversations/:id/messages`).
+ * Mapping-logic unit tests live in agent/conversations.test.ts
+ * (toAGUIHistory/getConversationMessages); these are the route-level integration
+ * checks — real HTTP over app.listen(), matching this file's own convention.
+ */
+describe("GET /api/conversations/:id/messages", () => {
+  test("a brand-new conversation with no turns yet returns 200 []", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "no history yet" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/messages`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([]);
+  });
+
+  test("a conversation with real session history returns it mapped to AG-UI Message[] shape", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "has real history" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const session = await getOrCreateSession(created.id);
+    session.state.messages = [
+      { role: "user", content: "What's the weather API key stored as?", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "It's WEATHER_API_KEY in your .env." }],
+        api: "anthropic-messages",
+        provider: "test-provider",
+        model: "test-model",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: 2,
+      },
+    ];
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/messages`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      { id: "history-0", role: "user", content: "What's the weather API key stored as?" },
+      { id: "history-1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
+    ]);
+  });
+
+  // Same malformed-id convention as GET /api/conversations/:id/artifacts/latest
+  // below: conversations.ts's assertSafeConversationId guard must normalize to a
+  // clean 400 with no leaked stack trace, not an unhandled 500.
+  test("a malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/messages`);
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+});
+
 describe("GET /api/conversations/:id/artifacts/latest", () => {
   // AC-8.1: Given a conversation with no published artifacts, when the endpoint is
   // called, then it returns 200 null — "no artifact yet" is an expected state, not

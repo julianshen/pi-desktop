@@ -3,6 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createAgentSession, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
+import type { Message as AGUIMessage } from "@ag-ui/core";
 import { env } from "../config/env.js";
 import { getAgentDeps } from "./deps.js";
 import { resolveModelById } from "./models.js";
@@ -219,4 +220,109 @@ async function createSession(id: string): Promise<AgentSession> {
   });
 
   return session;
+}
+
+/** The element type of AgentSession#messages (see agent-session.d.ts's `get messages(): AgentMessage[]`). */
+type SessionMessage = AgentSession["messages"][number];
+
+/**
+ * Extracts plain text from pi's content shape, which is either a bare string
+ * (UserMessage's common case) or an array of typed parts (TextContent /
+ * ImageContent / ThinkingContent / ToolCall — see @earendil-works/pi-ai's
+ * types.d.ts). Non-text parts (images, thinking, tool calls) are dropped here;
+ * tool calls are extracted separately by extractToolCalls() below, and this repo
+ * has no UI representation for inline images or thinking blocks in the replayed
+ * history (ChatView.tsx doesn't render them for live messages either).
+ */
+function extractText(content: string | Array<{ type: string; text?: string }>): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part): part is { type: "text"; text: string } => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+/** Extracts AG-UI-shaped toolCalls from an AssistantMessage's content array. */
+function extractToolCalls(
+  content: Array<{ type: string; id?: string; name?: string; arguments?: Record<string, unknown> }>,
+): NonNullable<Extract<AGUIMessage, { role: "assistant" }>["toolCalls"]> {
+  return content
+    .filter((part) => part.type === "toolCall")
+    .map((call) => ({
+      type: "function" as const,
+      id: call.id as string,
+      function: { name: call.name as string, arguments: JSON.stringify(call.arguments ?? {}) },
+    }));
+}
+
+/**
+ * Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
+ * criterion / TASKS.md's AC-12.2): maps pi's internal AgentSession#messages
+ * (AgentMessage[] — confirmed via
+ * node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts's
+ * `get messages(): AgentMessage[]`) to the @ag-ui/core Message[] wire shape, so
+ * index.ts's new GET /api/conversations/:id/messages route can hand the frontend
+ * something it can feed straight into `@ag-ui/client`'s
+ * `AbstractAgent#setMessages()` (see ChatView.tsx's seeding effect) — the exact
+ * shape RunAgentInput.messages already uses, so no separate frontend-side mapping
+ * is needed.
+ *
+ * pi's own Message type (@earendil-works/pi-ai) has no stable per-message `id`
+ * (only a numeric `timestamp`), but AG-UI's Message schema requires one. A
+ * deterministic `history-<index>` id is synthesized here; it only needs to be
+ * unique within a single response, since ChatView calls `setMessages()` with the
+ * whole array at once (a wholesale replace, not an id-keyed merge).
+ *
+ * Only "user" / "assistant" / "toolResult" carry a chat-transcript meaning. pi's
+ * other AgentMessage roles (bashExecution, custom, branchSummary,
+ * compactionSummary — see core/messages.d.ts's CustomAgentMessages module
+ * augmentation) have no AG-UI role and no ChatView.tsx rendering for live
+ * messages either, so they're dropped here rather than inventing a shape for
+ * them. This is a known, documented simplification, not a regression: a
+ * conversation whose history contains one of those (e.g. a `!bash` command) will
+ * not show that entry after a reload, exactly as it never showed during the live
+ * turn.
+ */
+export function toAGUIHistory(messages: SessionMessage[]): AGUIMessage[] {
+  const result: AGUIMessage[] = [];
+
+  messages.forEach((message, index) => {
+    const id = `history-${index}`;
+
+    if (message.role === "user") {
+      result.push({ id, role: "user", content: extractText(message.content) });
+      return;
+    }
+
+    if (message.role === "assistant") {
+      const text = extractText(message.content);
+      const toolCalls = extractToolCalls(message.content);
+      result.push({
+        id,
+        role: "assistant",
+        ...(text ? { content: text } : {}),
+        ...(toolCalls.length ? { toolCalls } : {}),
+      });
+      return;
+    }
+
+    if (message.role === "toolResult") {
+      result.push({ id, role: "tool", toolCallId: message.toolCallId, content: extractText(message.content) });
+    }
+  });
+
+  return result;
+}
+
+/**
+ * Backend half of the "switching to a conversation shows an empty transcript"
+ * fix (Critical /tgd-review finding, US-03 P0 / AC-12.2). Reuses
+ * getOrCreateSession() rather than a separate non-destructive read path — this
+ * repo has no such path today, and creating the session here is not wasted work:
+ * it's the same session a subsequent chat turn on this conversation will need
+ * anyway (mirrors how POST /agui already force-creates one).
+ */
+export async function getConversationMessages(id: string): Promise<AGUIMessage[]> {
+  const session = await getOrCreateSession(id);
+  return toAGUIHistory(session.messages as SessionMessage[]);
 }
