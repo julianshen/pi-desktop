@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -294,6 +294,107 @@ describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
       body: JSON.stringify({ modelId: STUB_MODEL_ID }),
     });
     expect(res.status).toBe(404);
+  });
+
+  /**
+   * Critical fix (/tgd-review, found independently by code-reviewer and
+   * test-engineer): AC-6.2 above only exercises a conversation that has never
+   * created a session (sessionPromises has no entry for it yet) -- the one case
+   * where the pre-fix code (metadata-only) happened to work. These two tests cover
+   * the actually-broken case: a conversation that already has a *live* cached
+   * AgentSession (agent/conversations.ts's sessionPromises). conversations.js is
+   * imported dynamically here (not statically at the top of the file) for the same
+   * reason as index.js above -- it transitively loads config/env.js, which must not
+   * resolve against the real environment before this file's top beforeAll sets the
+   * scratch PI_DESKTOP_* dirs.
+   */
+  describe("PATCH /api/conversations/:id/model with an already-live cached session", () => {
+    // (b): a conversation with a live session must have setModel() called on that
+    // *real* cached AgentSession instance, and the session must reflect the new
+    // model afterward -- proving the fix actually reaches the live session instead
+    // of only updating stored metadata. The real SDK setModel() validates
+    // configured auth via the session's own modelRegistry (see
+    // node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js),
+    // which this scratch test env never configures for any provider, so the spy's
+    // mockImplementation reproduces setModel()'s actual documented effect
+    // (assigning the new model onto session.state, which session.model reads from)
+    // while skipping the orthogonal auth check -- same test-double pattern as
+    // agent/conversations.test.ts's "setLiveSessionModel (Critical /tgd-review fix)"
+    // block.
+    test("calls setModel() on the real live session and the session reflects the new model afterward", async () => {
+      const { getOrCreateSession } = await import("./agent/conversations.js");
+
+      const created = (await (
+        await fetch(`${modelBaseUrl}/api/conversations`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title: "live session model switch" }),
+        })
+      ).json()) as ConversationMeta;
+
+      // Force a live, cached session to exist for this conversation before the
+      // PATCH -- the exact precondition the pre-fix code got wrong.
+      const session = await getOrCreateSession(created.id);
+      const setModelSpy = spyOn(session, "setModel").mockImplementation(async (model) => {
+        session.state.model = model;
+      });
+
+      const patchRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}/model`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ modelId: STUB_MODEL_ID }),
+      });
+      expect(patchRes.status).toBe(200);
+      const patched = (await patchRes.json()) as ConversationMeta;
+      expect(patched.modelId).toBe(STUB_MODEL_ID);
+
+      expect(setModelSpy).toHaveBeenCalledTimes(1);
+      expect(setModelSpy).toHaveBeenCalledWith(expect.objectContaining({ id: STUB_MODEL.id, provider: STUB_MODEL.provider }));
+      expect(session.model?.id).toBe(STUB_MODEL.id);
+      expect(session.model?.provider).toBe(STUB_MODEL.provider);
+
+      setModelSpy.mockRestore();
+    });
+
+    // (c): if the live session's setModel() rejects (e.g. no auth configured for
+    // the target model, per the SDK's own doc comment), the endpoint must return an
+    // error response rather than silently succeeding, and must NOT leave stored
+    // metadata updated to a model the live session never actually adopted --
+    // metadata and the live session's real model must stay consistent.
+    test("returns an error and leaves metadata unchanged when the live session's setModel() rejects", async () => {
+      const { getOrCreateSession } = await import("./agent/conversations.js");
+
+      const created = (await (
+        await fetch(`${modelBaseUrl}/api/conversations`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title: "live session model switch failure" }),
+        })
+      ).json()) as ConversationMeta;
+      expect(created.modelId).toBeUndefined();
+
+      const session = await getOrCreateSession(created.id);
+      const setModelSpy = spyOn(session, "setModel").mockRejectedValueOnce(
+        new Error("No API key for anthropic/claude-opus-4-5"),
+      );
+
+      const patchRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}/model`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ modelId: STUB_MODEL_ID }),
+      });
+      expect(patchRes.status).toBeGreaterThanOrEqual(500);
+
+      expect(setModelSpy).toHaveBeenCalledTimes(1);
+
+      // Metadata must be exactly what it was pre-PATCH -- not updated to the model
+      // the live session failed to adopt.
+      const getRes = await fetch(`${modelBaseUrl}/api/conversations/${created.id}`);
+      const refetched = (await getRes.json()) as ConversationMeta;
+      expect(refetched.modelId).toBeUndefined();
+
+      setModelSpy.mockRestore();
+    });
   });
 });
 

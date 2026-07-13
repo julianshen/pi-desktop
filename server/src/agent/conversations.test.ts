@@ -255,6 +255,96 @@ describe("conversations registry", () => {
 });
 
 /**
+ * Critical fix (/tgd-review, found independently by code-reviewer and
+ * test-engineer): PATCH /api/conversations/:id/model used to stop at
+ * touchConversation() and never reach the already-cached AgentSession sitting in
+ * this module's sessionPromises map -- so a conversation that had already sent a
+ * message kept using its OLD model forever. setLiveSessionModel(id, model) is the
+ * fix's unit boundary: called with the real live AgentSession when one exists, a
+ * no-op when one doesn't (that path was already correct -- createSession() reads
+ * fresh metadata on its own, proven by the "Task 1 fix" tests above).
+ *
+ * A second Model<Api> distinct from STUB_MODEL is needed here (rather than reusing
+ * STUB_MODEL for both "old" and "new") so assertions can actually distinguish
+ * "session still has its old model" from "session picked up the new one".
+ */
+const OTHER_STUB_MODEL_ID = "test-provider/other-test-model";
+const OTHER_STUB_MODEL = {
+  ...STUB_MODEL,
+  id: "other-test-model",
+  name: "Other Test Model",
+} as Model<Api>;
+
+describe("setLiveSessionModel (Critical /tgd-review fix)", () => {
+  // (a) No live session yet for the conversation: setLiveSessionModel() must
+  // resolve as a no-op and must NOT force-create a session as a side effect of
+  // what should be a metadata-only update (the next getOrCreateSession() call is
+  // what picks up the freshly-touched metadata, per createSession()'s modelId
+  // resolution above).
+  test("setLiveSessionModel() is a no-op when the conversation has no live cached session yet", async () => {
+    const meta = conversations.createConversation("no live session yet");
+
+    await expect(conversations.setLiveSessionModel(meta.id, OTHER_STUB_MODEL)).resolves.toBeUndefined();
+  });
+
+  // (b) A conversation WITH an already-live cached session: setLiveSessionModel()
+  // must call setModel() on that real, already-cached AgentSession instance (not
+  // a fresh one), and the session must reflect the new model afterward. The real
+  // SDK setModel() validates configured auth via the session's own modelRegistry
+  // (see node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js)
+  // which this scratch test env never configures for any provider -- so the spy's
+  // mockImplementation reproduces setModel()'s actual documented effect (assigning
+  // the new model onto session.state, which session.model reads from, per
+  // agent-session.js's `get model()`) while skipping the auth check that's
+  // orthogonal to what this test is proving.
+  test("setLiveSessionModel() calls setModel() on the real live session and the session reflects the new model afterward", async () => {
+    const meta = conversations.createConversation("live session model switch");
+    conversations.touchConversation(meta.id, { modelId: STUB_MODEL_ID });
+
+    const session = await conversations.getOrCreateSession(meta.id);
+    expect(session.model?.id).toBe(STUB_MODEL.id);
+
+    const setModelSpy = spyOn(session, "setModel").mockImplementation(async (model) => {
+      session.state.model = model;
+    });
+
+    await conversations.setLiveSessionModel(meta.id, OTHER_STUB_MODEL);
+
+    expect(setModelSpy).toHaveBeenCalledTimes(1);
+    expect(setModelSpy).toHaveBeenCalledWith(OTHER_STUB_MODEL);
+    expect(session.model?.id).toBe(OTHER_STUB_MODEL.id);
+
+    setModelSpy.mockRestore();
+  });
+
+  // (c) The live session's setModel() rejecting (e.g. no auth configured for the
+  // target model, per the SDK's own doc comment) must propagate rather than be
+  // swallowed -- callers (index.ts's PATCH handler) rely on this rejection to
+  // avoid updating stored metadata to a model the live session never actually
+  // adopted.
+  test("setLiveSessionModel() propagates a rejection from the live session's setModel() instead of swallowing it", async () => {
+    const meta = conversations.createConversation("live session model switch failure");
+
+    const session = await conversations.getOrCreateSession(meta.id);
+    const originalModel = session.model;
+
+    const setModelSpy = spyOn(session, "setModel").mockRejectedValueOnce(
+      new Error("No API key for other-provider/unavailable-model"),
+    );
+
+    await expect(conversations.setLiveSessionModel(meta.id, OTHER_STUB_MODEL)).rejects.toThrow(
+      "No API key for other-provider/unavailable-model",
+    );
+
+    // The session must not have silently adopted the new model despite the
+    // rejection -- it should still report whatever model it had before.
+    expect(session.model).toEqual(originalModel);
+
+    setModelSpy.mockRestore();
+  });
+});
+
+/**
  * Task 2 (US-03 regression guard): the pre-existing shared session that this app's
  * real users already have on disk under env.workspaceDir becomes conversation id
  * "default" (AC-1.2 already pins conversationCwd("default") === env.workspaceDir).

@@ -5,7 +5,13 @@ import { env } from "./config/env.js";
 import { handleAguiRun } from "./agui/adapter.js";
 import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
-import { listConversations, createConversation, getConversationMeta, touchConversation } from "./agent/conversations.js";
+import {
+  listConversations,
+  createConversation,
+  getConversationMeta,
+  touchConversation,
+  setLiveSessionModel,
+} from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact } from "./artifacts/store.js";
 
@@ -85,6 +91,17 @@ export function createApp(options?: CreateAppOptions): Express {
   // AC-5.3 contract resolveModelById returns undefined rather than throwing, so this
   // is a plain undefined check; per SPEC.md, touchConversation is deliberately not
   // called in that case, leaving the conversation's modelId unchanged.
+  //
+  // Critical fix (/tgd-review, found independently by code-reviewer and
+  // test-engineer): this used to stop at touchConversation() -- it never told the
+  // already-cached AgentSession (agent/conversations.ts's sessionPromises) about
+  // the switch, so a conversation that had already sent a message kept using its
+  // OLD model forever. setLiveSessionModel(id, resolved) now applies the switch to
+  // the live session (a no-op if none exists yet, per its own doc comment) *before*
+  // touchConversation() runs, so a rejection (e.g. no auth configured for the
+  // target model) falls through to the outer .catch() below and leaves stored
+  // metadata untouched -- the visible "current model" never gets ahead of what the
+  // live session will actually use next.
   app.patch("/api/conversations/:id/model", express.json(), (req, res) => {
     const meta = getConversationMeta(req.params.id);
     if (!meta) {
@@ -96,11 +113,12 @@ export function createApp(options?: CreateAppOptions): Express {
     const modelId = typeof body?.modelId === "string" ? body.modelId : undefined;
 
     (modelId ? resolveModelById(modelId, options?.modelRegistry) : Promise.resolve(undefined))
-      .then((resolved) => {
+      .then(async (resolved) => {
         if (!resolved) {
           res.status(400).end();
           return;
         }
+        await setLiveSessionModel(req.params.id, resolved);
         touchConversation(req.params.id, { modelId });
         res.json(getConversationMeta(req.params.id));
       })

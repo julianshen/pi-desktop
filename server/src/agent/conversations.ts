@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createAgentSession, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import type { Model, Api } from "@earendil-works/pi-ai";
 import { env } from "../config/env.js";
 import { getAgentDeps } from "./deps.js";
 import { resolveModelById } from "./models.js";
@@ -148,6 +149,41 @@ export function getOrCreateSession(id: string): Promise<AgentSession> {
     sessionPromises.set(id, promise);
   }
   return promise;
+}
+
+/**
+ * Critical fix (/tgd-review, found independently by code-reviewer and
+ * test-engineer): PATCH /api/conversations/:id/model previously only updated
+ * stored ConversationMeta -- it never touched the already-cached AgentSession
+ * sitting in sessionPromises, so switching a conversation's model after it had
+ * already sent at least one message (the normal case) silently did nothing; the
+ * next turn kept using the OLD model. Only a conversation that had never yet
+ * created a session picked up the change, and only because createSession()
+ * above reads current metadata (getConversationMeta(id)?.modelId) at creation
+ * time -- that path was already correct and is untouched here.
+ *
+ * This closes the gap for the live-session case using the SDK's own
+ * AgentSession#setModel(model: Model<any>): Promise<void> (confirmed in
+ * node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts).
+ * It accepts a resolved Model object -- exactly what models.ts's
+ * resolveModelById() already returns -- so the PATCH handler in index.ts can
+ * pass the same `resolved` value straight through with no extra mapping.
+ *
+ * Resolves to void (no-op) when there is no live session yet for `id`: it must
+ * NOT force-create one as a side effect of a metadata-only update, since the
+ * next getOrCreateSession() call will already pick up the freshly-touched
+ * metadata on its own. A rejection from the live session's setModel() (e.g. no
+ * auth configured for the target model, per its own doc comment) is
+ * deliberately left unswallowed so the caller can keep stored metadata and the
+ * live session's actual model consistent instead of reporting success while
+ * the live session silently kept its old model.
+ */
+export async function setLiveSessionModel(id: string, model: Model<Api>): Promise<void> {
+  const promise = sessionPromises.get(id);
+  if (!promise) return;
+
+  const session = await promise;
+  await session.setModel(model);
 }
 
 async function createSession(id: string): Promise<AgentSession> {
