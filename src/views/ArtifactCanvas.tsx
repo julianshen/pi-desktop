@@ -1,17 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CloseIcon } from "../components/icons";
 import type { CanvasTab } from "../state/useShellState";
-
-/**
- * Same derivation as src/state/useConversations.ts's API_BASE (Task 9) — the REST API
- * and the AG-UI endpoint are the same server (server/src/index.ts), so there is exactly
- * one base URL to point at. Replicated here rather than imported: no shared
- * `src/state/apiBase.ts` module exists yet at the time this task landed (Task 9 defines
- * it inline in its own file too), and this task's brief is explicit not to block on a
- * concurrently-running task introducing one.
- */
-const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
-const API_BASE = RUNTIME_URL.replace(/\/copilotkit\/?$/, "");
+import { API_BASE } from "../state/apiBase.js";
 
 /** Mirrors server/src/artifacts/store.ts's Artifact exactly (Task 13). */
 export interface Artifact {
@@ -45,16 +35,9 @@ export function ArtifactCanvas({
   /**
    * Any value that changes to signal "a chat turn just completed, re-check for a new
    * artifact" (Task 13 / TASKS.md: "when ChatView's isLoading transitions true -> false").
-   *
-   * FOLLOW-UP INTEGRATION POINT: nothing currently changes this value. Task 12 (running
-   * concurrently) owns ChatView.tsx's isLoading state, so wiring the real
-   * true -> false transition into this prop is deliberately left as a small follow-up in
-   * App.tsx once Task 12 lands: thread ChatView's isLoading up into App.tsx state (or a
-   * shared hook), pass it to ChatView as today, and pass a value derived from its
-   * false-transitions (e.g. an incrementing counter) down to ArtifactCanvas as
-   * `refreshSignal`. Until that wiring exists, ArtifactCanvas still correctly refetches
-   * on conversation switch (`conversationId` change) — only the mid-conversation
-   * "artifact published this turn" refresh is not yet triggered automatically.
+   * Wired in App.tsx: an incrementing counter, bumped from ChatView's
+   * `onTurnComplete` callback (fired on the true -> false edge of its own
+   * `isLoading`), is passed straight through here.
    */
   refreshSignal?: unknown;
 }) {

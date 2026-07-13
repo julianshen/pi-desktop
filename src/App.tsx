@@ -12,6 +12,7 @@ import { CodingAgentsView } from "./views/CodingAgentsView";
 import { McpServersView } from "./views/McpServersView";
 import { SkillsLibraryView } from "./views/SkillsLibraryView";
 import { SettingsView } from "./views/SettingsView";
+import { useState } from "react";
 import { useShellState, type ViewKey } from "./state/useShellState";
 import { useConversations } from "./state/useConversations";
 
@@ -40,6 +41,13 @@ function App() {
   // conversation is selected or created, so ArtifactCanvas's pre-existing
   // `conversationId={state.activeConv}` wiring keeps working unmodified.
   const conversations = useConversations();
+
+  // Task 13 follow-up (now resolved): ArtifactCanvas's `refreshSignal` fires when
+  // ChatView's isLoading transitions true -> false, i.e. once per completed chat turn.
+  // A simple incrementing counter, bumped from ChatView's `onTurnComplete` callback and
+  // passed straight through to ArtifactCanvas, is enough — ArtifactCanvas only cares
+  // that the value *changed*, not what it is.
+  const [turnCompleteCount, setTurnCompleteCount] = useState(0);
 
   return (
     <CopilotKit runtimeUrl={RUNTIME_URL} showDevConsole={false} enableInspector={false}>
@@ -83,7 +91,14 @@ function App() {
                   comment for the full mechanism). The `key` remount is kept alongside it — it still
                   usefully resets ChatView's own local UI state (draft text, scroll position) and the
                   connect-effect's ref bookkeeping per switch. */}
-              {state.view === "chat" && <ChatView key={state.activeConv} model={state.model} conversationId={state.activeConv} />}
+              {state.view === "chat" && (
+                <ChatView
+                  key={state.activeConv}
+                  model={state.model}
+                  conversationId={state.activeConv}
+                  onTurnComplete={() => setTurnCompleteCount((n) => n + 1)}
+                />
+              )}
               {state.view === "artifacts" && <ArtifactStoreView />}
               {state.view === "scheduled" && (
                 <ScheduledTasksView
@@ -101,14 +116,12 @@ function App() {
             </div>
 
             {showCanvas && (
-              // `refreshSignal` intentionally left unwired here (Task 13 follow-up): it
-              // should fire when ChatView's isLoading transitions true -> false, but
-              // ChatView.tsx's isLoading is owned by the concurrently-landing Task 12.
               <ArtifactCanvas
                 tab={state.canvasTab}
                 onSetTab={actions.setCanvasTab}
                 onClose={actions.toggleArtifact}
                 conversationId={state.activeConv}
+                refreshSignal={turnCompleteCount}
               />
             )}
           </div>

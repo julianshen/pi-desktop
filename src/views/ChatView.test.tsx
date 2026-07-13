@@ -194,4 +194,52 @@ describe("ChatView", () => {
     expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
     expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
   });
+
+  // Task 13 follow-up (App.tsx previously flagged `refreshSignal` as unwired pending
+  // both Task 12 and Task 13 landing): proves ChatView's new `onTurnComplete` callback
+  // fires exactly on the true -> false edge of isLoading, not on every render where
+  // isLoading happens to be false — in particular, not on initial mount, where
+  // isLoading already starts false.
+  test("onTurnComplete fires exactly once on isLoading true->false, and not on initial mount", async () => {
+    const state = threadFor("conv-turn");
+    let onTurnCompleteCalls = 0;
+    const onTurnComplete = () => {
+      onTurnCompleteCalls += 1;
+    };
+
+    const { rerender } = render(
+      <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
+    );
+
+    // Initial mount: isLoading starts false. Must NOT fire.
+    expect(onTurnCompleteCalls).toBe(0);
+
+    // Turn starts: isLoading -> true. Still must not fire (only the false->true edge
+    // happened, not true->false).
+    state.isLoading = true;
+    await act(async () => {
+      rerender(
+        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
+      );
+    });
+    expect(onTurnCompleteCalls).toBe(0);
+
+    // Turn completes: isLoading -> false. This is the true->false edge — must fire
+    // exactly once.
+    state.isLoading = false;
+    await act(async () => {
+      rerender(
+        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
+      );
+    });
+    expect(onTurnCompleteCalls).toBe(1);
+
+    // Re-rendering again with isLoading still false must not fire a second time.
+    await act(async () => {
+      rerender(
+        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
+      );
+    });
+    expect(onTurnCompleteCalls).toBe(1);
+  });
 });

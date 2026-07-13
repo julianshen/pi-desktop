@@ -7,7 +7,24 @@ import { AttachIcon, SendIcon } from "../components/icons";
 const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
 
-export function ChatView({ model, conversationId }: { model: string; conversationId: string }) {
+export function ChatView({
+  model,
+  conversationId,
+  onTurnComplete,
+}: {
+  model: string;
+  conversationId: string;
+  /**
+   * Task 13 follow-up (App.tsx previously flagged this as unwired pending both Task 12
+   * and Task 13 landing — both have now landed): called once per turn, exactly when
+   * `isLoading` transitions true -> false. Deliberately NOT called on initial mount
+   * (where isLoading starts false) or on every false render — only on the true->false
+   * edge, via the ref-tracked comparison below — so App.tsx can drive
+   * ArtifactCanvas's `refreshSignal` off real turn completions instead of firing an
+   * extra spurious refetch on first render.
+   */
+  onTurnComplete?: () => void;
+}) {
   // Task 12 CRITICAL BUG FIX (found via live E2E reproduction, not just static review):
   // `useCopilotChat()` (verified against the installed @copilotkit/react-core 1.62.3,
   // dist/index.mjs) returns only { visibleMessages, appendMessage, reloadMessages,
@@ -84,6 +101,17 @@ export function ChatView({ model, conversationId }: { model: string; conversatio
   const visibleMessages = aguiToGQL(rawMessages ?? []);
   const [draft, setDraft] = useState("");
   const listRef = useRef<HTMLDivElement>(null);
+
+  // Task 13 follow-up: fire `onTurnComplete` exactly on the true -> false edge of
+  // `isLoading`, not merely "whenever isLoading is false" (which would also fire on
+  // initial mount for a conversation that loads with isLoading already false).
+  const wasLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    if (wasLoadingRef.current && !isLoading) {
+      onTurnComplete?.();
+    }
+    wasLoadingRef.current = isLoading;
+  }, [isLoading, onTurnComplete]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
