@@ -49,6 +49,15 @@ function App() {
   // that the value *changed*, not what it is.
   const [turnCompleteCount, setTurnCompleteCount] = useState(0);
 
+  const handleTurnComplete = () => {
+    setTurnCompleteCount((n) => n + 1);
+    // The backend auto-derives a conversation's title from its first message once a
+    // turn completes (server/src/agui/adapter.ts's touchConversationAfterTurn) — but
+    // useConversations() only fetches once on mount, so without this the Sidebar kept
+    // showing "New conversation" forever. Same signal ArtifactCanvas already reacts to.
+    void conversations.refetch();
+  };
+
   return (
     <CopilotKit runtimeUrl={RUNTIME_URL} showDevConsole={false} enableInspector={false}>
       <div
@@ -96,7 +105,7 @@ function App() {
                   key={state.activeConv}
                   model={state.model}
                   conversationId={state.activeConv}
-                  onTurnComplete={() => setTurnCompleteCount((n) => n + 1)}
+                  onTurnComplete={handleTurnComplete}
                 />
               )}
               {state.view === "artifacts" && <ArtifactStoreView />}

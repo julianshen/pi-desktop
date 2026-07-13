@@ -109,4 +109,27 @@ describe("useConversations", () => {
     expect(result.current.conversations.some((c) => c.id === "new-conv")).toBe(true);
     expect(result.current.activeId).toBe("new-conv");
   });
+
+  test("AC-9.5: refetch() picks up a server-side title change (e.g. auto-derived after a turn) without remounting", async () => {
+    let fetchCount = 0;
+    global.fetch = mock(() => {
+      fetchCount += 1;
+      const title = fetchCount === 1 ? "New conversation" : "Sprint planning kickoff";
+      return Promise.resolve(jsonResponse([makeMeta({ id: "conv-1", title })]));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.conversations[0]?.title).toBe("New conversation");
+
+    await act(async () => {
+      await result.current.refetch();
+    });
+
+    expect(fetchCount).toBe(2);
+    expect(result.current.conversations[0]?.title).toBe("Sprint planning kickoff");
+    // refetch() must not flip loading back to true — it's meant to be silent,
+    // not to re-trigger the Sidebar's ConversationListLoading spinner state.
+    expect(result.current.loading).toBe(false);
+  });
 });

@@ -20,6 +20,7 @@ export interface UseConversationsResult {
   searchQuery: string;
   setSearchQuery: (query: string) => void;
   filtered: ConversationMeta[];
+  refetch: () => Promise<void>;
 }
 
 /**
@@ -34,29 +35,31 @@ export function useConversations(): UseConversationsResult {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
 
-  useEffect(() => {
-    let cancelled = false;
-
-    fetch(`${API_BASE}/api/conversations`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`GET /api/conversations failed: ${res.status}`);
-        return res.json() as Promise<ConversationMeta[]>;
-      })
-      .then((data) => {
-        if (cancelled) return;
-        setConversations(data);
-        setLoading(false);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err : new Error(String(err)));
-        setLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
+  const fetchConversations = useCallback(async (): Promise<void> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/conversations`);
+      if (!res.ok) throw new Error(`GET /api/conversations failed: ${res.status}`);
+      const data = (await res.json()) as ConversationMeta[];
+      setConversations(data);
+      setError(null);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void fetchConversations();
+  }, [fetchConversations]);
+
+  // Re-fetches the list without resetting `loading` to true — used to pick up
+  // server-side bookkeeping (e.g. auto-derived conversation titles, bumped
+  // `updatedAt`) after a chat turn completes, mirroring how ArtifactCanvas's
+  // `refreshSignal` re-fetches artifacts on the same onTurnComplete signal.
+  const refetch = useCallback(async (): Promise<void> => {
+    await fetchConversations();
+  }, [fetchConversations]);
 
   const create = useCallback(async (): Promise<ConversationMeta> => {
     const res = await fetch(`${API_BASE}/api/conversations`, {
@@ -77,5 +80,5 @@ export function useConversations(): UseConversationsResult {
     return conversations.filter((c) => c.title.toLowerCase().includes(q));
   }, [conversations, searchQuery]);
 
-  return { conversations, loading, error, activeId, setActiveId, create, searchQuery, setSearchQuery, filtered };
+  return { conversations, loading, error, activeId, setActiveId, create, searchQuery, setSearchQuery, filtered, refetch };
 }

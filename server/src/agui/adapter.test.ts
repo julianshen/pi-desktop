@@ -50,6 +50,42 @@ function makeStubSession(): StubSession {
 }
 
 /**
+ * Reproduces a live-observed bug: pi emits a message_start/message_end pair with
+ * zero text_delta in between for the assistant "turn" where the model decides to
+ * call a tool (no user-visible text, just a tool call), before a second, real
+ * assistant message with the actual answer. Confirmed via a raw /agui SSE capture
+ * against the real running app. Used to prove the empty pair never produces a
+ * TEXT_MESSAGE_START/END on the wire.
+ */
+function makeStubSessionWithEmptyThenRealAssistantMessage(): StubSession {
+  const listeners = new Set<(event: StubSessionEvent) => void>();
+  const session: StubSession = {
+    isStreaming: false,
+    unsubscribed: false,
+    subscribe(cb) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+        session.unsubscribed = true;
+      };
+    },
+    async prompt() {
+      const emit = (event: StubSessionEvent) => listeners.forEach((cb) => cb(event));
+      emit({ type: "message_start", message: { role: "assistant" } });
+      emit({ type: "message_end", message: { role: "assistant" } });
+      emit({ type: "message_start", message: { role: "assistant" } });
+      emit({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "the answer" },
+      });
+      emit({ type: "message_end", message: { role: "assistant" } });
+      emit({ type: "agent_end" });
+    },
+  };
+  return session;
+}
+
+/**
  * Task 3 fix (review finding): id that makes the mocked touchConversation() below
  * throw, simulating a registry write failure during the agent_end bookkeeping step.
  */
@@ -214,5 +250,36 @@ describe("handleAguiRun", () => {
     const allChunks = res.chunks.join("");
     expect(allChunks).toContain("RUN_FINISHED");
     expect(allChunks).not.toContain("RUN_ERROR");
+  });
+
+  // Bug fix (live-usage report: "empty lines in chat, seems thinking process"): a
+  // message_start/message_end pair with no text_delta between them (pi's own
+  // pre-tool-call "thinking" turn) must never produce a TEXT_MESSAGE_START/END pair
+  // on the wire — that's what rendered as an empty chat bubble. The second, real
+  // assistant message in the same turn must still render normally.
+  test("an empty assistant message_start/message_end pair (no text_delta) never emits TEXT_MESSAGE_START/END", async () => {
+    sessionsById.set("conv-empty-then-real", makeStubSessionWithEmptyThenRealAssistantMessage());
+
+    const res = new MockResponse();
+    await handleAguiRun(makeReq(makeInput({ threadId: "conv-empty-then-real" })), res as unknown as Response);
+
+    const events = res.chunks
+      .join("")
+      .split("\n\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice("data: ".length)) as { type: string; messageId?: string; delta?: string });
+
+    const starts = events.filter((e) => e.type === "TEXT_MESSAGE_START");
+    const ends = events.filter((e) => e.type === "TEXT_MESSAGE_END");
+
+    // Exactly one START/END pair — for the real message, not the empty one.
+    expect(starts.length).toBe(1);
+    expect(ends.length).toBe(1);
+    expect(starts[0]!.messageId).toBe(ends[0]!.messageId);
+
+    // The real message's content arrived under that same messageId.
+    const contentEvents = events.filter((e) => e.type === "TEXT_MESSAGE_CONTENT");
+    expect(contentEvents.every((e) => e.messageId === starts[0]!.messageId)).toBe(true);
+    expect(contentEvents.map((e) => e.delta).join("")).toBe("the answer");
   });
 });
