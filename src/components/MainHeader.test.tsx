@@ -44,6 +44,7 @@ function makeConversationsResult(overrides: Partial<UseConversationsResult> = {}
     searchQuery: "",
     setSearchQuery: () => {},
     filtered: list,
+    refetch: () => Promise.resolve(),
     ...overrides,
   };
 }
