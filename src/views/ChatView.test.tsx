@@ -706,4 +706,146 @@ describe("ChatView", () => {
       expect(screen.getByText("tool")).toBeTruthy();
     });
   });
+
+  // Task 8 (SPEC.md's "web_fetch" approval-gate feature): a `kind: "confirm"`
+  // pending interaction, delivered via ChatView's own independent poll of
+  // GET /api/conversations/:id/pending-interaction (App.tsx's sibling
+  // `usePendingRenderInteractionWatcher` polls the same endpoint but only ever
+  // acts on `kind: "render"` — these two pollers are intentionally separate,
+  // see App.tsx's own comment), renders as a standalone approve/deny chip in
+  // the transcript, not attached to any specific message.
+  describe("pending-interaction approval chip (Task 8)", () => {
+    function fetchMockFor(
+      conversationId: string,
+      opts: {
+        interaction?: { id: string; kind: "confirm" | "render"; host?: string } | null;
+        onResolve?: (interactionId: string, body: unknown) => Response | Promise<Response>;
+      },
+    ) {
+      const fetchCalls: { url: string; body?: unknown }[] = [];
+      const fn = mock((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body ? (JSON.parse(init.body as string) as unknown) : undefined;
+        fetchCalls.push({ url, body });
+
+        if (url.endsWith(`/api/conversations/${conversationId}/messages`)) {
+          return Promise.resolve(jsonResponse([]));
+        }
+        if (url.endsWith(`/api/conversations/${conversationId}/pending-interaction`)) {
+          return Promise.resolve(jsonResponse({ interaction: opts.interaction ?? null }));
+        }
+        const resolveMatch = url.match(
+          new RegExp(`/api/conversations/${conversationId}/pending-interaction/([^/]+)/resolve$`),
+        );
+        if (resolveMatch) {
+          const interactionId = resolveMatch[1];
+          if (opts.onResolve) return Promise.resolve(opts.onResolve(interactionId, body));
+          return Promise.resolve(jsonResponse({ resolved: true }));
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      }) as unknown as typeof fetch;
+      return { fn, fetchCalls };
+    }
+
+    test("AC-8.1: a pending confirm-kind interaction renders a chip with the literal host and visible Approve/Deny controls", async () => {
+      const { fn } = fetchMockFor("conv-confirm-1", {
+        interaction: { id: "int-1", kind: "confirm", host: "192.168.1.50" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-confirm-1" model="" conversationId="conv-confirm-1" />);
+
+      // Literal host text, verbatim — not a paraphrase, not truncated.
+      await waitFor(() => {
+        expect(screen.getByText("192.168.1.50")).toBeTruthy();
+      });
+      expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    });
+
+    test("AC-8.1 (contrast): no chip renders when no pending interaction exists, or when the pending interaction is render-kind", async () => {
+      const { fn } = fetchMockFor("conv-confirm-2", { interaction: null });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-confirm-2" model="" conversationId="conv-confirm-2" />);
+
+      // Give the poll a tick to run and confirm nothing renders.
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
+      });
+      expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Deny" })).toBeNull();
+    });
+
+    test("AC-8.2 [R]: clicking Approve calls resolve with { approved: true }, disables both buttons while in flight, and clears the chip once resolved", async () => {
+      let resolveResolvePost!: (res: Response) => void;
+      const pendingResolvePost = new Promise<Response>((resolve) => {
+        resolveResolvePost = resolve;
+      });
+
+      const { fn, fetchCalls } = fetchMockFor("conv-approve", {
+        interaction: { id: "int-approve", kind: "confirm", host: "10.0.0.7" },
+        onResolve: () => pendingResolvePost,
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-approve" model="" conversationId="conv-approve" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("10.0.0.7")).toBeTruthy();
+      });
+
+      const approveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+      const denyButton = screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement;
+      fireEvent.click(approveButton);
+
+      // While the resolve POST is still in flight, both buttons must be
+      // disabled — avoids a double-submission from a second click.
+      await waitFor(() => {
+        expect(approveButton.disabled).toBe(true);
+      });
+      expect(denyButton.disabled).toBe(true);
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-approve/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.body).toEqual({ approved: true });
+
+      await act(async () => {
+        resolveResolvePost(jsonResponse({ resolved: true }));
+      });
+
+      // Chip clears once resolved (this implementation optimistically clears
+      // right after the click settles rather than waiting for the next poll
+      // tick — see ChatView.tsx's resolvePendingConfirm comment).
+      await waitFor(() => {
+        expect(screen.queryByText("10.0.0.7")).toBeNull();
+      });
+    });
+
+    test("AC-8.3: clicking Deny calls resolve with { approved: false } and clears the chip", async () => {
+      const { fn, fetchCalls } = fetchMockFor("conv-deny", {
+        interaction: { id: "int-deny", kind: "confirm", host: "127.0.0.1" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-deny" model="" conversationId="conv-deny" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("127.0.0.1")).toBeTruthy();
+      });
+
+      const denyButton = screen.getByRole("button", { name: "Deny" });
+      await act(async () => {
+        fireEvent.click(denyButton);
+      });
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-deny/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.body).toEqual({ approved: false });
+
+      await waitFor(() => {
+        expect(screen.queryByText("127.0.0.1")).toBeNull();
+      });
+    });
+  });
 });

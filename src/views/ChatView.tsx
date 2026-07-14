@@ -14,6 +14,34 @@ const ERROR_DISPLAY_MAX_LENGTH = 300;
 const PUBLISH_ARTIFACT_TOOL_NAME = "publish_artifact";
 
 /**
+ * Task 8 (SPEC.md's web_fetch approval-gate). Public shape returned by
+ * GET /api/conversations/:id/pending-interaction for the fields this chip
+ * cares about — mirrors server/src/web-fetch/pending-interactions.ts's
+ * getPending() shape. `host` only exists on `kind: "confirm"` interactions;
+ * `kind: "render"` ones (a `url` field instead) are owned entirely by
+ * App.tsx's separate `usePendingRenderInteractionWatcher` and are ignored
+ * here — this poller only ever acts on `kind: "confirm"`.
+ */
+interface PendingInteractionPublic {
+  id: string;
+  kind: "confirm" | "render";
+  host?: string;
+}
+
+/**
+ * Poll interval for the approval-chip watcher below. SPEC.md's "Getting the
+ * pending interaction to the frontend — RESOLVED: poll" section calls for
+ * "every 400-600ms... to keep the [interaction] flow feeling responsive" —
+ * tighter than the once-per-turn `last-error` poll above, since a real
+ * `web_fetch` tool call is synchronously blocked on the user's answer for the
+ * whole time this chip is showing. Matches App.tsx's independent
+ * `usePendingRenderInteractionWatcher`'s own constant of the same value for
+ * consistency, though the two pollers are intentionally separate (see that
+ * file's comment) and aren't required to match.
+ */
+const PENDING_INTERACTION_POLL_MS = 500;
+
+/**
  * Provider error messages come through as whatever raw string the provider's own
  * API returned — live-verified with a real OpenRouter 402 response, whose raw
  * `errorMessage` is `"402: {\"message\": \"...\", \"code\": 402, \"metadata\": {
@@ -254,6 +282,81 @@ export function ChatView({
     wasLoadingRef.current = isLoading;
   }, [isLoading, onTurnComplete, conversationId]);
 
+  // Task 8 (SPEC.md's web_fetch approval-gate, AC-8.1/AC-8.2/AC-8.3): an
+  // independent poll of GET /api/conversations/:id/pending-interaction — same
+  // endpoint and convention as the last-error poll above, but on its own
+  // effect/interval (PENDING_INTERACTION_POLL_MS) since this is something the
+  // user is actively waiting to answer, not a once-per-turn check. Deliberately
+  // NOT shared with App.tsx's own poll of the same endpoint
+  // (usePendingRenderInteractionWatcher) — that hook only ever acts on
+  // `kind: "render"` and lives outside ChatView so it keeps running on other
+  // views too; this effect only ever acts on `kind: "confirm"` and is scoped to
+  // the chat view, per this task's spec.
+  const [pendingConfirm, setPendingConfirm] = useState<{ id: string; host: string } | null>(null);
+  const [resolvingApproval, setResolvingApproval] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction`);
+        if (!res.ok || cancelled) return;
+        const body = (await res.json()) as { interaction: PendingInteractionPublic | null };
+        if (cancelled) return;
+        const interaction = body.interaction;
+        if (interaction && interaction.kind === "confirm" && typeof interaction.host === "string") {
+          setPendingConfirm({ id: interaction.id, host: interaction.host });
+        } else {
+          setPendingConfirm(null);
+        }
+      } catch (error: unknown) {
+        console.error("[ChatView] failed to poll pending-interaction", error);
+      }
+    }
+
+    void poll();
+    const timer = setInterval(() => void poll(), PENDING_INTERACTION_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [conversationId]);
+
+  // AC-8.2/AC-8.3: Approve/Deny both funnel through here — `approved` is the
+  // only thing that differs. Disables both buttons for the duration of the
+  // POST (item 4's double-submission guard) via `resolvingApproval`.
+  //
+  // Clearing strategy (documented per this task's spec, which leaves the
+  // choice open): this clears `pendingConfirm` OPTIMISTICALLY, right after the
+  // POST settles — successfully or not (a network failure here still means
+  // there's nothing more this click can do; the next poll tick, if the
+  // interaction is somehow still pending, will bring the chip back rather than
+  // leaving a stale "approve/deny" affordance the user already acted on showing
+  // indefinitely). This matches this file's existing `submit()` convention of
+  // clearing `error` immediately on the next user action rather than waiting
+  // for a fresh fetch to confirm it, and avoids an up-to-
+  // PENDING_INTERACTION_POLL_MS visible lag after a click that already
+  // resolved the interaction server-side.
+  const resolvePendingConfirm = async (approved: boolean) => {
+    if (!pendingConfirm || resolvingApproval) return;
+    const { id } = pendingConfirm;
+    setResolvingApproval(true);
+    try {
+      await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${id}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ approved }),
+      });
+    } catch (error: unknown) {
+      console.error("[ChatView] failed to resolve pending interaction", error);
+    } finally {
+      setPendingConfirm(null);
+      setResolvingApproval(false);
+    }
+  };
+
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
   }, [visibleMessages.length]);
@@ -390,6 +493,45 @@ export function ChatView({
             <div style={{ display: "flex", gap: 14 }}>
               <Avatar />
               <p style={{ margin: 0, fontSize: 15, color: "color-mix(in srgb, var(--color-text) 50%, transparent)" }}>Thinking…</p>
+            </div>
+          )}
+
+          {/* Task 8 (AC-8.1): standalone approval chip — not attached to any
+              specific message, same as the "Thinking…" indicator above and the
+              error banner below. Shown whenever a `kind: "confirm"` pending
+              interaction exists for this conversation, regardless of isLoading
+              (the agent turn is genuinely blocked mid-tool-call waiting on this
+              exact answer, so it can be showing while isLoading is still true). */}
+          {pendingConfirm && (
+            <div style={{ display: "flex", gap: 14 }}>
+              <Avatar />
+              <Blueprint style={{ background: "transparent" }}>
+                <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 10, padding: "9px 12px" }}>
+                  <span className="tag tag-accent">approval needed</span>
+                  {/* Literal `host` field, verbatim — the human-readable message
+                      web_fetch's confirm gate composed. Never paraphrased or
+                      truncated, per this task's spec. */}
+                  <span style={{ fontFamily: "ui-monospace,'SF Mono',Menlo,monospace", fontSize: 12.5 }}>
+                    {pendingConfirm.host}
+                  </span>
+                  <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
+                    <button
+                      className="btn btn-primary"
+                      disabled={resolvingApproval}
+                      onClick={() => void resolvePendingConfirm(true)}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      disabled={resolvingApproval}
+                      onClick={() => void resolvePendingConfirm(false)}
+                    >
+                      Deny
+                    </button>
+                  </div>
+                </div>
+              </Blueprint>
             </div>
           )}
 
