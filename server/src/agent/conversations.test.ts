@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Model, Api } from "@earendil-works/pi-ai";
+import { getPending as getPendingInteraction, resolve as resolvePendingInteraction } from "../web-fetch/pending-interactions.js";
 
 /**
  * env.ts reads process.env into a module-level constant at import time, so the
@@ -708,4 +709,101 @@ describe("getConversationMessages (US-03 P0 fix)", () => {
       "Invalid conversation id",
     );
   });
+});
+
+/**
+ * Task 5 (web-fetch feature): session.extensionRunner.setUIContext() wiring, so
+ * ctx.ui.confirm() inside any custom tool's execute() (the not-yet-built web_fetch
+ * tool, a later task) reaches the real pending-interaction registry instead of the
+ * SDK's default noOpUIContext (which always resolves confirm() to `false`
+ * immediately, with no pause at all). Exercises the installed confirm()
+ * implementation directly off a real session's session.extensionRunner.getUIContext()
+ * -- the same object createSession() installs via setUIContext() in production --
+ * rather than a hand-rolled stand-in, per this file's own "real session" testing
+ * convention used throughout (see e.g. the "default conversation migration" block
+ * above).
+ */
+describe("confirm() wiring via session.extensionRunner (Task 5, AC-5.1)", () => {
+  // AC-5.1 [R]: Given a newly created session, when a custom tool's execute() calls
+  // ctx.ui.confirm(title, message), then it does NOT resolve to the SDK default
+  // `false` immediately -- it creates a real pending interaction in
+  // web-fetch/pending-interactions.ts and awaits it. Proven two ways: (1) the
+  // registry genuinely gains a pending "confirm" entry for this conversation the
+  // moment confirm() is called, before it's resolved -- something the SDK's
+  // noOpUIContext.confirm (`async () => false`) would never do; (2) the confirm()
+  // call's own return value reflects whatever resolve() is later called with
+  // (approved: true here), not a hardcoded `false` -- a regression that miswired
+  // this into a permanent auto-approve would still pass a naive "it doesn't
+  // resolve false immediately" check, so this asserts the exact registry entry
+  // shape AND both an approve and a deny outcome round-trip correctly.
+  test("AC-5.1: ctx.ui.confirm() creates a real pending interaction and awaits its resolution (approve path)", async () => {
+    const meta = conversations.createConversation("web-fetch confirm test - approve");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    const uiContext = session.extensionRunner.getUIContext();
+    const confirmPromise = uiContext.confirm("Allow local network fetch?", "pi wants to fetch 192.168.1.5");
+
+    // Before resolving: a real pending "confirm" interaction must already exist
+    // for this conversation -- the SDK default would never create one.
+    const pending = getPendingInteraction(meta.id);
+    expect(pending).toBeDefined();
+    expect(pending?.kind).toBe("confirm");
+    if (pending?.kind === "confirm") {
+      // Design decision (see conversations.ts's buildConfirmUIContext() comment):
+      // `host` carries confirm()'s free-text `message` verbatim, not a parsed
+      // hostname -- there is no structured host field available from the SDK's
+      // confirm() signature itself.
+      expect(pending.host).toBe("pi wants to fetch 192.168.1.5");
+    }
+
+    const resolved = resolvePendingInteraction(pending!.id, { kind: "confirm", approved: true });
+    expect(resolved).toBe(true);
+
+    await expect(confirmPromise).resolves.toBe(true);
+  });
+
+  // AC-5.1 [R] (deny path): the same wiring must faithfully propagate an explicit
+  // denial too -- not silently coerce every outcome to true, which would be the
+  // worse failure mode this AC's [R] flag calls out (a permanent auto-approve).
+  test("AC-5.1: ctx.ui.confirm() propagates an explicit deny rather than defaulting to approved", async () => {
+    const meta = conversations.createConversation("web-fetch confirm test - deny");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    const uiContext = session.extensionRunner.getUIContext();
+    const confirmPromise = uiContext.confirm("Allow local network fetch?", "pi wants to fetch 10.0.0.5");
+
+    const pending = getPendingInteraction(meta.id);
+    expect(pending).toBeDefined();
+
+    const resolved = resolvePendingInteraction(pending!.id, { kind: "confirm", approved: false });
+    expect(resolved).toBe(true);
+
+    await expect(confirmPromise).resolves.toBe(false);
+  });
+
+  // AC-5.1 [R] (timeout path): with no SDK-level timeout wrapping execute()/confirm()
+  // (verified against the installed SDK, per SPEC.md), the pending-interaction
+  // registry's own timeout is what eventually rescues a call nobody ever answers.
+  // This proves confirm() genuinely awaits the registry's real promise (which
+  // settles to the registry's fail-closed default after opts.timeout elapses) rather
+  // than short-circuiting some other way -- using a short real timeout (matching
+  // pending-interactions.test.ts's own established convention of short real
+  // timeoutMs values over mocked timers for this feature).
+  test("AC-5.1: ctx.ui.confirm() honors the caller's opts.timeout and resolves to the registry's fail-closed default when unanswered", async () => {
+    const meta = conversations.createConversation("web-fetch confirm test - timeout");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    const uiContext = session.extensionRunner.getUIContext();
+    const confirmPromise = uiContext.confirm("Allow local network fetch?", "pi wants to fetch 172.16.0.1", {
+      timeout: 30,
+    });
+
+    await expect(confirmPromise).resolves.toBe(false);
+  });
+
+  // AC-5.2: documentation/verification criterion, not a test per TASKS.md -- see the
+  // code comment at the setUIContext() call site in conversations.ts's createSession()
+  // for the recorded finding (grepped the installed SDK's compiled dist/**/*.js for
+  // `mode === "rpc"`/`"rpc"` branches; all RPC-mode-specific behavior lives in pi's
+  // own CLI subprocess entry point, a code path this app never reaches).
 });
