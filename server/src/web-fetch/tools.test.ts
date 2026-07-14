@@ -238,10 +238,19 @@ describe("web_fetch tool", () => {
   });
 
   // AC-6.6 — Given the plain fetch's content looks like an empty SPA shell
-  // and the (stubbed, in this task) render fallback returns null, when
-  // web_fetch completes, then it returns the plain-fetch content honestly
-  // rather than fabricating or erroring silently.
-  test("AC-6.6: an empty-SPA-shell plain fetch honestly falls back to the plain-fetch content (render fallback stubbed to null)", async () => {
+  // and the render fallback returns null, when web_fetch completes, then it
+  // returns the plain-fetch content honestly rather than fabricating or
+  // erroring silently.
+  //
+  // Updated for Task 11: this test originally relied on
+  // renderViaHeadlessWebview() being a stub that always returned null
+  // synchronously. Now that Task 11 wires in the real pending-interaction-
+  // backed implementation, a render interaction really is created here — so
+  // this test resolves it explicitly with `{ html: null }` (the same shape
+  // pending-interactions.ts's own fail-closed timeout default produces, see
+  // AC-3.2) to simulate the "render fallback declined/failed" case, still
+  // asserting the same honest-fallback outcome AC-6.6 describes.
+  test("AC-6.6: an empty-SPA-shell plain fetch honestly falls back to the plain-fetch content (render fallback resolves to null)", async () => {
     const conversationId = randomUUID();
     const [webFetch] = createWebFetchTools(conversationId, "interactive");
     const ctx = buildConfirmMustNotBeCalledContext();
@@ -255,12 +264,17 @@ describe("web_fetch tool", () => {
         { status: 200, headers: { "content-type": "text/html" } },
       );
 
-    const result = await webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+    const execPromise = webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+
+    const pending = await waitForPending(conversationId);
+    expect(pending.kind).toBe("render");
+    resolvePendingInteraction(pending.id, { kind: "render", html: null });
+
+    const result = await execPromise;
 
     expect(fetchCalls).toHaveLength(1);
     // Honest fallback: some real (if sparse) content is returned, not an
-    // error and not fabricated rendered content (render fallback is stubbed
-    // to always return null in this task).
+    // error and not fabricated rendered content.
     const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
     // The plain-fetch shell's own sparse text ("Loading…") is what comes
     // back — proving this is the honest plain-fetch content, not a silent
@@ -268,6 +282,157 @@ describe("web_fetch tool", () => {
     expect(text).toContain("Loading");
     expect(text).not.toContain("was not approved");
     expect(text).not.toContain("not permitted");
+  });
+
+  // AC-11.1 — Given a real local SPA dev server running (this is the
+  // live/manual verification case per SPEC.md's testing strategy — not
+  // reproducible in this headless environment). This test instead proves the
+  // WIRING is correct: it uses the REAL pending-interactions.ts registry
+  // (create/resolve), same as every other test in this file, to simulate the
+  // frontend's headless-render bridge (Task 10, not exercised here)
+  // successfully resolving a `kind: "render"` interaction with rendered
+  // HTML, and asserts web_fetch's final result contains that HTML-derived
+  // content rather than the plain-fetch's sparse empty-shell content. What
+  // this does NOT prove, and what remains for live /tgd-verify: the actual
+  // Rust `render_url_headless` Tauri command and a real webview round-trip
+  // against a real running SPA.
+  test("AC-11.1: a resolved render pending interaction's HTML becomes web_fetch's final result, not the empty-shell plain-fetch content", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildConfirmMustNotBeCalledContext(); // public URL — no approval gate involved
+
+    // Matches fetcher.ts's looksLikeEmptySpaShell() heuristic: near-empty
+    // body, a framework root-mount div, and a <script> tag present.
+    nextFetchResponse = () =>
+      new Response(
+        `<html><body><div id="app">Loading…</div><script src="/bundle.js"></script></body></html>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+
+    const execPromise = webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+
+    const pending = await waitForPending(conversationId);
+    expect(pending.kind).toBe("render");
+    expect(pending.kind === "render" && pending.url).toBe(new URL(PUBLIC_URL).href);
+
+    resolvePendingInteraction(pending.id, {
+      kind: "render",
+      html: `<html><body><main>Fully rendered SPA content, not the loading shell</main></body></html>`,
+    });
+
+    const result = await execPromise;
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("Fully rendered SPA content");
+    expect(text).not.toContain("Loading");
+  });
+
+  test("AC-11.1: when the render interaction resolves with html: null (the registry's own fail-closed timeout default, per AC-3.2), web_fetch honestly falls back to the plain-fetch shell content", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildConfirmMustNotBeCalledContext();
+
+    nextFetchResponse = () =>
+      new Response(
+        `<html><body><div id="app">Loading…</div><script src="/bundle.js"></script></body></html>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+
+    // Simulates the outcome of pending-interactions.ts's own fail-closed
+    // timeout default ({ html: null }, covered directly by AC-3.2) by
+    // resolving with that same shape rather than waiting out tools.ts's
+    // real 30s RENDER_TIMEOUT_MS, which would be too slow for a unit test.
+    // This asserts renderViaHeadlessWebview()'s wiring honors that result
+    // (null -> honest plain-fetch fallback), not the timeout mechanism
+    // itself.
+    const pendingPromise = waitForPending(conversationId);
+    const execPromise = webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+    const pending = await pendingPromise;
+    expect(pending.kind).toBe("render");
+    resolvePendingInteraction(pending.id, { kind: "render", html: null });
+
+    const result = await execPromise;
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("Loading");
+    expect(text).not.toContain("was not approved");
+  });
+
+  // AC-11.2 [R] — Given a URL resolving to a private address that ALSO needs
+  // the render fallback (its plain-fetch response would trigger the
+  // SPA-shell heuristic), when web_fetch runs, then the approval gate is
+  // still enforced BEFORE the render attempt — approval is not bypassable by
+  // triggering the SPA-shell heuristic. This is PRD §8's top-named risk and
+  // SPEC.md's explicit "Always" boundary: tested here as the actual combined
+  // path (confirm interaction created and resolved BEFORE any render
+  // interaction is ever created), not as two independently-passing gates.
+  test("AC-11.2 [R]: a private+unapproved host whose eventual response would trigger the SPA-shell heuristic still hits the confirm gate first — no render interaction exists until confirm resolves", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildRealConfirmContext(conversationId);
+
+    // This response, if ever reached by plainFetch, would trigger
+    // looksLikeEmptySpaShell() and thus renderViaHeadlessWebview(). The
+    // whole point of this test is that it must NOT be reached before the
+    // confirm gate resolves.
+    nextFetchResponse = () =>
+      new Response(
+        `<html><body><div id="root">Loading…</div><script src="/bundle.js"></script></body></html>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+
+    const execPromise = webFetch.execute("call-1", { url: PRIVATE_URL }, undefined, undefined, ctx);
+
+    // The FIRST pending interaction must be the confirm gate, not a render
+    // interaction — and no fetch (hence no SPA-shell detection, hence no
+    // render interaction) has happened yet.
+    const firstPending = await waitForPending(conversationId);
+    expect(firstPending.kind).toBe("confirm");
+    expect(firstPending.kind === "confirm" && firstPending.host).toContain(new URL(PRIVATE_URL).href);
+    expect(fetchCalls).toHaveLength(0);
+
+    resolvePendingInteraction(firstPending.id, { kind: "confirm", approved: true });
+
+    // Only AFTER approval does the plain fetch run, detect the SPA shell,
+    // and create the render interaction — proving the render path is not
+    // reachable independently of the confirm gate.
+    const secondPending = await waitForPending(conversationId);
+    expect(secondPending.kind).toBe("render");
+    expect(fetchCalls).toHaveLength(1);
+
+    resolvePendingInteraction(secondPending.id, {
+      kind: "render",
+      html: `<html><body><main>Rendered private-host SPA content</main></body></html>`,
+    });
+
+    const result = await execPromise;
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("Rendered private-host SPA content");
+  });
+
+  test("AC-11.2 [R]: denying the confirm gate on a private+SPA-shell-triggering host never creates a render interaction and never calls fetch", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildRealConfirmContext(conversationId);
+
+    nextFetchResponse = () =>
+      new Response(
+        `<html><body><div id="root">Loading…</div><script src="/bundle.js"></script></body></html>`,
+        { status: 200, headers: { "content-type": "text/html" } },
+      );
+
+    const execPromise = webFetch.execute("call-1", { url: PRIVATE_URL }, undefined, undefined, ctx);
+
+    const pending = await waitForPending(conversationId);
+    expect(pending.kind).toBe("confirm");
+    resolvePendingInteraction(pending.id, { kind: "confirm", approved: false });
+
+    const result = await execPromise;
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("not approved");
+    // Denial short-circuits before plain-fetch, so the SPA-shell heuristic
+    // and thus the render path is never reached — proving the render
+    // interaction cannot be created independently of an approved confirm.
+    expect(fetchCalls).toHaveLength(0);
+    expect(getPending(conversationId)).toBeUndefined();
   });
 
   test("an invalid URL is rejected immediately with no network calls at all", async () => {

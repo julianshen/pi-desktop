@@ -12,6 +12,7 @@ import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { plainFetch, toReadableContent, looksLikeEmptySpaShell, type FetchedPage } from "./fetcher.js";
 import { classifyTarget, DnsResolutionError } from "./safety.js";
+import { create as createPendingInteraction } from "./pending-interactions.js";
 
 export type SessionKind = "interactive" | "scheduled";
 
@@ -87,21 +88,47 @@ function pageResult(page: FetchedPage) {
 }
 
 /**
- * Phase 2 stub (Task 6 scope only — Task 11 wires the real implementation).
- * Always returns null, so web_fetch's SPA-shell branch always falls back
- * honestly to the plain-fetch content (AC-6.6) rather than fabricating
- * rendered output that doesn't exist yet.
- *
- * TODO(Task 11): replace this stub with the real headless-webview render
- * fallback — create a `kind: "render"` pending interaction via
- * pending-interactions.ts's create(), await its promise, and return the
- * resolved `html` field (or null on timeout/failure). No change needed to
- * the safety gate above: the render path must reuse the same
- * classifyTarget() result already computed for this call, never fetch (or
- * render) before it (SPEC.md's "Always" boundary).
+ * How long the render pending interaction (pending-interactions.ts) waits
+ * for the frontend's headless-render bridge (Task 10) to invoke the Rust
+ * `render_url_headless` command and POST the resulting HTML back before the
+ * registry's own fail-closed timeout default ({ html: null }, see
+ * pending-interactions.ts's timeoutDefaultFor()) applies. Deliberately a
+ * separate constant from CONFIRM_TIMEOUT_MS above — this is a page-render
+ * budget (waiting on a webview to navigate and settle), not a
+ * human-response budget, and the two have no reason to share a value.
  */
-async function renderViaHeadlessWebview(_conversationId: string, _url: URL): Promise<string | null> {
-  return null;
+const RENDER_TIMEOUT_MS = 30_000;
+
+/**
+ * Task 11: the real headless-webview render fallback. Creates a
+ * `kind: "render"` pending interaction (pending-interactions.ts's create()),
+ * awaits its promise — settled either by the frontend's headless-render
+ * bridge POSTing `{ html }` back (Task 10) or by the registry's own timeout
+ * default — and returns the resolved `html` field, or null on
+ * timeout/failure. Never throws (matches SPEC.md's "honest fallback"
+ * principle): a null return sends the caller back to the plain-fetch
+ * content (AC-6.6's fallback path), never a fabricated result and never an
+ * unhandled rejection.
+ *
+ * Safety-gate note (AC-11.2): this function does NOT perform its own
+ * classifyTarget()/approval check, and must not gain one — the caller
+ * (execute() below) already runs the one shared classify-then-confirm gate
+ * upfront, before EITHER the plain-fetch call or the call to this function,
+ * so by the time this function ever runs, a private target has already been
+ * classified and (if applicable) approved. Adding a second, independent
+ * gate here would be redundant at best and a maintenance hazard at worst
+ * (two gates that could drift out of sync) — see the execute() flow's own
+ * comment at the classifyTarget() call site.
+ */
+async function renderViaHeadlessWebview(conversationId: string, url: URL): Promise<string | null> {
+  const { promise } = createPendingInteraction(conversationId, {
+    conversationId,
+    kind: "render",
+    url: url.href,
+    timeoutMs: RENDER_TIMEOUT_MS,
+  });
+  const result = await promise;
+  return result.kind === "render" ? result.html : null;
 }
 
 export function createWebFetchTools(conversationId: string, sessionKind: SessionKind): ToolDefinition[] {
@@ -187,10 +214,14 @@ export function createWebFetchTools(conversationId: string, sessionKind: Session
       const plainPage = toReadableContent(html, target, response);
 
       // (e)/(f)/(g): if the plain fetch doesn't look like an empty SPA
-      // shell, return it as-is. Otherwise try the (stubbed, in this task)
-      // render fallback, and fall back honestly to the plain-fetch content
-      // if it returns null (AC-6.6) — never fabricate content, never
-      // silently return nothing.
+      // shell, return it as-is. Otherwise try the headless-webview render
+      // fallback (Task 11), and fall back honestly to the plain-fetch
+      // content if it returns null — timeout, frontend failure, or (Phase 1,
+      // before Task 11 landed) the old stub (AC-6.6) — never fabricate
+      // content, never silently return nothing. Note this call happens
+      // strictly after the classify-then-confirm gate above has already run
+      // for this target (AC-11.2) — see renderViaHeadlessWebview()'s own
+      // doc comment.
       if (!looksLikeEmptySpaShell(html)) {
         return pageResult(plainPage);
       }
