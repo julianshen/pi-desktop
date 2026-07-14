@@ -12,11 +12,109 @@ import { CodingAgentsView } from "./views/CodingAgentsView";
 import { McpServersView } from "./views/McpServersView";
 import { SkillsLibraryView } from "./views/SkillsLibraryView";
 import { SettingsView } from "./views/SettingsView";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useShellState, type ViewKey } from "./state/useShellState";
 import { useConversations } from "./state/useConversations";
+import { API_BASE } from "./state/apiBase.js";
+import { renderUrlHeadless } from "./lib/headlessRender.js";
 
 const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
+
+/**
+ * Task 10 (SPEC.md's "Headless render bridge" section). Public shape returned
+ * by `GET /api/conversations/:id/pending-interaction` (server/src/web-fetch/
+ * pending-interactions.ts's `getPending()`) — only the fields this watcher
+ * cares about. `host` (confirm-kind) is intentionally omitted: Task 8's
+ * approval chip in ChatView.tsx owns that kind, this effect only ever reads
+ * `url`/`timeoutMs` off a `kind: "render"` interaction.
+ */
+interface PendingInteractionPublic {
+  id: string;
+  kind: "confirm" | "render";
+  url?: string;
+  timeoutMs: number;
+}
+
+/**
+ * Poll interval while this effect watches for a pending interaction.
+ * SPEC.md's "Getting the pending interaction to the frontend — RESOLVED:
+ * poll" section calls for "every 400-600ms... to keep the [interaction] flow
+ * feeling responsive despite polling" for exactly this reason: a real tool
+ * call (`web_fetch`) is synchronously blocked waiting on this endpoint's
+ * answer for the whole time an interaction is pending, unlike the once-per-
+ * turn `last-error` poll elsewhere in this app.
+ */
+const PENDING_INTERACTION_POLL_MS = 500;
+
+/**
+ * Task 10 (AC-10.1/AC-10.2): silently services `kind: "render"` pending
+ * interactions for `conversationId` — no visible UI of its own, ever. Called
+ * from `App()` below (not `ChatView.tsx`) so it keeps polling no matter which
+ * view/tab is currently showing, per SPEC.md's "Headless render bridge"
+ * section: a `web_fetch` tool call could be sitting blocked on this exact
+ * interaction while the user is looking at Settings or any other view.
+ *
+ * `kind: "confirm"` interactions are deliberately left alone here — Task 8's
+ * approval chip (ChatView.tsx) owns that path entirely; this effect only ever
+ * acts when `interaction.kind === "render"` and otherwise no-ops.
+ *
+ * Exported (rather than kept as an inline effect) purely so App.test.tsx can
+ * exercise it directly via `@testing-library/react`'s `renderHook()`, without
+ * needing to mount the rest of the app shell (CopilotKit, every view, the
+ * design-system CSS import aside) — this hook has no rendering output of its
+ * own to assert against, only network side effects.
+ */
+export function usePendingRenderInteractionWatcher(conversationId: string): void {
+  const inFlightRenderIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      let interaction: PendingInteractionPublic | null;
+      try {
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction`);
+        if (!res.ok) return;
+        const body = (await res.json()) as { interaction: PendingInteractionPublic | null };
+        interaction = body.interaction;
+      } catch (error: unknown) {
+        console.error("[App] failed to poll pending-interaction", error);
+        return;
+      }
+
+      if (cancelled || !interaction || interaction.kind !== "render") return;
+
+      // No-double-fire guard: once an interaction id has been picked up here,
+      // don't dispatch a second renderUrlHeadless()/resolve() for it on a
+      // later poll tick that fires before this one's resolve POST completes.
+      if (inFlightRenderIdsRef.current.has(interaction.id)) return;
+      inFlightRenderIdsRef.current.add(interaction.id);
+
+      // renderUrlHeadless() never throws (see headlessRender.ts) — `html` is
+      // always a definite `string | null`, so the resolve POST below always
+      // fires with an honest answer, success or failure alike (AC-10.2).
+      const html = await renderUrlHeadless(interaction.url ?? "", interaction.timeoutMs);
+      if (cancelled) return;
+
+      try {
+        await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${interaction.id}/resolve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ html }),
+        });
+      } catch (error: unknown) {
+        console.error("[App] failed to resolve render interaction", error);
+      }
+    }
+
+    void poll();
+    const timer = setInterval(() => void poll(), PENDING_INTERACTION_POLL_MS);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [conversationId]);
+}
 
 const WINDOW_TITLES: Record<ViewKey, string> = {
   chat: "Chat",
@@ -57,6 +155,14 @@ function App() {
     // showing "New conversation" forever. Same signal ArtifactCanvas already reacts to.
     void conversations.refetch();
   };
+
+  // Task 10 (AC-10.1/AC-10.2): silently services `kind: "render"` pending
+  // interactions for the ACTIVE conversation. Lives HERE, not ChatView.tsx,
+  // because per SPEC.md this must keep running no matter which view/tab is
+  // currently showing — a `web_fetch` tool call could be sitting blocked on
+  // this exact interaction while the user is looking at Settings or any other
+  // view, not just Chat.
+  usePendingRenderInteractionWatcher(state.activeConv);
 
   return (
     <CopilotKit runtimeUrl={RUNTIME_URL} showDevConsole={false} enableInspector={false}>
