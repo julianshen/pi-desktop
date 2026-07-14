@@ -745,6 +745,15 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
   // and the interaction's promise (from create()) resolves with { approved: true }.
   // This is the only path by which a real user approval reaches the waiting tool
   // call — tested in both directions (this test: approve).
+  //
+  // Also empirically settles AC-2.2 (the poll-vs-push delivery spike): this test
+  // drives a real HTTP request against the real running app.listen() server (not a
+  // mock) and confirms a pending interaction, created server-side, is genuinely
+  // resolvable by an external POST the way a polling frontend would issue — proof
+  // the chosen (poll) mechanism actually reaches and unblocks the waiting promise
+  // end-to-end, not just in theory. See SPEC.md's "Getting the pending interaction
+  // to the frontend — RESOLVED: poll" section for the full architectural trace of
+  // why push was ruled out instead.
   test("AC-4.1: { approved: true } returns 200 and resolves the promise with approved: true", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
