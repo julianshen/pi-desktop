@@ -161,6 +161,23 @@ describe("conversations registry", () => {
     }
   });
 
+  // AC-7.1 — Given a normal interactive conversation, when its session is created,
+  // then web_fetch is present in its available tools. Mirrors the AC-7.3
+  // wiring-gap test above (same proof shape: introspect the SDK's own
+  // getActiveToolNames()/getToolDefinition() against a session built by the real
+  // getOrCreateSession() -> createSession() path, not a hand-rolled copy of it) --
+  // proving createWebFetchTools(id, "interactive") (agent/conversations.ts's
+  // createSession()) is actually reached, not just that the factory function
+  // exists and works in isolation (that's web-fetch/tools.test.ts's job).
+  test("AC-7.1: getOrCreateSession() appends web_fetch onto the session's active tools", async () => {
+    const meta = conversations.createConversation("web-fetch interactive conversation");
+    const session = await conversations.getOrCreateSession(meta.id);
+
+    const activeToolNames = session.getActiveToolNames();
+    expect(activeToolNames).toContain("web_fetch");
+    expect(session.getToolDefinition("web_fetch")).toBeDefined();
+  });
+
   // Task 1 fix (model-sourcing gap): createSession() must resolve a conversation's
   // stored modelId via models.ts's resolveModelById rather than always falling back
   // to getAgentDeps()'s env-var default. Verified end-to-end through

@@ -25,6 +25,20 @@ let depsPromise: Promise<AgentDeps> | undefined;
  * Auth, model registry, and the combined custom tool set (memory, computer-use, MCP)
  * are expensive to build (MCP servers spawn subprocesses) and shared by both the
  * interactive chat session and every scheduled agent run, so build them once.
+ *
+ * Deliberately NOT part of this bundle: any tool factory that's scoped to a single
+ * conversation/task id, e.g. artifacts/tools.ts's `createArtifactTools(conversationId)`
+ * or web-fetch/tools.ts's `createWebFetchTools(conversationId, sessionKind)`. Both
+ * close over per-conversation state (approved-hosts, artifact storage) and, for
+ * web_fetch, over a `sessionKind: "interactive" | "scheduled"` that determines
+ * whether a private-target fetch pauses for approval or hard-blocks outright
+ * (US-05) — baking either into this singleton, built once from whichever caller
+ * happens to trigger it first, would either leak state across conversations or
+ * permanently fix `sessionKind` for the process. Callers build those per-session
+ * instead, appending onto `customTools` at the actual session-creation call site:
+ * agent/conversations.ts's `createSession()` (interactive, `sessionKind:
+ * "interactive"`) and scheduler/index.ts's `createScheduledSession()` (scheduled,
+ * `sessionKind: "scheduled"`).
  */
 export function getAgentDeps(): Promise<AgentDeps> {
   if (!depsPromise) {

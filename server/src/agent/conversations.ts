@@ -15,6 +15,7 @@ import { getAgentDeps } from "./deps.js";
 import { resolveModelById } from "./models.js";
 import { createArtifactTools } from "../artifacts/tools.js";
 import { create as createPendingInteraction } from "../web-fetch/pending-interactions.js";
+import { createWebFetchTools } from "../web-fetch/tools.js";
 
 export interface ConversationMeta {
   id: string;
@@ -340,6 +341,17 @@ async function createSession(id: string): Promise<AgentSession> {
    * conversation's id so it always saves to *this* conversation's artifacts.json),
    * so they're built here per-session rather than being part of getAgentDeps()'s
    * memoized, conversation-agnostic bundle — appended on top, not replacing it.
+   *
+   * web-fetch's web_fetch tool (createWebFetchTools) is wired in the same way and
+   * for the same reason (AC-7.1): it's conversationId-scoped (per-conversation
+   * approved-hosts state, see web-fetch/tools.ts), so it can't live inside
+   * getAgentDeps()'s singleton bundle either — putting it there would bake in
+   * whichever conversationId happened to trigger the first getAgentDeps() call for
+   * the lifetime of the process. It is also constructed with `sessionKind:
+   * "interactive"` here, never "scheduled" — scheduler/index.ts's own session
+   * construction (createScheduledSession) passes "scheduled" independently
+   * (AC-7.2/US-05); getAgentDeps()'s memoized bundle stays completely unaware of
+   * sessionKind, on purpose.
    */
   const { session } = await createAgentSession({
     cwd,
@@ -347,7 +359,7 @@ async function createSession(id: string): Promise<AgentSession> {
     model,
     authStorage,
     modelRegistry,
-    customTools: [...customTools, ...createArtifactTools(id)],
+    customTools: [...customTools, ...createArtifactTools(id), ...createWebFetchTools(id, "interactive")],
     sessionManager: SessionManager.continueRecent(cwd),
   });
 

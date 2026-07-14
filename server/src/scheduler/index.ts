@@ -1,9 +1,10 @@
 import fs from "node:fs";
 import path from "node:path";
 import { schedule } from "node-cron";
-import { createAgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
 import { env } from "../config/env.js";
 import { getAgentDeps } from "../agent/deps.js";
+import { createWebFetchTools } from "../web-fetch/tools.js";
 
 interface ScheduledAgentConfig {
   id: string;
@@ -35,9 +36,25 @@ function appendLog(taskId: string, entry: Record<string, unknown>): void {
  * dataDir), separate from the interactive chat session (agent/conversations.ts's
  * getOrCreateSession("default")), so a background run's history doesn't intermix
  * with the live conversation.
+ *
+ * Task 7 (AC-7.2, US-05): builds this session's tool set with
+ * `createWebFetchTools(task.id, "scheduled")`, never `"interactive"` — a scheduled
+ * run getting the interactive tool factory would let `web_fetch`'s private-target
+ * gate call `ctx.ui.confirm()` and create a real pending interaction that nobody is
+ * watching, hanging the background run forever instead of hard-blocking
+ * immediately (see web-fetch/tools.ts's `sessionKind === "scheduled"` branch).
+ * `createWebFetchTools` is conversationId-scoped like `createArtifactTools`
+ * (agent/conversations.ts), so — mirroring that same reasoning — it's built here
+ * per-task-session rather than folded into getAgentDeps()'s memoized,
+ * task/conversation-agnostic bundle.
+ *
+ * Split out from runTask() below (which also fires the real session.prompt() LLM
+ * call) so this construction step — the exact place `sessionKind` is threaded
+ * through — is independently unit-testable without needing real model/auth
+ * configuration or triggering a live agent turn.
  */
-async function runTask(task: ScheduledAgentConfig): Promise<void> {
-  const taskCwd = path.join(env.dataDir, "scheduled", task.id);
+export async function createScheduledSession(taskId: string): Promise<AgentSession> {
+  const taskCwd = path.join(env.dataDir, "scheduled", taskId);
   fs.mkdirSync(taskCwd, { recursive: true });
 
   const { authStorage, modelRegistry, model, customTools } = await getAgentDeps();
@@ -47,9 +64,14 @@ async function runTask(task: ScheduledAgentConfig): Promise<void> {
     model,
     authStorage,
     modelRegistry,
-    customTools,
+    customTools: [...customTools, ...createWebFetchTools(taskId, "scheduled")],
     sessionManager: SessionManager.continueRecent(taskCwd),
   });
+  return session;
+}
+
+async function runTask(task: ScheduledAgentConfig): Promise<void> {
+  const session = await createScheduledSession(task.id);
 
   try {
     await session.prompt(task.prompt);
