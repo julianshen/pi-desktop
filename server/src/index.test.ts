@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { Server } from "node:http";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
@@ -663,5 +664,328 @@ describe("CORS", () => {
     });
 
     expect(res.headers.get("access-control-allow-origin")).toBe("tauri://localhost");
+  });
+});
+
+/**
+ * Task 4: the pending-interaction poll/resolve routes on top of Task 3's registry
+ * (server/src/web-fetch/pending-interactions.ts). Interactions are seeded directly
+ * via that module's own create() (same pattern as the artifacts/latest tests above
+ * seeding via saveArtifact() directly) rather than driving a real web_fetch tool
+ * call, since the tool itself is a separate task's own test coverage.
+ */
+describe("GET /api/conversations/:id/pending-interaction", () => {
+  // AC-4.4: Given no pending interaction exists for a conversation, when GET
+  // .../pending-interaction is called, then it returns 200 { interaction: null },
+  // not 404 — "nothing pending" is an expected state, matching this repo's existing
+  // artifacts/latest convention exactly.
+  test("AC-4.4: no pending interaction returns 200 { interaction: null }", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "nothing pending" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ interaction: null });
+  });
+
+  // Not itself a numbered AC, but exercises the "public shape only" contract SPEC.md
+  // and pending-interactions.ts's own getPending() doc comment both call out: the
+  // response must be the interaction's public fields, never a leaked resolver.
+  test("returns 200 with the pending interaction's public shape when one exists", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "has a pending interaction" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "192.168.1.5",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { interaction: Record<string, unknown> | null };
+    expect(body.interaction).toMatchObject({
+      id,
+      conversationId: created.id,
+      kind: "confirm",
+      host: "192.168.1.5",
+    });
+    expect(body.interaction).not.toHaveProperty("resolver");
+  });
+
+  // AC-4.3: Given a malformed conversation id (path-traversal-style, matching this
+  // repo's existing assertSafeConversationId convention — same test pattern as
+  // /artifacts/latest's equivalent test), when GET .../pending-interaction is
+  // called, then it returns 400 with no leaked stack trace.
+  test("AC-4.3: malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/pending-interaction`);
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+});
+
+describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve", () => {
+  // AC-4.1 [R]: Given a pending confirm-kind interaction exists for a conversation,
+  // when POST .../resolve is called with { "approved": true }, then it returns 200
+  // and the interaction's promise (from create()) resolves with { approved: true }.
+  // This is the only path by which a real user approval reaches the waiting tool
+  // call — tested in both directions (this test: approve).
+  test("AC-4.1: { approved: true } returns 200 and resolves the promise with approved: true", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "approve flow" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id, promise } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.5",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ resolved: true });
+
+    expect(await promise).toEqual({ kind: "confirm", approved: true });
+  });
+
+  // AC-4.1 [R]: same as above, but the deny direction — a regression that silently
+  // resolved every confirm-kind interaction as approved regardless of the request
+  // body would defeat the entire approval-gate safety boundary, so this must be
+  // tested explicitly, not inferred from the approve case.
+  test("AC-4.1: { approved: false } returns 200 and resolves the promise with approved: false", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "deny flow" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id, promise } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.6",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: false }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ resolved: true });
+
+    expect(await promise).toEqual({ kind: "confirm", approved: false });
+  });
+
+  // Render-kind coverage of the same resolve path — not itself a numbered AC, but
+  // proves the body-shape-disambiguation design (confirm vs render) actually works
+  // both ways, not just for confirm-kind.
+  test("{ html } resolves a render-kind interaction's promise", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "render flow" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id, promise } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "render",
+      url: "https://example.com/app",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ html: "<html>rendered</html>" }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ resolved: true });
+
+    expect(await promise).toEqual({ kind: "render", html: "<html>rendered</html>" });
+  });
+
+  // AC-4.2: Given an interaction id that doesn't exist, when POST .../resolve is
+  // called, then it returns 404, not 200.
+  test("AC-4.2: resolving an unknown interaction id returns 404, not 200", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "unknown interaction" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(
+      `${baseUrl}/api/conversations/${created.id}/pending-interaction/${randomUUID()}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  // AC-4.2: Given an interaction that's already been resolved, when POST
+  // .../resolve is called again for that same id, then it returns 404, not 200.
+  test("AC-4.2: resolving an already-resolved interaction a second time returns 404, not 200", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "double resolve" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.7",
+      timeoutMs: 5000,
+    });
+
+    const resolveUrl = `${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`;
+    const first = await fetch(resolveUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: true }),
+    });
+    expect(first.status).toBe(200);
+
+    const second = await fetch(resolveUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: false }),
+    });
+    expect(second.status).toBe(404);
+  });
+
+  // AC-4.3: Given a malformed conversation id (path-traversal-style), when POST
+  // .../resolve is called, then it returns 400 with no leaked stack trace.
+  test("AC-4.3: malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(
+      `${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/pending-interaction/${randomUUID()}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+
+  // Body-shape validation coverage: the route must not guess which kind an
+  // interaction is (that's pending-interactions.ts's own private state) — a body
+  // matching neither shape unambiguously must 400 before resolve() is ever called.
+  test("400 when the body has neither approved nor html", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "empty body" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.8",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("400 when the body has both approved and html", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "ambiguous body" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.9",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: true, html: "<p>x</p>" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  test("400 when approved is present but not a boolean", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "wrong type" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id } = createPendingInteraction(created.id, {
+      conversationId: created.id,
+      kind: "confirm",
+      host: "10.0.0.10",
+      timeoutMs: 5000,
+    });
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: "yes" }),
+    });
+    expect(res.status).toBe(400);
   });
 });

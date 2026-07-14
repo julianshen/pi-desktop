@@ -14,9 +14,16 @@ import {
   setLiveSessionModel,
   getConversationMessages,
   getLastTurnError,
+  conversationCwd,
 } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
+import {
+  getPending as getPendingInteraction,
+  resolve as resolvePendingInteraction,
+  type ConfirmResult,
+  type RenderResult,
+} from "./web-fetch/pending-interactions.js";
 
 /**
  * Task 6: both models.ts functions already accept an optional ModelRegistry
@@ -224,6 +231,78 @@ export function createApp(options?: CreateAppOptions): Express {
       console.error("[api/conversations/:id/artifacts/:artifactId] unhandled error", error);
       if (!res.headersSent) res.status(400).end();
     }
+  });
+
+  // Task 4 (AC-4.4): the pending-interaction poll endpoint (SPEC.md's "Getting the
+  // pending interaction to the frontend — RESOLVED: poll" section — push was ruled
+  // out because the browser never talks to /agui directly, see that section for the
+  // full trace). getPendingInteraction() already returns undefined for "nothing
+  // pending" or "settled" — normalized to 200 { interaction: null }, not 404, same
+  // "expected state, not an error" convention as GET .../artifacts/latest above.
+  //
+  // conversationCwd(id) is called here purely for its assertSafeConversationId
+  // side-effect-free validation (it does no I/O by itself) — same path-traversal
+  // guard every other per-conversation route in this file relies on, reused rather
+  // than duplicated. Same broad try/catch -> 400 convention as .../artifacts/latest
+  // (AC-4.3 / this repo's "Task 8 fix"): a malformed id throws synchronously, so a
+  // bare .catch() on a promise chain wouldn't catch it, and letting it fall through
+  // to Express's default error handler would leak a stack trace with absolute local
+  // paths in the response body.
+  app.get("/api/conversations/:id/pending-interaction", (req, res) => {
+    try {
+      conversationCwd(req.params.id);
+      res.json({ interaction: getPendingInteraction(req.params.id) ?? null });
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/pending-interaction] unhandled error", error);
+      if (!res.headersSent) res.status(400).end();
+    }
+  });
+
+  // Task 4 (AC-4.1/AC-4.2/AC-4.3): resolves a pending interaction the frontend has
+  // just answered (an approve/deny click, Task 8; or a headless-render result, Task
+  // 10). This route only has :interactionId and a body — it deliberately does NOT
+  // know whether the interaction is confirm- or render-kind (that's pending-
+  // interactions.ts's own private state, never exposed), so the body shape itself
+  // is what disambiguates: `{ approved: boolean }` for confirm-kind, `{ html:
+  // string | null }` for render-kind. A body matching neither shape unambiguously
+  // (missing both fields, or carrying both) is a 400, checked *before* calling
+  // resolve() — never guessed at.
+  //
+  // resolve() returns false for an unknown, already-resolved, or already-timed-out
+  // id (pending-interactions.ts's own contract) — that must surface as 404, not a
+  // false-looking 200, per AC-4.2: the caller needs to know its approval/render
+  // answer never actually reached anything.
+  app.post("/api/conversations/:id/pending-interaction/:interactionId/resolve", express.json(), (req, res) => {
+    try {
+      conversationCwd(req.params.id);
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/pending-interaction/:interactionId/resolve] unhandled error", error);
+      res.status(400).end();
+      return;
+    }
+
+    const body = req.body as { approved?: unknown; html?: unknown } | undefined;
+    const hasApproved = typeof body?.approved === "boolean";
+    const hasHtml = !!body && "html" in body && (body.html === null || typeof body.html === "string");
+
+    let result: ConfirmResult | RenderResult | undefined;
+    if (hasApproved && !hasHtml) {
+      result = { kind: "confirm", approved: body!.approved as boolean };
+    } else if (hasHtml && !hasApproved) {
+      result = { kind: "render", html: body!.html as string | null };
+    }
+
+    if (!result) {
+      res.status(400).end();
+      return;
+    }
+
+    if (!resolvePendingInteraction(req.params.interactionId, result)) {
+      res.status(404).end();
+      return;
+    }
+
+    res.json({ resolved: true });
   });
 
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
