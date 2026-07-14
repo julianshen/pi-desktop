@@ -540,6 +540,70 @@ describe("GET /api/conversations/:id/artifacts/latest", () => {
   });
 });
 
+describe("GET /api/conversations/:id/artifacts/:artifactId", () => {
+  // Artifacts-as-chat-attachments: an older artifact must still be fetchable by id
+  // after a newer one has become "latest" — this is the endpoint the chat
+  // attachment chip's click handler calls, since it knows the exact id its own
+  // tool call published, not just whatever is currently latest.
+  test("returns 200 with a specific artifact's full content even after a newer one was published", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "has two artifacts" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { saveArtifact } = await import("./artifacts/store.js");
+    const older = {
+      id: "chart-1",
+      title: "WAU chart",
+      language: "tsx",
+      code: "export const Chart = () => null;",
+      publishedAt: "2020-01-01T00:00:00.000Z",
+    };
+    const newer = {
+      id: "chart-2",
+      title: "MAU chart",
+      language: "tsx",
+      code: "export const Chart2 = () => null;",
+      publishedAt: "2030-01-01T00:00:00.000Z",
+    };
+    saveArtifact(created.id, older);
+    saveArtifact(created.id, newer);
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/artifacts/chart-1`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(older);
+  });
+
+  // AC parity with /latest's AC-8.1: an unknown artifact id is a "nothing to show"
+  // state, not a client error — returns 200 null rather than 404.
+  test("returns 200 null for an id that was never published", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "no such artifact" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/artifacts/does-not-exist`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toBeNull();
+  });
+
+  // Same path-traversal guard as /latest — must not leak a stack trace.
+  test("malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/artifacts/chart-1`);
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+});
+
 // Security-review finding (Critical, /tgd-review security-auditor): createApp() used
 // to mount `cors()` with no options, which is the `cors` package's wildcard default
 // (Access-Control-Allow-Origin: *). Combined with zero auth on any route, that let any

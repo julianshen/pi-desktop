@@ -86,6 +86,41 @@ function makeStubSessionWithEmptyThenRealAssistantMessage(): StubSession {
 }
 
 /**
+ * Reproduces a live-observed bug: a chat turn against openrouter (real account,
+ * insufficient credits — a genuine 402 from OpenRouter, not a code bug) produced
+ * RUN_STARTED immediately followed by RUN_FINISHED with zero content and no
+ * error. Root-caused via a raw /agui capture against the real running app with
+ * temporary event logging: a failed model call does NOT go through
+ * message_update's assistantMessageEvent stream at all — pi instead goes
+ * straight message_start -> message_end with the SAME AssistantMessage object
+ * carrying `stopReason: "error"` and a populated `errorMessage`. This handler
+ * only checked message_update's "text_delta", never message_end's stopReason,
+ * so a failed turn rendered as total silence instead of a visible error.
+ */
+function makeStubSessionWithFailingTurn(errorMessage: string): StubSession {
+  const listeners = new Set<(event: StubSessionEvent) => void>();
+  const session: StubSession = {
+    isStreaming: false,
+    unsubscribed: false,
+    subscribe(cb) {
+      listeners.add(cb);
+      return () => {
+        listeners.delete(cb);
+        session.unsubscribed = true;
+      };
+    },
+    async prompt() {
+      const emit = (event: StubSessionEvent) => listeners.forEach((cb) => cb(event));
+      const failedMessage = { role: "assistant", content: [], stopReason: "error", errorMessage };
+      emit({ type: "message_start", message: failedMessage });
+      emit({ type: "message_end", message: failedMessage });
+      emit({ type: "agent_end" });
+    },
+  };
+  return session;
+}
+
+/**
  * Task 3 fix (review finding): id that makes the mocked touchConversation() below
  * throw, simulating a registry write failure during the agent_end bookkeeping step.
  */
@@ -281,5 +316,35 @@ describe("handleAguiRun", () => {
     const contentEvents = events.filter((e) => e.type === "TEXT_MESSAGE_CONTENT");
     expect(contentEvents.every((e) => e.messageId === starts[0]!.messageId)).toBe(true);
     expect(contentEvents.map((e) => e.delta).join("")).toBe("the answer");
+  });
+
+  // Bug fix (live-usage report: a chat turn produced RUN_STARTED immediately
+  // followed by RUN_FINISHED with zero content — the model call had failed, but
+  // nothing told the user). A failed turn must surface a real RUN_ERROR with the
+  // actual error message, not silence, and must not also emit RUN_FINISHED (this
+  // file's own established convention — see the "Task 3 fix" test above asserting
+  // their absence together).
+  test("a failing model call (message_end's stopReason 'error') surfaces RUN_ERROR with the real message, not silence", async () => {
+    sessionsById.set(
+      "conv-failing",
+      makeStubSessionWithFailingTurn('402: {"message":"This request requires more credits..."}'),
+    );
+
+    const res = new MockResponse();
+    await handleAguiRun(makeReq(makeInput({ threadId: "conv-failing" })), res as unknown as Response);
+
+    const allChunks = res.chunks.join("");
+    expect(allChunks).toContain("RUN_ERROR");
+    expect(allChunks).toContain("This request requires more credits");
+    expect(allChunks).not.toContain("RUN_FINISHED");
+
+    // No dangling open message either — nothing was ever started for this turn.
+    expect(allChunks).not.toContain("TEXT_MESSAGE_START");
+
+    // The stream was still torn down cleanly (unsubscribe + finish), same as
+    // every other terminal path in this handler.
+    expect(res.ended).toBe(true);
+    const session = sessionsById.get("conv-failing");
+    expect(session?.unsubscribed).toBe(true);
   });
 });

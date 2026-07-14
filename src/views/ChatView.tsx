@@ -2,16 +2,51 @@ import { useEffect, useRef, useState } from "react";
 import { useCopilotChatInternal, useThreads } from "@copilotkit/react-core";
 import { Role, TextMessage, aguiToGQL } from "@copilotkit/runtime-client-gql";
 import { Blueprint } from "../components/Blueprint";
-import { AttachIcon, SendIcon } from "../components/icons";
+import { AttachIcon, FileIcon, SendIcon } from "../components/icons";
 import { API_BASE } from "../state/apiBase.js";
 
 const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
 
+const ERROR_DISPLAY_MAX_LENGTH = 300;
+
+/** Matches server/src/artifacts/tools.ts's defineTool({ name: "publish_artifact", ... }). */
+const PUBLISH_ARTIFACT_TOOL_NAME = "publish_artifact";
+
+/**
+ * Provider error messages come through as whatever raw string the provider's own
+ * API returned — live-verified with a real OpenRouter 402 response, whose raw
+ * `errorMessage` is `"402: {\"message\": \"...\", \"code\": 402, \"metadata\": {
+ * \"previous_errors\": [...] }}"` — an HTTP status prefix (`"402: "`) followed by
+ * a JSON blob wrapping a human-readable `message` field inside a much longer
+ * structure repeating the same text per retry attempt. Rendering that verbatim
+ * produced a wall of raw JSON dominating the whole transcript. Strip a leading
+ * `NNN: ` status prefix if present (a common pattern for HTTP-client-wrapped
+ * errors, not specific to OpenRouter), then extract just the top-level `message`
+ * when what's left parses as JSON shaped like that (a safe no-op for plain-text
+ * errors from other providers/paths), then truncate regardless — no error
+ * message should be allowed to dominate the viewport, whatever provider or shape
+ * it came from.
+ */
+function summarizeError(raw: string): string {
+  let text = raw;
+  const withoutStatusPrefix = raw.replace(/^\d{3}:\s*/, "");
+  try {
+    const parsed: unknown = JSON.parse(withoutStatusPrefix);
+    if (parsed && typeof parsed === "object" && "message" in parsed && typeof (parsed as { message: unknown }).message === "string") {
+      text = (parsed as { message: string }).message;
+    }
+  } catch {
+    // Not JSON — use the raw string as-is.
+  }
+  return text.length > ERROR_DISPLAY_MAX_LENGTH ? `${text.slice(0, ERROR_DISPLAY_MAX_LENGTH)}…` : text;
+}
+
 export function ChatView({
   model,
   conversationId,
   onTurnComplete,
+  onOpenArtifact,
 }: {
   model: string;
   conversationId: string;
@@ -25,6 +60,13 @@ export function ChatView({
    * extra spurious refetch on first render.
    */
   onTurnComplete?: () => void;
+  /**
+   * Artifacts-as-chat-attachments: called with an artifact id when the user clicks
+   * a `publish_artifact` attachment chip in the transcript below, so App.tsx can
+   * open the Canvas pinned to that exact artifact (useShellState's
+   * `actions.openArtifact`).
+   */
+  onOpenArtifact?: (artifactId: string) => void;
 }) {
   // Task 12 CRITICAL BUG FIX (found via live E2E reproduction, not just static review):
   // `useCopilotChat()` (verified against the installed @copilotkit/react-core 1.62.3,
@@ -166,16 +208,51 @@ export function ChatView({
     };
   }, [conversationId, isAvailable, setMessages]);
 
+  // Bug fix (live-usage report: a failed turn — real OpenRouter 402
+  // "insufficient credits" — was completely invisible in the UI). adapter.ts
+  // now emits a real RUN_ERROR over the AG-UI stream, but the installed
+  // CopilotKit version's `<CopilotKit onError>` prop silently no-ops without a
+  // `publicApiKey` configured (confirmed by reading the installed package's
+  // own source, node_modules/@copilotkit/react-core/dist/copilotkit-ympAovXs.mjs's
+  // `handleErrors`: `if (copilotApiConfig.publicApiKey && onErrorRef.current)`)
+  // — this app is deliberately self-hosted with no license key, so that's a
+  // dead end, not a viable way to observe agent errors client-side. Polling
+  // the new GET /api/conversations/:id/last-error on the same turn-completion
+  // signal below is an independent, backend-owned check that doesn't depend
+  // on it.
+  const [error, setError] = useState<string | null>(null);
+
   // Task 13 follow-up: fire `onTurnComplete` exactly on the true -> false edge of
   // `isLoading`, not merely "whenever isLoading is false" (which would also fire on
   // initial mount for a conversation that loads with isLoading already false).
   const wasLoadingRef = useRef(isLoading);
+  // Bug fix (found in review): the last-error fetch had no ordering guard, unlike
+  // the sibling history-seeding effect's `cancelled` flag. If the user sends a
+  // follow-up message before a failed turn's last-error fetch resolves, `submit()`
+  // clears `error` immediately — but the still-in-flight fetch from the PRIOR turn
+  // would later call `setError()` unconditionally, and if it happens to resolve
+  // after the new turn's own last-error check, it clobbers the fresh state with a
+  // stale error banner for a turn that already succeeded (or is still running).
+  // A monotonic request id, bumped by both a new turn's check and `submit()`,
+  // lets each fetch's `.then()` recognize it's no longer the latest request and
+  // discard its result instead of applying it.
+  const lastErrorRequestIdRef = useRef(0);
   useEffect(() => {
     if (wasLoadingRef.current && !isLoading) {
       onTurnComplete?.();
+      const requestId = ++lastErrorRequestIdRef.current;
+      fetch(`${API_BASE}/api/conversations/${conversationId}/last-error`)
+        .then((res) => (res.ok ? (res.json() as Promise<{ message: string | null }>) : { message: null }))
+        .then(({ message }) => {
+          if (requestId !== lastErrorRequestIdRef.current) return;
+          setError(message);
+        })
+        .catch((err: unknown) => {
+          console.error("[ChatView] failed to check last-turn error", err);
+        });
     }
     wasLoadingRef.current = isLoading;
-  }, [isLoading, onTurnComplete]);
+  }, [isLoading, onTurnComplete, conversationId]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
@@ -185,6 +262,10 @@ export function ChatView({
     const text = draft.trim();
     if (!text || isLoading) return;
     setDraft("");
+    setError(null);
+    // Invalidates any last-error fetch still in flight from the turn just left
+    // behind — see the request-id guard above.
+    lastErrorRequestIdRef.current += 1;
     void appendMessage(new TextMessage({ content: text, role: Role.User }));
   };
 
@@ -234,11 +315,55 @@ export function ChatView({
               );
             }
 
-            if (message.isTextMessage() && message.role === Role.Assistant) {
+            // Bug fix (live-usage report: real conversations doing multi-step bash
+            // tool use — e.g. generating a PDF — showed a stack of empty chat
+            // bubbles). Root-caused via direct DOM/data inspection (confirmed
+            // backend data was correct and identical in shape for both working and
+            // broken cases): @copilotkit/runtime-client-gql's own aguiToGQL()
+            // unconditionally synthesizes a TextMessage for every assistant message
+            // that has toolCalls — `content: message.content || ""` — even when
+            // that message carries no text at all (a normal shape for a pure
+            // tool-call turn, e.g. bash commands with no accompanying explanation).
+            // ChatView has no control over that library-level behavior; skipping an
+            // empty-content text bubble here is the fix, matching the same "never
+            // render a bubble with nothing in it" rule adapter.ts and
+            // toAGUIHistory() already apply server-side (which cover different
+            // cases — this is a third, client-side-library-specific one).
+            if (message.isTextMessage() && message.role === Role.Assistant && message.content.trim()) {
               return (
                 <div key={message.id} style={{ display: "flex", gap: 14 }}>
                   <Avatar />
                   <p style={{ margin: 0, fontSize: 15, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{message.content}</p>
+                </div>
+              );
+            }
+
+            // Artifacts-as-chat-attachments: render a publish_artifact tool call as a
+            // clickable attachment chip instead of the generic "tool: {name}" chip
+            // below — the tool's own args already carry everything needed to render
+            // it (id/title/language, see server/src/artifacts/tools.ts's
+            // defineTool parameters), no extra fetch required just to show the chip.
+            // Clicking it opens the Canvas pinned to this exact artifact id
+            // (App.tsx wires onOpenArtifact -> useShellState's actions.openArtifact),
+            // even if a newer artifact has since become "latest" in this conversation.
+            if (message.isActionExecutionMessage() && message.name === PUBLISH_ARTIFACT_TOOL_NAME) {
+              const args = message.arguments as { id?: string; title?: string; language?: string };
+              const artifactId = typeof args.id === "string" ? args.id : undefined;
+              return (
+                <div key={message.id} style={{ display: "flex", gap: 14 }}>
+                  <Avatar />
+                  <Blueprint
+                    style={{ background: "transparent", cursor: artifactId ? "pointer" : "default" }}
+                    onClick={artifactId ? () => onOpenArtifact?.(artifactId) : undefined}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 12px" }}>
+                      <FileIcon size={14} />
+                      <span style={{ fontFamily: "ui-monospace,'SF Mono',Menlo,monospace", fontSize: 12.5 }}>
+                        {args.title ?? "Untitled artifact"}
+                      </span>
+                      {args.language && <span className="tag tag-accent">{args.language}</span>}
+                    </div>
+                  </Blueprint>
                 </div>
               );
             }
@@ -265,6 +390,25 @@ export function ChatView({
             <div style={{ display: "flex", gap: 14 }}>
               <Avatar />
               <p style={{ margin: 0, fontSize: 15, color: "color-mix(in srgb, var(--color-text) 50%, transparent)" }}>Thinking…</p>
+            </div>
+          )}
+
+          {!isLoading && error && (
+            <div style={{ display: "flex", gap: 14 }}>
+              <Avatar />
+              <div
+                style={{
+                  maxWidth: "78%",
+                  padding: "10px 14px",
+                  fontSize: 14,
+                  lineHeight: 1.5,
+                  color: "var(--color-danger)",
+                  background: "var(--color-danger-bg)",
+                  border: "1px solid var(--color-danger)",
+                }}
+              >
+                {summarizeError(error)}
+              </div>
             </div>
           )}
         </div>

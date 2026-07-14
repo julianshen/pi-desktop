@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import { useShellState } from "./useShellState.js";
 
 /**
@@ -31,6 +31,16 @@ describe("useShellState", () => {
     expect(result.current.state.view).toBe("chat");
   });
 
+  // Most turns don't publish an artifact, so opening the Canvas unconditionally on
+  // every launch showed an empty "Nothing published to the canvas yet" panel far
+  // more often than real content. It now starts closed; the user opens it
+  // explicitly (MainHeader's Canvas button) or implicitly (clicking a
+  // publish_artifact chat attachment chip).
+  test("Canvas starts closed by default", () => {
+    const { result } = renderHook(() => useShellState());
+    expect(result.current.state.artifactOpen).toBe(false);
+  });
+
   /**
    * Regression test for a bug found LIVE via /tgd-verify (a real running app in a real
    * browser), not just a mocked-test-only issue: `state.model` was hardcoded to
@@ -48,5 +58,44 @@ describe("useShellState", () => {
     const { result } = renderHook(() => useShellState());
     expect(result.current.state.model).toBe("");
     expect(result.current.state.model).not.toBe("pi-2 Sonnet");
+  });
+
+  describe("artifact-attachment Canvas pinning", () => {
+    test("initial canvasArtifactId is null (show the latest artifact)", () => {
+      const { result } = renderHook(() => useShellState());
+      expect(result.current.state.canvasArtifactId).toBeNull();
+    });
+
+    test("openArtifact(id) opens the Canvas pinned to that specific artifact id", () => {
+      const { result } = renderHook(() => useShellState());
+      act(() => result.current.actions.openArtifact("artifact-7"));
+      expect(result.current.state.artifactOpen).toBe(true);
+      expect(result.current.state.canvasArtifactId).toBe("artifact-7");
+    });
+
+    test("openArtifact() with no id opens the Canvas showing the latest artifact", () => {
+      const { result } = renderHook(() => useShellState());
+      act(() => result.current.actions.openArtifact("artifact-7"));
+      act(() => result.current.actions.openArtifact());
+      expect(result.current.state.artifactOpen).toBe(true);
+      expect(result.current.state.canvasArtifactId).toBeNull();
+    });
+
+    test("toggleArtifact() clears a pinned artifact id when reopening a closed Canvas", () => {
+      const { result } = renderHook(() => useShellState());
+      act(() => result.current.actions.openArtifact("artifact-7"));
+      act(() => result.current.actions.toggleArtifact()); // close
+      expect(result.current.state.artifactOpen).toBe(false);
+      act(() => result.current.actions.toggleArtifact()); // reopen via the generic button
+      expect(result.current.state.artifactOpen).toBe(true);
+      expect(result.current.state.canvasArtifactId).toBeNull();
+    });
+
+    test("setActiveConv() clears a pinned artifact id from the previous conversation", () => {
+      const { result } = renderHook(() => useShellState());
+      act(() => result.current.actions.openArtifact("artifact-7"));
+      act(() => result.current.actions.setActiveConv("conv-2"));
+      expect(result.current.state.canvasArtifactId).toBeNull();
+    });
   });
 });

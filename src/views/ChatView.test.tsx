@@ -247,6 +247,43 @@ describe("ChatView", () => {
     expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
   });
 
+  // Bug fix (live-usage report: a real multi-step bash tool-use conversation —
+  // generating a PDF from an SVG — showed a stack of empty chat bubbles).
+  // Root-caused via direct DOM/data inspection: the backend's AG-UI history is
+  // correct (an assistant message with toolCalls and no `content` field, the
+  // normal shape for a pure tool-call turn with no accompanying explanation),
+  // but @copilotkit/runtime-client-gql's own aguiToGQL() unconditionally
+  // synthesizes a TextMessage for every assistant message with toolCalls —
+  // `content: message.content || ""` — producing an empty-content TextMessage
+  // ChatView then rendered as a blank bubble, IN ADDITION to (not instead of)
+  // the real ActionExecutionMessage for the tool call. Both must show correctly:
+  // no empty bubble, and the tool chip still renders for every call, not just
+  // ones that happen to also carry explanatory text.
+  test("bug fix: an assistant message with toolCalls and no text (pure tool-call turn) renders only the tool chip, never an empty bubble", async () => {
+    threadFor("default").messages = [
+      { id: "u1", role: "user", content: "做成Pdf" },
+      {
+        id: "a1",
+        role: "assistant",
+        toolCalls: [{ type: "function", id: "bash_1", function: { name: "bash", arguments: '{"command":"ls -lh out.pdf"}' } }],
+      },
+      { id: "t1", role: "tool", toolCallId: "bash_1", toolName: "bash", content: "-rw-r--r-- 1 user staff 23K out.pdf" },
+      { id: "a2", role: "assistant", content: "PDF 做好了！" },
+    ] as unknown as MockMessage[];
+
+    render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("bash")).toBeTruthy();
+    });
+    expect(screen.getByText("PDF 做好了！")).toBeTruthy();
+
+    // No empty assistant bubble: every rendered paragraph must have real text.
+    const paragraphs = Array.from(document.querySelectorAll("p"));
+    const emptyParagraphs = paragraphs.filter((p) => p.textContent?.trim() === "");
+    expect(emptyParagraphs.length).toBe(0);
+  });
+
   // Task 13 follow-up (App.tsx previously flagged `refreshSignal` as unwired pending
   // both Task 12 and Task 13 landing): proves ChatView's new `onTurnComplete` callback
   // fires exactly on the true -> false edge of isLoading, not on every render where
@@ -377,5 +414,296 @@ describe("ChatView", () => {
     // The textarea and send button must still render normally — only the model label
     // span is conditionally omitted.
     expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
+  });
+
+  // Bug fix (live-usage report: a chat turn failed against a real, misconfigured
+  // provider — OpenRouter 402 "insufficient credits" — with zero visible indication
+  // anywhere in the UI, even after adapter.ts was fixed to emit a real RUN_ERROR).
+  // The installed CopilotKit version's `<CopilotKit onError>` prop turned out to
+  // silently no-op without a `publicApiKey` (this app is deliberately self-hosted,
+  // no license key — confirmed by reading the installed package's own source), so
+  // ChatView instead polls the new GET /api/conversations/:id/last-error on the
+  // same isLoading true->false edge `onTurnComplete` already fires on.
+  test("bug fix: a failed turn (last-error endpoint returns a message) renders as a visible banner, and clears on the next send", async () => {
+    const state = threadFor("conv-failing");
+
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/conversations/conv-failing/messages")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/api/conversations/conv-failing/last-error")) {
+        return Promise.resolve(jsonResponse({ message: "402: insufficient credits for this request" }));
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
+
+    // Turn starts, then completes (isLoading true -> false) — the edge that
+    // triggers the last-error check, same as onTurnComplete.
+    state.isLoading = true;
+    await act(async () => {
+      rerender(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
+    });
+    state.isLoading = false;
+    await act(async () => {
+      rerender(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("402: insufficient credits for this request")).toBeTruthy();
+    });
+
+    // Sending a new message clears the banner immediately, without waiting for a
+    // fresh last-error check.
+    const textarea = screen.getByPlaceholderText(/Message pi/);
+    fireEvent.change(textarea, { target: { value: "try again" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    await waitFor(() => {
+      expect(screen.queryByText("402: insufficient credits for this request")).toBeNull();
+    });
+  });
+
+  test("no error banner renders when a turn completes successfully (last-error endpoint returns null)", async () => {
+    const state = threadFor("conv-ok");
+
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/conversations/conv-ok/messages")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/api/conversations/conv-ok/last-error")) {
+        return Promise.resolve(jsonResponse({ message: null }));
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
+
+    state.isLoading = true;
+    await act(async () => {
+      rerender(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
+    });
+    state.isLoading = false;
+    await act(async () => {
+      rerender(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
+    });
+
+    expect(screen.queryByText(/insufficient credits/)).toBeNull();
+  });
+
+  // Bug fix (found in review): the last-error fetch had no ordering guard against a
+  // user immediately retrying after a failed turn — a still-in-flight fetch from the
+  // turn the user already moved past could resolve AFTER the new turn's own
+  // last-error check and clobber the fresh state with a stale error banner.
+  test("bug fix: a stale last-error fetch from a turn the user already moved past does not overwrite a fresher state", async () => {
+    const state = threadFor("conv-race");
+
+    let resolveStaleFetch!: (res: Response) => void;
+    const staleFetch = new Promise<Response>((resolve) => {
+      resolveStaleFetch = resolve;
+    });
+
+    let lastErrorCallCount = 0;
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/conversations/conv-race/messages")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/api/conversations/conv-race/last-error")) {
+        lastErrorCallCount += 1;
+        // First call (turn 1's failure) is left in flight; second call (turn 2,
+        // which succeeded) resolves immediately.
+        return lastErrorCallCount === 1 ? staleFetch : Promise.resolve(jsonResponse({ message: null }));
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<ChatView key="conv-race" model="" conversationId="conv-race" />);
+
+    // Turn 1 completes (failed) -- fires the first (stale) last-error fetch, left in flight.
+    state.isLoading = true;
+    await act(async () => {
+      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
+    });
+    state.isLoading = false;
+    await act(async () => {
+      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
+    });
+
+    // User immediately sends a follow-up (submit() clears error + bumps the request id).
+    const textarea = screen.getByPlaceholderText(/Message pi/);
+    fireEvent.change(textarea, { target: { value: "try again" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    // Turn 2 completes successfully -- its own last-error fetch resolves with null.
+    state.isLoading = true;
+    await act(async () => {
+      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
+    });
+    state.isLoading = false;
+    await act(async () => {
+      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
+    });
+
+    // Now the STALE turn-1 fetch finally resolves, with an error -- after turn 2
+    // already succeeded. Without the request-id guard this would clobber the
+    // correct "no error" state with turn 1's stale message.
+    await act(async () => {
+      resolveStaleFetch(jsonResponse({ message: "402: stale insufficient credits error" }));
+    });
+
+    expect(screen.queryByText(/stale insufficient credits/)).toBeNull();
+  });
+
+  // Bug fix follow-up (found live: the real OpenRouter 402 error, once actually
+  // surfaced, turned out to be an HTTP-status-prefixed JSON string —
+  // `"402: {...}"`, not bare JSON — wrapping a much longer structure with a
+  // `previous_errors` array repeating the same text per retry attempt.
+  // Rendering it verbatim dumped a wall of raw JSON dominating the whole
+  // transcript; the initial fix's JSON.parse also silently failed on the raw
+  // string because of the un-stripped `"402: "` prefix. Extract just the
+  // human-readable top-level `message` field after stripping that prefix.
+  test("bug fix follow-up: a JSON-shaped provider error (real OpenRouter 402 shape, status-prefixed) renders its clean message, not the raw JSON", async () => {
+    const state = threadFor("conv-json-error");
+    // Exact raw shape captured live: "<status>: <json>", not bare JSON.
+    const rawOpenRouterError = `402: ${JSON.stringify({
+      message: "This request requires more credits, or fewer max_tokens.",
+      code: 402,
+      metadata: {
+        provider_name: null,
+        previous_errors: [
+          { code: 402, message: "This request requires more credits, or fewer max_tokens." },
+          { code: 402, message: "This request requires more credits, or fewer max_tokens." },
+        ],
+      },
+    })}`;
+
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/api/conversations/conv-json-error/messages")) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/api/conversations/conv-json-error/last-error")) {
+        return Promise.resolve(jsonResponse({ message: rawOpenRouterError }));
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
+
+    state.isLoading = true;
+    await act(async () => {
+      rerender(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
+    });
+    state.isLoading = false;
+    await act(async () => {
+      rerender(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("This request requires more credits, or fewer max_tokens.")).toBeTruthy();
+    });
+    // The raw JSON (metadata, previous_errors, code, etc.) must never render.
+    expect(screen.queryByText(/previous_errors/)).toBeNull();
+    expect(screen.queryByText(/"metadata"/)).toBeNull();
+  });
+
+  // New feature: a publish_artifact tool call renders as a clickable attachment
+  // chip (title + language), distinct from the generic "tool: {name}" chip other
+  // tool calls get, and clicking it calls onOpenArtifact with the published
+  // artifact's id — the args a publish_artifact call carries are already the full
+  // { id, title, language, code } payload (server/src/artifacts/tools.ts), so the
+  // chip needs no extra fetch to render.
+  describe("artifacts-as-chat-attachments", () => {
+    test("a publish_artifact tool call renders as an attachment chip with its title and language, not the generic tool chip", async () => {
+      threadFor("conv-artifact").messages = [
+        { id: "u1", role: "user", content: "chart the weather" },
+        {
+          id: "a1",
+          role: "assistant",
+          toolCalls: [
+            {
+              type: "function",
+              id: "call_1",
+              function: {
+                name: "publish_artifact",
+                arguments: JSON.stringify({
+                  id: "weather-chart",
+                  title: "weather_chart.tsx",
+                  language: "tsx",
+                  code: "export const Chart = () => null;",
+                }),
+              },
+            },
+          ],
+        },
+        { id: "t1", role: "tool", toolCallId: "call_1", toolName: "publish_artifact", content: "Published." },
+      ] as unknown as MockMessage[];
+
+      render(<ChatView key="conv-artifact" model="" conversationId="conv-artifact" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("weather_chart.tsx")).toBeTruthy();
+      });
+      expect(screen.getByText("tsx")).toBeTruthy();
+      // Not the generic tool chip's raw tool-name rendering.
+      expect(screen.queryByText("publish_artifact")).toBeNull();
+    });
+
+    test("clicking a publish_artifact attachment chip calls onOpenArtifact with the artifact's id", async () => {
+      threadFor("conv-artifact-click").messages = [
+        {
+          id: "a1",
+          role: "assistant",
+          toolCalls: [
+            {
+              type: "function",
+              id: "call_1",
+              function: {
+                name: "publish_artifact",
+                arguments: JSON.stringify({ id: "weather-chart", title: "weather_chart.tsx", language: "tsx", code: "" }),
+              },
+            },
+          ],
+        },
+        { id: "t1", role: "tool", toolCallId: "call_1", toolName: "publish_artifact", content: "Published." },
+      ] as unknown as MockMessage[];
+
+      const openedIds: string[] = [];
+      render(
+        <ChatView
+          key="conv-artifact-click"
+          model=""
+          conversationId="conv-artifact-click"
+          onOpenArtifact={(id) => openedIds.push(id)}
+        />,
+      );
+
+      const chip = await waitFor(() => screen.getByText("weather_chart.tsx"));
+      fireEvent.click(chip);
+
+      expect(openedIds).toEqual(["weather-chart"]);
+    });
+
+    test("other tool calls (e.g. bash) still render the generic tool chip, unaffected by the artifact special-case", async () => {
+      threadFor("conv-generic-tool").messages = [
+        {
+          id: "a1",
+          role: "assistant",
+          toolCalls: [{ type: "function", id: "bash_1", function: { name: "bash", arguments: '{"command":"ls"}' } }],
+        },
+        { id: "t1", role: "tool", toolCallId: "bash_1", toolName: "bash", content: "out.pdf" },
+      ] as unknown as MockMessage[];
+
+      render(<ChatView key="conv-generic-tool" model="" conversationId="conv-generic-tool" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("bash")).toBeTruthy();
+      });
+      expect(screen.getByText("tool")).toBeTruthy();
+    });
   });
 });

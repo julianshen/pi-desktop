@@ -94,6 +94,7 @@ function Harness({
     view,
     activeConv,
     artifactOpen: false,
+    canvasArtifactId: null,
     canvasTab: "code",
     modelOpen,
     model: "pi-2 Sonnet",

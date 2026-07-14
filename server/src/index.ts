@@ -13,9 +13,10 @@ import {
   touchConversation,
   setLiveSessionModel,
   getConversationMessages,
+  getLastTurnError,
 } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
-import { getLatestArtifact } from "./artifacts/store.js";
+import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
 
 /**
  * Task 6: both models.ts functions already accept an optional ModelRegistry
@@ -159,6 +160,29 @@ export function createApp(options?: CreateAppOptions): Express {
       });
   });
 
+  // Bug fix (live-usage report: a failed turn — real OpenRouter 402
+  // "insufficient credits" — was completely invisible in the UI, even after
+  // adapter.ts was fixed to emit a real RUN_ERROR over the AG-UI stream). The
+  // installed CopilotKit version's `<CopilotKit onError>` prop silently no-ops
+  // without a `publicApiKey` (confirmed by reading the installed package's own
+  // source — this app is deliberately self-hosted with no license key), so
+  // there is no client-side way to observe an agent run error at all. This
+  // endpoint gives the frontend an independent, backend-owned check: "did the
+  // most recent turn fail, and why" — ChatView.tsx polls it on the same
+  // isLoading true->false edge it already tracks for onTurnComplete.
+  app.get("/api/conversations/:id/last-error", (req, res) => {
+    getLastTurnError(req.params.id)
+      .then((message) => res.json({ message }))
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.message.startsWith("Invalid conversation id")) {
+          res.status(400).end();
+          return;
+        }
+        console.error("[api/conversations/:id/last-error] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
+  });
+
   // Task 8 (AC-8.1/AC-8.2): latest published artifact for a conversation.
   // getLatestArtifact() returns undefined when none has been published yet — per
   // spec that's an expected state, not an error, so it's normalized to 200 null
@@ -179,6 +203,25 @@ export function createApp(options?: CreateAppOptions): Express {
       res.json(getLatestArtifact(req.params.id) ?? null);
     } catch (error: unknown) {
       console.error("[api/conversations/:id/artifacts/latest] unhandled error", error);
+      if (!res.headersSent) res.status(400).end();
+    }
+  });
+
+  // Artifacts-as-chat-attachments feature: fetch one specific artifact by id, not
+  // just whatever is currently "latest" — backs the Canvas opening to the exact
+  // artifact a clicked chat attachment published, even if a newer one has since
+  // been published in the same conversation. Registered *after* the /latest route
+  // above (Express matches path patterns in registration order, and "latest" would
+  // otherwise also match this route's :artifactId param) so a request to
+  // .../artifacts/latest keeps hitting that route first. Same 200-null-for-"not
+  // found" and 400-for-malformed-id conventions as /latest — an unknown artifact id
+  // is an expected "nothing to show" state here too (e.g. a stale chat attachment
+  // referencing an id that's since been pruned), not a client error.
+  app.get("/api/conversations/:id/artifacts/:artifactId", (req, res) => {
+    try {
+      res.json(getArtifactById(req.params.id, req.params.artifactId) ?? null);
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/artifacts/:artifactId] unhandled error", error);
       if (!res.headersSent) res.status(400).end();
     }
   });

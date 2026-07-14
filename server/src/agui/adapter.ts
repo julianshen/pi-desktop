@@ -126,6 +126,36 @@ export async function handleAguiRun(req: Request, res: Response): Promise<void> 
       }
       case "message_end": {
         if (event.message.role === "assistant" && currentMessageId) {
+          // Bug fix (live-usage report: a chat turn failed silently — RUN_STARTED
+          // immediately followed by RUN_FINISHED, zero visible content, no error).
+          // Root-caused via a raw /agui capture with temporary event logging: a
+          // failed model call does NOT go through message_update's
+          // assistantMessageEvent stream at all (no "error" variant ever fires
+          // there) — pi instead goes straight message_start -> message_end with
+          // the SAME AssistantMessage object carrying `stopReason: "error"` and a
+          // populated `errorMessage` (confirmed live: a real OpenRouter 402
+          // "insufficient credits" response). A failed turn must never render as
+          // total silence — that looks like the app hung, not like something
+          // went wrong. Treated as terminal, matching the outer catch below and
+          // this file's own established convention of never emitting both
+          // RUN_ERROR and RUN_FINISHED for the same run (see the "Task 3 fix"
+          // test asserting their absence together) — finish() here makes the
+          // later agent_end case's own RUN_FINISHED write a no-op via write()'s
+          // `finished` guard.
+          if (event.message.stopReason === "error") {
+            if (textMessageStarted) {
+              write({ type: EventType.TEXT_MESSAGE_END, messageId: currentMessageId } as BaseEvent);
+            }
+            currentMessageId = undefined;
+            textMessageStarted = false;
+            write({
+              type: EventType.RUN_ERROR,
+              message: event.message.errorMessage ?? "The model call failed.",
+            } as BaseEvent);
+            unsubscribe();
+            finish();
+            break;
+          }
           if (textMessageStarted) {
             write({ type: EventType.TEXT_MESSAGE_END, messageId: currentMessageId } as BaseEvent);
           }

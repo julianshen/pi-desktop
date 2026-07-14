@@ -336,3 +336,28 @@ export async function getConversationMessages(id: string): Promise<AGUIMessage[]
   const session = await getOrCreateSession(id);
   return toAGUIHistory(session.messages as SessionMessage[]);
 }
+
+/**
+ * Bug fix (live-usage report: a failed turn — real OpenRouter 402 "insufficient
+ * credits" — was completely invisible in the UI). adapter.ts now emits a real
+ * RUN_ERROR over the AG-UI stream, but the installed CopilotKit version's
+ * documented `<CopilotKit onError>` prop silently no-ops without a
+ * `publicApiKey` configured (confirmed by reading the installed package's own
+ * source, node_modules/@copilotkit/react-core/dist/copilotkit-ympAovXs.mjs's
+ * `handleErrors`: `if (copilotApiConfig.publicApiKey && onErrorRef.current)`) —
+ * this app is deliberately self-hosted with no license key, so that prop is a
+ * dead end here, not a viable way to observe agent errors client-side. This
+ * gives the frontend an independent, backend-owned way to check "did the most
+ * recent turn fail, and why" — read directly off the last message rather than
+ * going through toAGUIHistory() (which intentionally drops content-free
+ * assistant messages from history replay).
+ */
+export async function getLastTurnError(id: string): Promise<string | null> {
+  const session = await getOrCreateSession(id);
+  const messages = session.messages as SessionMessage[];
+  const last = messages[messages.length - 1];
+  if (last?.role === "assistant" && last.stopReason === "error") {
+    return last.errorMessage ?? "The model call failed.";
+  }
+  return null;
+}

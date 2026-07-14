@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CanvasIcon, CheckIcon, ChevronDownIcon, PlusIcon, SearchIcon } from "./icons";
+import { CanvasIcon, ChevronDownIcon, PlusIcon, SearchIcon } from "./icons";
 import { filterConfig } from "../data/mockData";
 import type { ShellActions, ShellState, ViewKey } from "../state/useShellState";
 import type { UseConversationsResult } from "../state/useConversations";
@@ -368,17 +368,16 @@ export function MainHeader({
         </>
       )}
 
-      {isSettings && (
-        <>
-          <button className="btn btn-secondary" style={{ height: 32 }}>
-            Reset
-          </button>
-          <button className="btn btn-primary" style={{ height: 32 }}>
-            <CheckIcon size={14} />
-            Save changes
-          </button>
-        </>
-      )}
+      {/* Bug fix (found in review): these "Reset"/"Save changes" buttons had no
+          onClick at all -- leftover from the pre-real-backend mock shell, where a
+          batch-edit-then-save model made sense. The real settings pages
+          (ProvidersView/ModelDefaultsView) save each action immediately (connect,
+          disconnect, and picking a model all PATCH/POST/PUT on click) -- there is
+          no pending-edit state for these buttons to act on, so wiring them up
+          would be fake functionality. Removed rather than left to silently do
+          nothing, matching this codebase's "never render a fake control" rule
+          (see e.g. ChatView.tsx's composer footer / ArtifactCanvas.tsx's honest
+          fallback comments). */}
     </div>
   );
 }

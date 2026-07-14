@@ -16,6 +16,14 @@ export interface ShellState {
   view: ViewKey;
   activeConv: string;
   artifactOpen: boolean;
+  /**
+   * Which artifact the Canvas is pinned to, or null to show the conversation's
+   * latest published artifact (the pre-existing default behavior). Set by clicking
+   * a `publish_artifact` attachment chip in the chat transcript (ChatView.tsx) so
+   * the Canvas opens to the exact artifact that chip represents, even if a newer
+   * one has since been published in the same conversation.
+   */
+  canvasArtifactId: string | null;
   canvasTab: CanvasTab;
   modelOpen: boolean;
   model: string;
@@ -29,7 +37,8 @@ export interface ShellActions {
   go: (view: ViewKey) => void;
   setActiveConv: (id: string) => void;
   toggleArtifact: () => void;
-  openArtifact: () => void;
+  /** Opens the Canvas. Pass an artifact id to pin it to that specific artifact; omit to show the latest. */
+  openArtifact: (artifactId?: string) => void;
   setCanvasTab: (tab: CanvasTab) => void;
   toggleModelMenu: () => void;
   setModel: (name: string) => void;
@@ -63,7 +72,13 @@ export function useShellState(initialView: ViewKey = "chat") {
     // silently spins up a brand-new empty session instead of resolving to the user's
     // real history.
     activeConv: "default",
-    artifactOpen: true,
+    // Closed by default: most turns don't publish an artifact, so opening the
+    // Canvas unconditionally on every launch showed "Nothing published to the
+    // canvas yet" far more often than real content. Users open it explicitly via
+    // MainHeader's Canvas button, or implicitly by clicking a publish_artifact
+    // chat attachment chip (ChatView.tsx's onOpenArtifact -> actions.openArtifact).
+    artifactOpen: false,
+    canvasArtifactId: null,
     canvasTab: "code",
     modelOpen: false,
     // Empty, not a fake name like the old "pi-2 Sonnet" mock leftover: there is no
@@ -97,9 +112,22 @@ export function useShellState(initialView: ViewKey = "chat") {
 
   const actions: ShellActions = {
     go,
-    setActiveConv: (id) => setState((s) => ({ ...s, activeConv: id })),
-    toggleArtifact: () => setState((s) => ({ ...s, artifactOpen: !s.artifactOpen })),
-    openArtifact: () => setState((s) => ({ ...s, artifactOpen: true })),
+    // Switching conversations invalidates any pinned artifact id — it belongs to
+    // the conversation being left, and the new one should default to showing its
+    // own latest artifact rather than silently carrying over a stale pin.
+    setActiveConv: (id) => setState((s) => ({ ...s, activeConv: id, canvasArtifactId: null })),
+    // Only clears the pin when actually reopening a closed Canvas (s.artifactOpen
+    // was false) — this is the generic Canvas toggle button in MainHeader, which
+    // should always land on "latest", not whatever a previous chip click pinned.
+    // Closing an already-open, pinned Canvas leaves the pin alone since it's not
+    // visible either way.
+    toggleArtifact: () =>
+      setState((s) => ({
+        ...s,
+        artifactOpen: !s.artifactOpen,
+        canvasArtifactId: s.artifactOpen ? s.canvasArtifactId : null,
+      })),
+    openArtifact: (artifactId) => setState((s) => ({ ...s, artifactOpen: true, canvasArtifactId: artifactId ?? null })),
     setCanvasTab: (tab) => setState((s) => ({ ...s, canvasTab: tab })),
     toggleModelMenu: () => setState((s) => ({ ...s, modelOpen: !s.modelOpen })),
     setModel: (name) => setState((s) => ({ ...s, model: name, modelOpen: false })),

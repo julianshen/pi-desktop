@@ -52,3 +52,14 @@ export function getLatestArtifact(conversationId: string): Artifact | undefined 
   if (entries.length === 0) return undefined;
   return entries.reduce((latest, entry) => (entry.publishedAt > latest.publishedAt ? entry : latest));
 }
+
+/**
+ * Looks up one specific artifact by id, regardless of whether it's the most
+ * recently published one — backs "click a chat attachment to open that exact
+ * artifact on the canvas" (each publish_artifact tool call's args already carry
+ * the id, so the chip can request it directly instead of only ever getting
+ * whatever is currently "latest").
+ */
+export function getArtifactById(conversationId: string, artifactId: string): Artifact | undefined {
+  return readArtifacts(conversationId).find((entry) => entry.id === artifactId);
+}

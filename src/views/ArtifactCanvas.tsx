@@ -14,9 +14,51 @@ export interface Artifact {
 
 type Status = "loading" | "empty" | "populated" | "updating";
 
-async function fetchLatestArtifact(conversationId: string): Promise<Artifact | null> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/artifacts/latest`);
-  if (!res.ok) throw new Error(`GET artifacts/latest failed: ${res.status}`);
+/**
+ * Real usage (checked against ~/.pi-desktop/data/conversations/*\/artifacts.json
+ * from live testing) only ever produces two rich-previewable languages: standalone
+ * HTML documents (charts/animations built with inline <style>/<script>, e.g. the
+ * canvas-based typhoon visualizations) and standalone SVG markup (static/animated
+ * diagrams). Everything else (source snippets, "text", etc.) has no meaningful
+ * visual rendering, so the honest "no rich preview" fallback stays for those.
+ */
+const PREVIEWABLE_LANGUAGES = new Set(["html", "svg"]);
+
+/**
+ * Builds the sandboxed iframe document for the Preview tab, or null if this
+ * artifact's language has no rich preview. Both html and svg go through an
+ * `<iframe sandbox="allow-scripts">` (srcDoc, not dangerouslySetInnerHTML) —
+ * artifact code is agent-generated content, and SVG (like HTML) can carry
+ * <script> tags, so it gets the same untrusted-content treatment. `allow-scripts`
+ * is included because real animated artifacts (canvas-driven typhoon animations,
+ * confirmed live) depend on it; `allow-same-origin` is deliberately omitted so a
+ * srcDoc frame gets a unique opaque origin instead of inheriting the app's,
+ * closing off DOM/storage access back into the host page.
+ */
+function buildPreviewDoc(artifact: Artifact): string | null {
+  const language = artifact.language.trim().toLowerCase();
+  if (!PREVIEWABLE_LANGUAGES.has(language)) return null;
+
+  if (language === "html") return artifact.code;
+
+  // SVG artifacts are just the <svg>...</svg> fragment, not a full document —
+  // wrap it in a minimal shell so it centers and scales instead of rendering
+  // top-left at its raw intrinsic size against the iframe's default white canvas.
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+    html, body { margin: 0; height: 100%; display: flex; align-items: center; justify-content: center; background: #fff; }
+    svg { max-width: 100%; max-height: 100%; }
+  </style></head><body>${artifact.code}</body></html>`;
+}
+
+/**
+ * `artifactId` pins the fetch to one specific artifact (GET .../artifacts/:id) —
+ * used when a chat attachment chip was clicked. Null falls back to the
+ * pre-existing "latest published artifact" behavior (GET .../artifacts/latest).
+ */
+async function fetchArtifact(conversationId: string, artifactId: string | null): Promise<Artifact | null> {
+  const path = artifactId ? `artifacts/${encodeURIComponent(artifactId)}` : "artifacts/latest";
+  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/${path}`);
+  if (!res.ok) throw new Error(`GET ${path} failed: ${res.status}`);
   return (await res.json()) as Artifact | null;
 }
 
@@ -26,6 +68,7 @@ export function ArtifactCanvas({
   onClose,
   conversationId,
   refreshSignal,
+  pinnedArtifactId,
 }: {
   tab: CanvasTab;
   onSetTab: (tab: CanvasTab) => void;
@@ -40,15 +83,22 @@ export function ArtifactCanvas({
    * `isLoading`), is passed straight through here.
    */
   refreshSignal?: unknown;
+  /**
+   * Artifacts-as-chat-attachments: when set (from clicking a `publish_artifact`
+   * chip in ChatView), fetches that exact artifact by id instead of the
+   * conversation's latest one. Null/undefined preserves the pre-existing
+   * "always show latest" behavior.
+   */
+  pinnedArtifactId?: string | null;
 }) {
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [status, setStatus] = useState<Status>("loading");
   const isFirstRefreshRender = useRef(true);
 
-  const load = useCallback((id: string, mode: "loading" | "updating") => {
+  const load = useCallback((id: string, mode: "loading" | "updating", artifactId: string | null) => {
     let cancelled = false;
     setStatus(mode);
-    fetchLatestArtifact(id)
+    fetchArtifact(id, artifactId)
       .then((data) => {
         if (cancelled) return;
         setArtifact(data);
@@ -65,7 +115,7 @@ export function ArtifactCanvas({
     };
   }, []);
 
-  // Initial mount + conversation switch: reset and fetch fresh.
+  // Initial mount + conversation switch + pinned-artifact change: reset and fetch fresh.
   useEffect(() => {
     if (!conversationId) {
       setArtifact(null);
@@ -73,19 +123,21 @@ export function ArtifactCanvas({
       return;
     }
     setArtifact(null);
-    return load(conversationId, "loading");
+    return load(conversationId, "loading", pinnedArtifactId ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationId]);
+  }, [conversationId, pinnedArtifactId]);
 
   // Turn-completion refresh signal: keep existing content visible, dim it, refetch.
   // Skips the mount render so it doesn't double-fetch alongside the effect above.
+  // Re-fetches by the same pinned id if one is set, so a pinned view still picks up
+  // a same-id republish rather than only ever refreshing "latest".
   useEffect(() => {
     if (isFirstRefreshRender.current) {
       isFirstRefreshRender.current = false;
       return;
     }
     if (!conversationId) return;
-    return load(conversationId, "updating");
+    return load(conversationId, "updating", pinnedArtifactId ?? null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshSignal]);
 
@@ -256,11 +308,22 @@ export function ArtifactCanvas({
           </pre>
         )}
 
-        {artifact && !isEmpty && !isLoading && tab === "preview" && (
-          <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 55%, transparent)", padding: "20px 0" }}>
-            No rich preview available for this artifact type — showing code only.
-          </div>
-        )}
+        {artifact && !isEmpty && !isLoading && tab === "preview" && (() => {
+          const previewDoc = buildPreviewDoc(artifact);
+          return previewDoc ? (
+            <iframe
+              key={artifact.id + artifact.publishedAt}
+              title={`Preview: ${artifact.title}`}
+              srcDoc={previewDoc}
+              sandbox="allow-scripts"
+              style={{ width: "100%", height: "60vh", border: "1px solid var(--color-divider)", background: "#fff" }}
+            />
+          ) : (
+            <div style={{ fontSize: 13, color: "color-mix(in srgb, var(--color-text) 55%, transparent)", padding: "20px 0" }}>
+              No rich preview available for this artifact type — showing code only.
+            </div>
+          );
+        })()}
       </div>
     </div>
   );

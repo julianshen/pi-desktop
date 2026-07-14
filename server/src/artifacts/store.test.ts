@@ -114,4 +114,32 @@ describe("artifacts store", () => {
 
     expect(store.getLatestArtifact(conversationId)?.id).toBe("b");
   });
+
+  // Artifacts-as-chat-attachments: a chat attachment chip needs to open the exact
+  // artifact its own message published, even after a newer, unrelated artifact has
+  // since become "latest" in the same conversation.
+  test("getArtifactById() finds an older artifact by id even after a newer one was published", () => {
+    const conversationId = randomUUID();
+    const first = { id: "a", title: "A", language: "text", code: "a", publishedAt: "2020-01-01T00:00:00.000Z" };
+    const second = { id: "b", title: "B", language: "text", code: "b", publishedAt: "2030-01-01T00:00:00.000Z" };
+
+    store.saveArtifact(conversationId, first);
+    store.saveArtifact(conversationId, second);
+
+    expect(store.getArtifactById(conversationId, "a")).toEqual(first);
+    expect(store.getArtifactById(conversationId, "b")).toEqual(second);
+  });
+
+  test("getArtifactById() returns undefined for an unknown artifact id", () => {
+    const conversationId = randomUUID();
+    store.saveArtifact(conversationId, {
+      id: "a",
+      title: "A",
+      language: "text",
+      code: "a",
+      publishedAt: new Date().toISOString(),
+    });
+
+    expect(store.getArtifactById(conversationId, "does-not-exist")).toBeUndefined();
+  });
 });

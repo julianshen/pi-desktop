@@ -106,6 +106,7 @@ function App() {
                   model={state.model}
                   conversationId={state.activeConv}
                   onTurnComplete={handleTurnComplete}
+                  onOpenArtifact={actions.openArtifact}
                 />
               )}
               {state.view === "artifacts" && <ArtifactStoreView />}
@@ -131,6 +132,7 @@ function App() {
                 onClose={actions.toggleArtifact}
                 conversationId={state.activeConv}
                 refreshSignal={turnCompleteCount}
+                pinnedArtifactId={state.canvasArtifactId}
               />
             )}
           </div>

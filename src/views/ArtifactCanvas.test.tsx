@@ -97,4 +97,137 @@ describe("ArtifactCanvas", () => {
     expect(screen.getByText("const b = 2;")).toBeTruthy();
     expect(screen.queryByText("updating")).toBeNull();
   });
+
+  // Artifacts-as-chat-attachments: clicking a chat attachment chip pins the Canvas
+  // to that exact artifact id instead of "whatever is latest".
+  describe("pinnedArtifactId", () => {
+    test("fetches the specific artifact by id, not the latest, when pinnedArtifactId is set", async () => {
+      const requestedUrls: string[] = [];
+      global.fetch = mock((input: RequestInfo | URL) => {
+        requestedUrls.push(String(input));
+        return Promise.resolve(jsonResponse(makeArtifact({ id: "older-1", title: "older.tsx" })));
+      }) as unknown as typeof fetch;
+
+      render(
+        <ArtifactCanvas
+          tab="code"
+          onSetTab={noop}
+          onClose={noop}
+          conversationId="conv-1"
+          pinnedArtifactId="older-1"
+        />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("older.tsx")).toBeTruthy();
+      });
+      expect(requestedUrls.some((url) => url.endsWith("/conversations/conv-1/artifacts/older-1"))).toBe(true);
+      expect(requestedUrls.some((url) => url.endsWith("/artifacts/latest"))).toBe(false);
+    });
+
+    test("falls back to fetching the latest artifact when pinnedArtifactId is null", async () => {
+      const requestedUrls: string[] = [];
+      global.fetch = mock((input: RequestInfo | URL) => {
+        requestedUrls.push(String(input));
+        return Promise.resolve(jsonResponse(makeArtifact()));
+      }) as unknown as typeof fetch;
+
+      render(
+        <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" pinnedArtifactId={null} />,
+      );
+
+      await waitFor(() => {
+        expect(requestedUrls.length).toBeGreaterThan(0);
+      });
+      expect(requestedUrls.some((url) => url.endsWith("/artifacts/latest"))).toBe(true);
+    });
+
+    test("switching pinnedArtifactId re-fetches the newly pinned artifact", async () => {
+      global.fetch = mock((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/artifacts/a1")) return Promise.resolve(jsonResponse(makeArtifact({ id: "a1", title: "first.tsx" })));
+        if (url.endsWith("/artifacts/a2")) return Promise.resolve(jsonResponse(makeArtifact({ id: "a2", title: "second.tsx" })));
+        return Promise.resolve(jsonResponse(null));
+      }) as unknown as typeof fetch;
+
+      const { rerender } = render(
+        <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" pinnedArtifactId="a1" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("first.tsx")).toBeTruthy();
+      });
+
+      rerender(
+        <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" pinnedArtifactId="a2" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("second.tsx")).toBeTruthy();
+      });
+    });
+  });
+
+  // Preview tab: real usage (checked against actual ~/.pi-desktop artifacts.json
+  // data) only ever produces standalone HTML and SVG artifacts with anything
+  // visually meaningful to render — this replaces the old unconditional "No rich
+  // preview available" message with a real, sandboxed rendering for those two.
+  describe("Preview tab", () => {
+    test("an HTML artifact renders in a sandboxed iframe with the raw HTML as srcDoc", async () => {
+      const htmlCode = "<!DOCTYPE html><html><body><h1>Hi</h1></body></html>";
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "html", title: "page.html", code: htmlCode }))),
+      ) as unknown as typeof fetch;
+
+      render(<ArtifactCanvas tab="preview" onSetTab={noop} onClose={noop} conversationId="conv-1" />);
+
+      const iframe = await waitFor(() => screen.getByTitle("Preview: page.html"));
+      expect(iframe.tagName).toBe("IFRAME");
+      expect(iframe.getAttribute("sandbox")).toBe("allow-scripts");
+      // No allow-same-origin: the srcDoc frame must get a unique opaque origin,
+      // not inherit the app's — allow-scripts + allow-same-origin together would
+      // let agent-generated content script its way back into the host page.
+      expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin");
+      expect(iframe.getAttribute("srcdoc")).toBe(htmlCode);
+    });
+
+    test("an SVG artifact renders in a sandboxed iframe wrapped in a centering HTML shell", async () => {
+      const svgCode = '<svg width="10" height="10"><circle r="5"/></svg>';
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "svg", title: "shape.svg", code: svgCode }))),
+      ) as unknown as typeof fetch;
+
+      render(<ArtifactCanvas tab="preview" onSetTab={noop} onClose={noop} conversationId="conv-1" />);
+
+      const iframe = await waitFor(() => screen.getByTitle("Preview: shape.svg"));
+      const srcDoc = iframe.getAttribute("srcdoc") ?? "";
+      expect(srcDoc).toContain(svgCode);
+      expect(srcDoc).toContain("<!DOCTYPE html>");
+    });
+
+    test("a non-previewable language still shows the honest fallback message, not an iframe", async () => {
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "python", title: "script.py", code: "print(1)" }))),
+      ) as unknown as typeof fetch;
+
+      render(<ArtifactCanvas tab="preview" onSetTab={noop} onClose={noop} conversationId="conv-1" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("No rich preview available for this artifact type — showing code only.")).toBeTruthy();
+      });
+      expect(screen.queryByTitle("Preview: script.py")).toBeNull();
+    });
+
+    test("language matching is case-insensitive", async () => {
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "HTML", title: "upper.html", code: "<b>x</b>" }))),
+      ) as unknown as typeof fetch;
+
+      render(<ArtifactCanvas tab="preview" onSetTab={noop} onClose={noop} conversationId="conv-1" />);
+
+      await waitFor(() => {
+        expect(screen.getByTitle("Preview: upper.html")).toBeTruthy();
+      });
+    });
+  });
 });
