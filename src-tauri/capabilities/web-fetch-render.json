@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "web-fetch-render",
+  "description": "Minimal IPC surface for the hidden headless-render windows created by render_url_headless (src-tauri/src/web_fetch.rs). These windows navigate to arbitrary, agent-supplied http/https URLs, so remote (untrusted, third-party) page content runs in them — this capability intentionally grants that remote content nothing beyond emitting one namespaced completion event back to Rust, on windows matching the render-window label pattern only. It must never be broadened to core:default or to the main window.",
+  "windows": ["web-fetch-render-*"],
+  "remote": {
+    "urls": ["http://*", "https://*"]
+  },
+  "local": false,
+  "permissions": ["core:event:allow-emit"]
+}

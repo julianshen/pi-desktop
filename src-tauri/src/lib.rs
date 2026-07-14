@@ -7,6 +7,8 @@ use tauri::{
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::ShellExt;
 
+mod web_fetch;
+
 struct SidecarState(Mutex<Option<CommandChild>>);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -92,6 +94,7 @@ pub fn run() {
                 api.prevent_close();
             }
         })
+        .invoke_handler(tauri::generate_handler![web_fetch::render_url_headless])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

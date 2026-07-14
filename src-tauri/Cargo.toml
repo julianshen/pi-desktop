@@ -23,4 +23,10 @@ tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Used directly (not just via tauri::async_runtime, which re-exports mpsc but
+# not oneshot/time) to race the headless-render event listener against a
+# timeout in web_fetch.rs. Tauri already pulls in tokio as its async runtime,
+# so this unifies with the existing resolved version rather than adding a
+# second copy.
+tokio = { version = "1", features = ["sync", "time"] }
 
