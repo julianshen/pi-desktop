@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Streamdown } from "streamdown";
+import { code as streamdownCodePlugin } from "@streamdown/code";
 import { CloseIcon } from "../components/icons";
 import type { CanvasTab } from "../state/useShellState";
 import { API_BASE } from "../state/apiBase.js";
+import { wrapAsFencedCodeBlock } from "../lib/asCodeBlock.js";
 
 /** Mirrors server/src/artifacts/store.ts's Artifact exactly (Task 13). */
 export interface Artifact {
@@ -294,18 +297,30 @@ export function ArtifactCanvas({
         )}
 
         {artifact && !isEmpty && !isLoading && tab === "code" && (
-          <pre
-            style={{
-              margin: 0,
-              fontFamily: "ui-monospace,'SF Mono',Menlo,monospace",
-              fontSize: 12,
-              lineHeight: 1.7,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-            }}
+          // Task 10 (assistant-ui-migration): render as one syntax-highlighted code
+          // block, never as parsed markdown prose — a Python `#` comment or a
+          // markdown artifact's own `#` heading must never become an <h1>.
+          // wrapAsFencedCodeBlock() (markdown-rendering/SPEC.md's Architecture point
+          // 4) is the primary safety mechanism: the whole input is one dynamically-
+          // fenced code block by construction. `allowedElements` is defense-in-depth
+          // alongside it, not instead of it — restricts what Streamdown can ever
+          // produce here even if the fence-escaping had a bug. `mode="static"`
+          // because an already-fetched artifact is never "streaming" from this
+          // component's perspective. `key` is set (same convention as the Preview
+          // tab's iframe below) because Streamdown's internal block memoization
+          // does not reliably re-highlight on a plain content-prop change alone
+          // (verified empirically: without a changing `key`, re-rendering with new
+          // `children` left the previous artifact's highlighted DOM in place) — a
+          // key keyed to the artifact's identity forces a clean remount whenever a
+          // new/republished artifact replaces the current one.
+          <Streamdown
+            key={artifact.id + artifact.publishedAt}
+            mode="static"
+            plugins={{ code: streamdownCodePlugin }}
+            allowedElements={["pre", "code"]}
           >
-            {artifact.code}
-          </pre>
+            {wrapAsFencedCodeBlock(artifact.code, artifact.language)}
+          </Streamdown>
         )}
 
         {artifact && !isEmpty && !isLoading && tab === "preview" && (() => {

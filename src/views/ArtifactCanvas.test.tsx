@@ -69,15 +69,18 @@ describe("ArtifactCanvas", () => {
       return secondFetch;
     }) as unknown as typeof fetch;
 
-    const { rerender } = render(
+    const { container, rerender } = render(
       <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" refreshSignal={0} />,
     );
 
-    // Initial artifact loads and renders.
+    // Initial artifact loads and renders. Task 10: the Code tab now renders through
+    // Streamdown/Shiki, which splits highlighted code into multiple per-token spans —
+    // so code content is asserted via `textContent` (survives that splitting) rather
+    // than `getByText` (requires a single element's text to match exactly).
     await waitFor(() => {
       expect(screen.getByText("initial.tsx")).toBeTruthy();
     });
-    expect(screen.getByText("const a = 1;")).toBeTruthy();
+    expect(container.textContent ?? "").toContain("const a = 1;");
 
     // Simulate a completed turn: refreshSignal changes, fetch is still in flight.
     rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" refreshSignal={1} />);
@@ -86,7 +89,7 @@ describe("ArtifactCanvas", () => {
       expect(screen.getByText("updating")).toBeTruthy();
     });
     // The prior content stays visible (dimmed underneath), not blanked, while updating.
-    expect(screen.getByText("const a = 1;")).toBeTruthy();
+    expect(container.textContent ?? "").toContain("const a = 1;");
 
     // Resolve the refetch with the newly published artifact.
     resolveSecondFetch(jsonResponse(published));
@@ -94,7 +97,9 @@ describe("ArtifactCanvas", () => {
     await waitFor(() => {
       expect(screen.getByText("published.tsx")).toBeTruthy();
     });
-    expect(screen.getByText("const b = 2;")).toBeTruthy();
+    await waitFor(() => {
+      expect(container.textContent ?? "").toContain("const b = 2;");
+    });
     expect(screen.queryByText("updating")).toBeNull();
   });
 
@@ -228,6 +233,36 @@ describe("ArtifactCanvas", () => {
       await waitFor(() => {
         expect(screen.getByTitle("Preview: upper.html")).toBeTruthy();
       });
+    });
+  });
+
+  // Task 10 (assistant-ui-migration): the Code tab must render artifact.code as one
+  // syntax-highlighted code block, never as parsed markdown prose — a Python `#`
+  // comment must never become a markdown heading element.
+  describe("Code tab", () => {
+    test("AC-10.2: a Python artifact's `#` comment renders as literal code text, never as a markdown heading", async () => {
+      const pythonCode = "# this is a comment\nprint('hello')";
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "python", title: "script.py", code: pythonCode }))),
+      ) as unknown as typeof fetch;
+
+      const { container } = render(
+        <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("script.py")).toBeTruthy();
+      });
+
+      // No heading element anywhere in the rendered output — the `#` must never be
+      // reinterpreted as markdown.
+      for (const tag of ["h1", "h2", "h3", "h4", "h5", "h6"]) {
+        expect(container.querySelectorAll(tag).length).toBe(0);
+      }
+
+      // The `#`-prefixed comment is present verbatim as literal code text somewhere
+      // in the rendered code block.
+      expect(container.textContent ?? "").toContain("# this is a comment");
     });
   });
 });
