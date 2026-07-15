@@ -1,5 +1,14 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { plainFetch, looksLikeEmptySpaShell, toReadableContent } from "./fetcher.js";
+import {
+  plainFetch,
+  looksLikeEmptySpaShell,
+  toReadableContent,
+  PrivateRedirectError,
+  TooManyRedirectsError,
+  MAX_REDIRECTS,
+  MAX_RESPONSE_BYTES,
+} from "./fetcher.js";
+import type { LookupAddress } from "./safety.js";
 
 /**
  * fetcher.ts has zero dependencies on the rest of the web-fetch feature (no
@@ -235,4 +244,179 @@ describe("plainFetch", () => {
     expect(html).toContain("Landed");
     expect(response.url).toBe(`${baseUrl}/landed`);
   });
+});
+
+/**
+ * REVIEW.md #1 (redirect SSRF), #2 (DNS-rebinding TOCTOU), #5
+ * (timeout/size cap). All three server instances below are only ever bound
+ * to 127.0.0.1 (loopback) — real "public"-classified addresses aren't
+ * reachable in a hermetic test, so these tests instead isolate the specific
+ * new logic: whether a hop's `host` string matches the ORIGINAL input URL's
+ * host (see plainFetch()'s module doc comment for why that, not raw
+ * public/private classification, is what gates a redirect).
+ */
+describe("plainFetch — SSRF fixes (REVIEW.md #1, #2, #5)", () => {
+  let server: ReturnType<typeof Bun.serve>;
+  let baseUrl: string;
+  let receivedHostHeaders: string[];
+  let secretHitCount: number;
+
+  function fakeResolverTo(address: LookupAddress) {
+    return async (_hostname: string): Promise<LookupAddress[]> => [address];
+  }
+
+  beforeAll(() => {
+    receivedHostHeaders = [];
+    secretHitCount = 0;
+    server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        const url = new URL(request.url);
+        receivedHostHeaders.push(request.headers.get("host") ?? "");
+
+        if (url.pathname === "/redirect-cross-host") {
+          // Redirects to a DIFFERENT hostname than whatever hostname the
+          // client used to reach this server — the case plainFetch must
+          // catch and refuse to follow silently.
+          return Response.redirect("http://not-yet-approved-internal.test/secret", 302);
+        }
+        if (url.pathname === "/redirect-same-host") {
+          // Relative Location -> resolves against the SAME host:port the
+          // client used to reach this server, whatever hostname that was.
+          return Response.redirect("/landed", 302);
+        }
+        if (url.pathname === "/landed") {
+          return new Response("<html><body><h1>Landed</h1></body></html>", {
+            headers: { "content-type": "text/html" },
+          });
+        }
+        if (url.pathname === "/secret") {
+          secretHitCount++;
+          return new Response("top secret", { headers: { "content-type": "text/plain" } });
+        }
+        if (url.pathname === "/loop") {
+          return Response.redirect(new URL("/loop", url).href, 302);
+        }
+        if (url.pathname === "/huge") {
+          // MAX_RESPONSE_BYTES + a comfortable margin, so a correct cap is
+          // unambiguous even accounting for streaming chunk boundaries.
+          const body = "a".repeat(MAX_RESPONSE_BYTES + 1024 * 1024);
+          return new Response(body, { headers: { "content-type": "text/plain" } });
+        }
+        if (url.pathname === "/hang") {
+          // Never resolves — simulates a slow-loris / hung upstream.
+          return new Promise<Response>(() => {});
+        }
+        return new Response("<html><body><h1>Home</h1></body></html>", {
+          headers: { "content-type": "text/html" },
+        });
+      },
+    });
+    baseUrl = `http://127.0.0.1:${server.port}`;
+  });
+
+  afterAll(() => {
+    server.stop(true);
+  });
+
+  test("DNS-rebinding: the address resolveHost returns is what's actually connected to, not a re-resolved hostname", async () => {
+    // "totally-legit-app" isn't a real, DNS-resolvable hostname — if
+    // plainFetch let its HTTP client re-resolve it independently (the old,
+    // vulnerable behavior fetch(url, { redirect: "follow" }) had), this
+    // request would fail with a real DNS error. It only succeeds because
+    // the connection is pinned to the literal address the injected resolver
+    // returned, exactly as resolveTarget() classified it.
+    const fakeHostname = "totally-legit-app.invalid-nonexistent-tld-for-test";
+    const url = new URL(`http://${fakeHostname}:${server.port}/`);
+
+    const { html, response } = await plainFetch(url, {
+      resolveHost: fakeResolverTo({ address: "127.0.0.1", family: 4 }),
+    });
+
+    expect(html).toContain("<h1>Home</h1>");
+    expect(response.status).toBe(200);
+    // And the Host header on the wire is the ORIGINAL hostname, not the IP —
+    // proving the pinned-IP connection still presents the correct virtual
+    // host (the mechanism that makes IP-pinning safe for shared/virtual-
+    // hosted servers).
+    expect(receivedHostHeaders.at(-1)).toBe(`${fakeHostname}:${server.port}`);
+  });
+
+  test("redirect to a private target on a DIFFERENT host is blocked/re-gated (throws PrivateRedirectError), never silently followed", async () => {
+    const startUrl = new URL(`${baseUrl}/redirect-cross-host`);
+    const resolveHost = fakeResolverTo({ address: "127.0.0.1", family: 4 });
+
+    let caught: unknown;
+    try {
+      await plainFetch(startUrl, { resolveHost });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(PrivateRedirectError);
+    const error = caught as PrivateRedirectError;
+    expect(error.redirectUrl.href).toBe("http://not-yet-approved-internal.test/secret");
+    expect(error.fromUrl.href).toBe(startUrl.href);
+    // The redirect target must never actually have been requested.
+    expect(secretHitCount).toBe(0);
+  });
+
+  test("redirect to the SAME host as the original input is followed without re-gating (matches tools.ts's approvedHosts, keyed by host)", async () => {
+    // The redirect target here (127.0.0.1 via DNS-rebinding-style pinning,
+    // reached through a fake hostname) is private, exactly like the
+    // cross-host case above — the only difference is the redirect stays on
+    // the SAME host:port as the original input. That must be enough to
+    // proceed without throwing, proving the gate is keyed on `host`
+    // matching, not on public/private classification alone.
+    const resolveHost = fakeResolverTo({ address: "127.0.0.1", family: 4 });
+    const startUrl = new URL(`http://same-host.invalid-test:${server.port}/redirect-same-host`);
+
+    const { html, response } = await plainFetch(startUrl, { resolveHost });
+
+    expect(html).toContain("Landed");
+    expect(response.url).toBe(`http://same-host.invalid-test:${server.port}/landed`);
+  });
+
+  test("redirect chains longer than MAX_REDIRECTS throw TooManyRedirectsError", async () => {
+    const url = new URL(`${baseUrl}/loop`);
+
+    let caught: unknown;
+    try {
+      await plainFetch(url);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(TooManyRedirectsError);
+    expect((caught as TooManyRedirectsError).maxRedirects).toBe(MAX_REDIRECTS);
+  });
+
+  test("response body is capped at MAX_RESPONSE_BYTES rather than read unconditionally in full", async () => {
+    const url = new URL(`${baseUrl}/huge`);
+
+    const { html } = await plainFetch(url);
+
+    // Decoded UTF-8 byte length must not exceed the cap (allowing a small
+    // margin for the last streamed chunk straddling the boundary).
+    expect(Buffer.byteLength(html, "utf-8")).toBeLessThanOrEqual(MAX_RESPONSE_BYTES + 65536);
+    expect(html.length).toBeLessThan(MAX_RESPONSE_BYTES + 1024 * 1024);
+  });
+
+  test("a hung/slow-loris response is aborted by the per-hop timeout rather than hanging forever", async () => {
+    const url = new URL(`${baseUrl}/hang`);
+
+    let caught: unknown;
+    try {
+      await plainFetch(url, { timeoutMs: 100 });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeDefined();
+    // Bun/undici surface an AbortError-shaped error (DOMException name
+    // "AbortError" or "TimeoutError") when a signal fires mid-request —
+    // asserting broadly here since the exact error class is a runtime
+    // implementation detail, not part of plainFetch()'s own contract.
+    expect(String(caught)).toMatch(/abort|timeout/i);
+  }, 5000);
 });

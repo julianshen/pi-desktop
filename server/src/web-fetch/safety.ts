@@ -45,9 +45,12 @@ export class DnsResolutionError extends Error {
 }
 
 /**
- * "Private" per SPEC.md's classification table:
- * IPv4 loopback (127.0.0.0/8), private (10.0.0.0/8, 172.16.0.0/12,
- * 192.168.0.0/16), link-local (169.254.0.0/16).
+ * "Private" per SPEC.md's classification table, plus REVIEW.md #8's two
+ * additions:
+ * IPv4 "this network" (0.0.0.0/8 — treated as localhost by several network
+ * stacks), loopback (127.0.0.0/8), private (10.0.0.0/8, 172.16.0.0/12,
+ * 192.168.0.0/16), CGNAT/shared-address space (100.64.0.0/10, RFC 6598),
+ * link-local (169.254.0.0/16).
  */
 function isPrivateIPv4(ip: string): boolean {
   const octets = ip.split(".").map((part) => Number(part));
@@ -55,8 +58,10 @@ function isPrivateIPv4(ip: string): boolean {
     return false;
   }
   const [a, b] = octets;
+  if (a === 0) return true; // 0.0.0.0/8 "this network" — several stacks treat it as localhost
   if (a === 127) return true; // 127.0.0.0/8 loopback
   if (a === 10) return true; // 10.0.0.0/8 private
+  if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT/shared address space (RFC 6598)
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 private
   if (a === 192 && b === 168) return true; // 192.168.0.0/16 private
   if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
@@ -145,11 +150,35 @@ function isPrivateAddress(addr: LookupAddress): boolean {
 }
 
 /**
- * Resolves `url`'s hostname to its real IP address(es) via DNS, then
+ * Result of resolveTarget(): the classification AND the single literal
+ * address it was based on. `address` exists specifically so callers that go
+ * on to make the actual network connection (fetcher.ts's plainFetch()) can
+ * pin that connection to this exact address instead of letting their own
+ * HTTP client re-resolve the hostname a second time — see REVIEW.md #2
+ * (DNS-rebinding TOCTOU): classifying one DNS answer and then connecting via
+ * an independently-resolved second answer is exactly the gap that finding
+ * exploited. Resolving once and reusing the address for both classification
+ * and connection closes it structurally.
+ */
+export interface ResolvedTarget {
+  classification: TargetClassification;
+  /**
+   * The specific resolved address `classification` is based on. When
+   * multiple addresses come back and at least one is private, this is THAT
+   * private address (not just "the first one") — so a caller pinning its
+   * connection to `address` connects to the literal address that was judged
+   * private, never to a different, unclassified address from the same
+   * multi-answer response.
+   */
+  address: LookupAddress;
+}
+
+/**
+ * Resolves `url`'s hostname to its real IP address(es) via DNS once, then
  * classifies as "private" if ANY resolved address falls in a
- * loopback/private/link-local range (SPEC.md: checked once, upfront,
- * against the target — before either the plain-HTTP or webview-render path
- * is attempted).
+ * loopback/private/CGNAT/link-local range, returning both the
+ * classification and the one address it's based on (see ResolvedTarget's
+ * doc comment for why the address is returned at all).
  *
  * `resolveHost` is an optional dependency-injection seam (defaults to a
  * real `node:dns/promises` lookup) — see safety.test.ts's module doc
@@ -158,10 +187,10 @@ function isPrivateAddress(addr: LookupAddress): boolean {
  * Throws DnsResolutionError — never returns a default classification — if
  * DNS resolution itself fails, per TASKS.md Task 6's explicit requirement.
  */
-export async function classifyTarget(
+export async function resolveTarget(
   url: URL,
   resolveHost: HostResolver = defaultResolveHost,
-): Promise<TargetClassification> {
+): Promise<ResolvedTarget> {
   // URL.hostname wraps IPv6 literals in brackets (e.g. "[::1]"); DNS lookup
   // needs the bare address.
   const hostname = url.hostname.replace(/^\[|\]$/g, "");
@@ -177,5 +206,23 @@ export async function classifyTarget(
     throw new DnsResolutionError(hostname, new Error("DNS lookup returned no addresses"));
   }
 
-  return addresses.some(isPrivateAddress) ? "private" : "public";
+  const privateAddress = addresses.find(isPrivateAddress);
+  return privateAddress
+    ? { classification: "private", address: privateAddress }
+    : { classification: "public", address: addresses[0]! };
+}
+
+/**
+ * Classification-only convenience wrapper around resolveTarget(), kept as
+ * its own export because it's the one tools.ts's execute() calls directly
+ * for its upfront gate (SPEC.md: "Always resolve DNS and classify the
+ * resolved IP before any fetch attempt"). Behavior/signature unchanged from
+ * before this file added resolveTarget() — existing callers and tests are
+ * unaffected.
+ */
+export async function classifyTarget(
+  url: URL,
+  resolveHost: HostResolver = defaultResolveHost,
+): Promise<TargetClassification> {
+  return (await resolveTarget(url, resolveHost)).classification;
 }

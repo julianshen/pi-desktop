@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { classifyTarget, DnsResolutionError, type LookupAddress } from "./safety.js";
+import { classifyTarget, resolveTarget, DnsResolutionError, type LookupAddress } from "./safety.js";
 
 /**
  * Task 6 (TASKS.md) — safety.ts's boundary tests over every IP range in
@@ -115,6 +115,84 @@ describe("classifyTarget — IPv4 boundaries", () => {
   });
 });
 
+// REVIEW.md #8: isPrivateIPv4's range table omitted 0.0.0.0/8 ("this
+// network", treated as localhost by several stacks) and 100.64.0.0/10
+// (RFC 6598 CGNAT/shared-address space) — boundary tests matching the
+// existing table's style (just-inside, just-outside each range).
+describe("classifyTarget — IPv4 range-table gaps (REVIEW.md #8)", () => {
+  test("0.0.0.0 (0.0.0.0/8 'this network', lower bound) classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://zero-lo.example.test/"),
+      fakeResolver([{ address: "0.0.0.0", family: 4 }]),
+    );
+    expect(result).toBe("private");
+  });
+
+  test("0.255.255.255 (0.0.0.0/8, upper bound) classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://zero-hi.example.test/"),
+      fakeResolver([{ address: "0.255.255.255", family: 4 }]),
+    );
+    expect(result).toBe("private");
+  });
+
+  test("1.0.0.0 (just outside 0.0.0.0/8) classifies as public", async () => {
+    const result = await classifyTarget(
+      new URL("http://zero-out.example.test/"),
+      fakeResolver([{ address: "1.0.0.0", family: 4 }]),
+    );
+    expect(result).toBe("public");
+  });
+
+  test("100.64.0.0 (100.64.0.0/10 CGNAT, lower bound) classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://cgnat-lo.example.test/"),
+      fakeResolver([{ address: "100.64.0.0", family: 4 }]),
+    );
+    expect(result).toBe("private");
+  });
+
+  test("100.127.255.255 (100.64.0.0/10 CGNAT, upper bound) classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://cgnat-hi.example.test/"),
+      fakeResolver([{ address: "100.127.255.255", family: 4 }]),
+    );
+    expect(result).toBe("private");
+  });
+
+  test("100.63.255.255 (just below 100.64.0.0/10) classifies as public", async () => {
+    const result = await classifyTarget(
+      new URL("http://cgnat-below.example.test/"),
+      fakeResolver([{ address: "100.63.255.255", family: 4 }]),
+    );
+    expect(result).toBe("public");
+  });
+
+  test("100.128.0.0 (just above 100.64.0.0/10) classifies as public", async () => {
+    const result = await classifyTarget(
+      new URL("http://cgnat-above.example.test/"),
+      fakeResolver([{ address: "100.128.0.0", family: 4 }]),
+    );
+    expect(result).toBe("public");
+  });
+
+  test("::ffff:0.0.0.0 (IPv4-mapped 'this network') classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://v4mapped-zero.example.test/"),
+      fakeResolver([{ address: "::ffff:0.0.0.0", family: 6 }]),
+    );
+    expect(result).toBe("private");
+  });
+
+  test("::ffff:100.64.0.1 (IPv4-mapped CGNAT) classifies as private", async () => {
+    const result = await classifyTarget(
+      new URL("http://v4mapped-cgnat.example.test/"),
+      fakeResolver([{ address: "::ffff:100.64.0.1", family: 6 }]),
+    );
+    expect(result).toBe("private");
+  });
+});
+
 describe("classifyTarget — IPv6 boundaries", () => {
   test("::1 (loopback) classifies as private", async () => {
     const result = await classifyTarget(
@@ -199,6 +277,52 @@ describe("classifyTarget — DNS-rebinding closure (never string-match the hostn
       ]),
     );
     expect(result).toBe("private");
+  });
+});
+
+// REVIEW.md #2 (DNS-rebinding TOCTOU): fetcher.ts's plainFetch() pins its
+// actual network connection to resolveTarget()'s `address` field rather than
+// letting its HTTP client re-resolve the hostname a second time. These tests
+// cover resolveTarget() in isolation — the piece of the fix that lives in
+// this file; fetcher.test.ts covers the end-to-end "the pinned address is
+// what's actually connected to" behavior.
+describe("resolveTarget — returns the specific address classification is based on", () => {
+  test("single public address: classification is public and address is that address", async () => {
+    const result = await resolveTarget(
+      new URL("http://public.example.test/"),
+      fakeResolver([{ address: "8.8.8.8", family: 4 }]),
+    );
+    expect(result.classification).toBe("public");
+    expect(result.address).toEqual({ address: "8.8.8.8", family: 4 });
+  });
+
+  test("multiple addresses, one private: address is the PRIVATE one, not just the first in the list", async () => {
+    // A caller pinning its connection to `address` must connect to the
+    // literal address that was judged private — never to a different,
+    // still-public address from the same multi-answer DNS response (that
+    // would classify "private" but connect somewhere never actually
+    // evaluated).
+    const result = await resolveTarget(
+      new URL("http://multi.example.test/"),
+      fakeResolver([
+        { address: "8.8.8.8", family: 4 },
+        { address: "10.1.2.3", family: 4 },
+      ]),
+    );
+    expect(result.classification).toBe("private");
+    expect(result.address).toEqual({ address: "10.1.2.3", family: 4 });
+  });
+
+  test("multiple public addresses, none private: address is the first one", async () => {
+    const result = await resolveTarget(
+      new URL("http://multi-public.example.test/"),
+      fakeResolver([
+        { address: "8.8.8.8", family: 4 },
+        { address: "1.1.1.1", family: 4 },
+      ]),
+    );
+    expect(result.classification).toBe("public");
+    expect(result.address).toEqual({ address: "8.8.8.8", family: 4 });
   });
 });
 
