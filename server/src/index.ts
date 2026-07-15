@@ -1,5 +1,7 @@
 import express, { type Express } from "express";
 import cors from "cors";
+import readline from "node:readline";
+import { timingSafeEqual } from "node:crypto";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
 import { handleAguiRun } from "./agui/adapter.js";
@@ -14,9 +16,16 @@ import {
   setLiveSessionModel,
   getConversationMessages,
   getLastTurnError,
+  conversationCwd,
 } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
+import {
+  getPending as getPendingInteraction,
+  resolve as resolvePendingInteraction,
+  type ConfirmResult,
+  type RenderResult,
+} from "./web-fetch/pending-interactions.js";
 
 /**
  * Task 6: both models.ts functions already accept an optional ModelRegistry
@@ -26,9 +35,111 @@ import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
  * PATCH /api/conversations/:id/model against a stubbed registry with configured
  * models, mirroring agent/models.test.ts's makeRegistryStub pattern, instead of a
  * real provider-less registry that would always resolve empty/undefined.
+ *
+ * ADR-001 (resolve-endpoint trust-boundary remediation): resolveToken follows the
+ * exact same "injectable option" pattern for the same reason — it's the server's
+ * own resolve token, established once at startup by main() via readResolveToken()
+ * below (env var or stdin, see that function's doc comment) and threaded through
+ * here rather than read as a bare module-level side effect, so createApp() stays
+ * synchronous and index.test.ts can inject any value (including null/undefined for
+ * the "no token configured" fail-closed case) without touching real stdin/env
+ * state. null/undefined/empty means "no token was ever established" — the resolve
+ * route below fails closed (401 unconditionally) in that case, per ADR-001 step 1.3.
  */
 export interface CreateAppOptions {
   modelRegistry?: ModelRegistry;
+  resolveToken?: string | null;
+}
+
+const STDIN_RESOLVE_TOKEN_TIMEOUT_MS = 3000;
+
+export interface ReadResolveTokenDeps {
+  env?: NodeJS.ProcessEnv;
+  stdin?: NodeJS.ReadableStream & { isTTY?: boolean };
+  timeoutMs?: number;
+}
+
+/**
+ * ADR-001 step 1: resolves this server's own resolve-approval token, with the
+ * precedence explicitly signed off on during this remediation:
+ *
+ * 1. `PI_DESKTOP_RESOLVE_TOKEN` env var, if set (non-empty) -- the dev-mode path
+ *    (R6 wires this into `npm run dev`'s `concurrently` orchestration, see
+ *    ADR-001's Addendum) and a legitimate manual override for anyone running the
+ *    server standalone (`npm run server:dev`, `bun src/index.ts`).
+ * 2. Otherwise, one line read from the process's own stdin -- the packaged-build
+ *    handoff channel `src-tauri/src/lib.rs` writes to immediately after spawning
+ *    the sidecar (ADR-001's stdin-handoff design). Bounded by a timeout so this
+ *    NEVER hangs server startup:
+ *    - `stdin.isTTY` true (a real terminal) skips the read entirely -- verified
+ *      against real Bun behavior with a scratch script (`process.stdin.isTTY` is
+ *      `true`/boolean under a real TTY via `script -q /dev/null`, and `undefined`
+ *      when piped/redirected, e.g. `echo x | bun run ...` -- same as Node, not
+ *      assumed from docs, per this repo's CLAUDE.md verification convention).
+ *      There is no line coming from a human terminal; waiting for one would hang
+ *      every standalone/manual dev workflow.
+ *    - Otherwise (piped, e.g. Rust's `CommandChild` stdin pipe) reads with a
+ *      bounded timeout (a few seconds -- the packaged Rust side writes the token
+ *      synchronously right after `spawn()`, so the line arrives near-instantly).
+ *      No line before the timeout, or the stream ending with nothing on it, both
+ *      resolve to null, same as case 3.
+ * 3. Neither yields a token -> resolves to null. Callers (main()) must NOT treat
+ *    that as fatal -- the server still starts, per ADR-001's explicit fail-closed
+ *    decision enforced downstream on the resolve route itself, not here.
+ *
+ * `deps` exists purely for unit testing this function's pure logic without
+ * touching the real process.stdin/process.env (index.test.ts's HTTP-level tests
+ * exercise the resolve route's auth behavior directly via createApp({
+ * resolveToken }) instead; this function's own stdin-reading mechanics aren't
+ * re-tested there).
+ */
+export async function readResolveToken(deps: ReadResolveTokenDeps = {}): Promise<string | null> {
+  const env = deps.env ?? process.env;
+  const envToken = env.PI_DESKTOP_RESOLVE_TOKEN;
+  if (envToken) return envToken;
+
+  const stdin = deps.stdin ?? process.stdin;
+  if (stdin.isTTY) return null;
+
+  const timeoutMs = deps.timeoutMs ?? STDIN_RESOLVE_TOKEN_TIMEOUT_MS;
+
+  return new Promise<string | null>((resolvePromise) => {
+    let settled = false;
+    const rl = readline.createInterface({ input: stdin as NodeJS.ReadableStream, terminal: false });
+
+    const finish = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      rl.removeAllListeners();
+      rl.close();
+      resolvePromise(value);
+    };
+
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    rl.once("line", (line: string) => {
+      const trimmed = line.trim();
+      finish(trimmed.length > 0 ? trimmed : null);
+    });
+
+    rl.once("close", () => finish(null));
+  });
+}
+
+/**
+ * Constant-time token comparison for the resolve route's auth check below --
+ * ADR-001 doesn't mandate this specifically, but a plain `===` on a secret
+ * comparison is a well-known timing side channel, and this is a near-zero-cost
+ * hardening on top of the ADR's design. Length-mismatch is checked first (and
+ * short-circuits to false) because `timingSafeEqual` throws, rather than
+ * returning false, when given buffers of different lengths.
+ */
+function tokensMatch(expected: string, actual: string): boolean {
+  const expectedBuf = Buffer.from(expected);
+  const actualBuf = Buffer.from(actual);
+  if (expectedBuf.length !== actualBuf.length) return false;
+  return timingSafeEqual(expectedBuf, actualBuf);
 }
 
 /**
@@ -226,6 +337,114 @@ export function createApp(options?: CreateAppOptions): Express {
     }
   });
 
+  // Task 4 (AC-4.4): the pending-interaction poll endpoint (SPEC.md's "Getting the
+  // pending interaction to the frontend — RESOLVED: poll" section — push was ruled
+  // out because the browser never talks to /agui directly, see that section for the
+  // full trace). getPendingInteraction() already returns undefined for "nothing
+  // pending" or "settled" — normalized to 200 { interaction: null }, not 404, same
+  // "expected state, not an error" convention as GET .../artifacts/latest above.
+  //
+  // conversationCwd(id) is called here purely for its assertSafeConversationId
+  // side-effect-free validation (it does no I/O by itself) — same path-traversal
+  // guard every other per-conversation route in this file relies on, reused rather
+  // than duplicated. Same broad try/catch -> 400 convention as .../artifacts/latest
+  // (AC-4.3 / this repo's "Task 8 fix"): a malformed id throws synchronously, so a
+  // bare .catch() on a promise chain wouldn't catch it, and letting it fall through
+  // to Express's default error handler would leak a stack trace with absolute local
+  // paths in the response body.
+  app.get("/api/conversations/:id/pending-interaction", (req, res) => {
+    try {
+      conversationCwd(req.params.id);
+      res.json({ interaction: getPendingInteraction(req.params.id) ?? null });
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/pending-interaction] unhandled error", error);
+      if (!res.headersSent) res.status(400).end();
+    }
+  });
+
+  // Task 4 (AC-4.1/AC-4.2/AC-4.3): resolves a pending interaction the frontend has
+  // just answered (an approve/deny click, Task 8; or a headless-render result, Task
+  // 10). This route only has :interactionId and a body — it deliberately does NOT
+  // know whether the interaction is confirm- or render-kind (that's pending-
+  // interactions.ts's own private state, never exposed), so the body shape itself
+  // is what disambiguates: `{ approved: boolean }` for confirm-kind, `{ html:
+  // string | null }` for render-kind. A body matching neither shape unambiguously
+  // (missing both fields, or carrying both) is a 400, checked *before* calling
+  // resolve() — never guessed at.
+  //
+  // resolve() returns false for an unknown, already-resolved, or already-timed-out
+  // id (pending-interactions.ts's own contract) — that must surface as 404, not a
+  // false-looking 200, per AC-4.2: the caller needs to know its approval/render
+  // answer never actually reached anything.
+  //
+  // ADR-001 / REVIEW.md High finding ("self-approval bypass"): this route used to
+  // have no auth beyond CORS, so any local HTTP client (including a
+  // prompt-injected agent's own `bash` tool) could approve its own pending
+  // web_fetch private-network request. Now requires an `X-Resolve-Token` header
+  // exactly matching this server's own resolve token (options.resolveToken, set
+  // by main() via readResolveToken() -- see ADR-001 for the full stdin/env
+  // handoff design and why bash can't observe either channel). This check runs
+  // FIRST, before the malformed-id / body-shape / ownership checks below, so an
+  // unauthenticated caller learns nothing about whether any of that would have
+  // succeeded. Per ADR-001 step 1.3: if the server itself has no token configured
+  // (options.resolveToken is null/undefined/empty), every request is rejected
+  // unconditionally -- fail-closed by explicit, deliberate design, not a bug.
+  app.post("/api/conversations/:id/pending-interaction/:interactionId/resolve", express.json(), (req, res) => {
+    const serverToken = options?.resolveToken;
+    const requestToken = req.header("X-Resolve-Token");
+    if (!serverToken || !requestToken || !tokensMatch(serverToken, requestToken)) {
+      res.status(401).end();
+      return;
+    }
+
+    try {
+      conversationCwd(req.params.id);
+    } catch (error: unknown) {
+      console.error("[api/conversations/:id/pending-interaction/:interactionId/resolve] unhandled error", error);
+      res.status(400).end();
+      return;
+    }
+
+    const body = req.body as { approved?: unknown; html?: unknown } | undefined;
+    const hasApproved = typeof body?.approved === "boolean";
+    const hasHtml = !!body && "html" in body && (body.html === null || typeof body.html === "string");
+
+    let result: ConfirmResult | RenderResult | undefined;
+    if (hasApproved && !hasHtml) {
+      result = { kind: "confirm", approved: body!.approved as boolean };
+    } else if (hasHtml && !hasApproved) {
+      result = { kind: "render", html: body!.html as string | null };
+    }
+
+    if (!result) {
+      res.status(400).end();
+      return;
+    }
+
+    // Low finding (REVIEW.md): bind interactionId to conversationId before
+    // resolving. Previously resolvePendingInteraction() was called with only
+    // interactionId, never checking it actually belongs to the conversation named
+    // in the URL (req.params.id) -- so knowing/guessing/enumerating another
+    // conversation's pending interaction id let it be resolved via a different
+    // conversation's URL. getPending(conversationId) (pending-interactions.ts)
+    // already returns the currently-pending interaction *for that conversation
+    // specifically* -- reused here rather than adding a new helper there.
+    // Mismatch (including "no pending interaction at all for this conversation")
+    // is a 404, matching this route's existing 404-for-unknown-id convention.
+    const pending = getPendingInteraction(req.params.id);
+    if (!pending || pending.id !== req.params.interactionId) {
+      res.status(404).end();
+      return;
+    }
+
+    if (!resolvePendingInteraction(req.params.interactionId, result)) {
+      res.status(404).end();
+      return;
+    }
+
+    res.json({ resolved: true });
+  });
+
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
   app.post("/agui", express.json({ limit: "10mb" }), (req, res) => {
     handleAguiRun(req, res).catch((error: unknown) => {
@@ -253,7 +472,20 @@ export function createApp(options?: CreateAppOptions): Express {
 }
 
 async function main(): Promise<void> {
-  const app = createApp();
+  // ADR-001: the only place that actually performs the env-or-stdin resolve-token
+  // read (an async operation) -- createApp() itself stays synchronous and
+  // side-effect-free so index.test.ts can call it directly without ever blocking
+  // on stdin. See readResolveToken()'s own doc comment for the full precedence.
+  const resolveToken = await readResolveToken();
+  if (!resolveToken) {
+    console.warn(
+      "[pi-desktop] no resolve-token was established via PI_DESKTOP_RESOLVE_TOKEN or " +
+        "stdin -- the web-fetch private-network approval gate will reject every resolve " +
+        "request until one of those is provided (ADR-001, fail-closed by design).",
+    );
+  }
+
+  const app = createApp({ resolveToken });
   const baseUrl = `http://${env.host}:${env.port}`;
 
   app.listen(env.port, env.host, () => {

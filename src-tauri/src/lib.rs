@@ -7,14 +7,64 @@ use tauri::{
 use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::ShellExt;
 
+mod web_fetch;
+
 struct SidecarState(Mutex<Option<CommandChild>>);
+
+/// Holds the per-launch resolve-endpoint auth token (ADR-001:
+/// resolve-endpoint-trust-boundary). Generated once in `run()`, before the
+/// packaged/dev split, and never mutated afterward — plain `String`, no
+/// `Mutex` needed. Read by `get_resolve_token()` (packaged builds) and by the
+/// packaged-only sidecar-spawn code below, which writes it to the sidecar's
+/// stdin. Dev builds never read this field (see `get_resolve_token`'s
+/// `cfg!(debug_assertions)` branch) since dev mode's token instead comes from
+/// `PI_DESKTOP_RESOLVE_TOKEN`, set by the `npm run dev` orchestration.
+struct ResolveTokenState(String);
+
+/// Returns the per-launch resolve-endpoint auth token, reachable only via
+/// Tauri's `invoke()` IPC bridge (registered below in `invoke_handler!`) —
+/// never over HTTP, a file, or an env var the frontend process or anything
+/// spawned from it could leak. See ADR-001 for why this channel specifically
+/// (stdin + Tauri IPC) was chosen over env vars/argv/an HTTP endpoint: all of
+/// those are readable by the agent's own unrestricted `bash` tool via
+/// `printenv`/`ps`/`curl localhost`, defeating the point of the token.
+///
+/// Dev-mode fallback (ADR-001 §"Dev mode fallback"): in dev,
+/// `cfg!(debug_assertions)` is true and this Rust process never spawns the
+/// sidecar at all (`npm run dev`'s `concurrently` step does, outside Rust) —
+/// so there is no stdin handoff to originate here. Dev mode's reduced threat
+/// model (the developer running `npm run dev` themselves is the trusted
+/// operator) uses a simpler, explicitly weaker fallback instead: the token
+/// travels via the `PI_DESKTOP_RESOLVE_TOKEN` env var that the same
+/// `concurrently` parent process exports to both `vite` and the Bun server.
+/// This function mirrors that here so the frontend's `invoke("get_resolve_token")`
+/// call has the same shape in both dev and packaged builds. If the env var is
+/// unset (e.g. someone runs `tauri dev` outside the `npm run dev` wrapper),
+/// this returns an empty-string sentinel — the resolve-auth check on the
+/// server side (a different task) simply won't have a token to compare
+/// against in that case.
+#[tauri::command]
+fn get_resolve_token(state: tauri::State<ResolveTokenState>) -> String {
+    if cfg!(debug_assertions) {
+        std::env::var("PI_DESKTOP_RESOLVE_TOKEN").unwrap_or_default()
+    } else {
+        state.0.clone()
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // 256-bit-ish randomness, generated once per app launch, held only in
+    // Rust process memory (ADR-001 point 1). Managed as app state below so
+    // both `get_resolve_token()` and the packaged-only sidecar-spawn code can
+    // reach it.
+    let resolve_token = uuid::Uuid::new_v4().to_string();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
+        .manage(ResolveTokenState(resolve_token))
         .setup(|app| {
             let show_item = MenuItem::with_id(app, "show", "Show pi desktop", true, None::<&str>)?;
             let hide_item = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
@@ -61,9 +111,27 @@ pub fn run() {
                     .shell()
                     .sidecar("pi-desktop-server")?
                     .args([entry_point.to_string_lossy().to_string()]);
-                let (mut rx, child) = sidecar
+                let (mut rx, mut child) = sidecar
                     .spawn()
                     .expect("failed to spawn pi-desktop-server sidecar");
+
+                // ADR-001: hand the resolve token to the sidecar over its own
+                // stdin, immediately after spawn and before anything else
+                // touches the child process (before it's stored in
+                // `SidecarState`, before the stdout/stderr reader task below
+                // is even spawned). The server reads and consumes this one
+                // line at startup, before serving any HTTP request — by the
+                // time a `bash` tool call could run (which requires the
+                // server to already be fully up), the bytes are already gone
+                // from the pipe. Deliberately NOT an env var or argv: both
+                // are readable by the agent's own unrestricted `bash` tool
+                // (`printenv`/`ps`/`/proc/self/environ`), which would defeat
+                // the whole point of the token.
+                let resolve_token = app.state::<ResolveTokenState>().0.clone();
+                child
+                    .write(format!("{resolve_token}\n").as_bytes())
+                    .expect("failed to write resolve token to sidecar stdin");
+
                 *app.state::<SidecarState>().0.lock().unwrap() = Some(child);
 
                 tauri::async_runtime::spawn(async move {
@@ -92,6 +160,10 @@ pub fn run() {
                 api.prevent_close();
             }
         })
+        .invoke_handler(tauri::generate_handler![
+            web_fetch::render_url_headless,
+            get_resolve_token
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

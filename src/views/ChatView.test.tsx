@@ -144,10 +144,33 @@ mock.module("@copilotkit/react-core", () => ({
   },
 }));
 
+/**
+ * ADR-001 ("Resolve-endpoint trust boundary"): ChatView.tsx now calls
+ * `getResolveToken()` (src/lib/resolveToken.ts), which calls
+ * `invoke("get_resolve_token")` under the hood — mocked here the same way
+ * `headlessRender.test.ts`/`App.test.tsx` mock `@tauri-apps/api/core`.
+ * `invokeImpl` defaults to resolving a valid token so every pre-existing test in
+ * this file (none of which care about ADR-001) sees a normal, non-degraded
+ * approval chip, same as production behavior when `get_resolve_token()` succeeds.
+ * Tests that specifically exercise the degraded path override `invokeImpl` (and/or
+ * `import.meta.env.VITE_RESOLVE_TOKEN`) themselves.
+ */
+let invokeImpl: (cmd: string, args?: unknown) => Promise<unknown> = () => Promise.resolve("test-resolve-token");
+
+mock.module("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invokeImpl(cmd, args),
+}));
+
 // Imported dynamically, after mock.module() above registers the replacement —
 // a static top-level `import` would be hoisted ahead of that call and pick up
 // the real (unmocked) module instead.
 const { ChatView } = await import("./ChatView.js");
+// Already loaded as part of ChatView.js's own import graph above — importing it
+// again here just gets the same cached module instance, exposing its test-only
+// cache-reset helper (see resolveToken.ts's own doc comment for why this exists:
+// getResolveToken() is memoized module-wide, so without resetting it between
+// tests, whichever test runs first would "win" for every later test in this file).
+const { __resetResolveTokenCacheForTests } = await import("../lib/resolveToken.js");
 
 let originalFetch: typeof fetch;
 
@@ -163,10 +186,16 @@ beforeEach(() => {
   // don't hit the real network / log noisy ECONNREFUSED errors. Tests that DO care
   // override global.fetch themselves before rendering.
   global.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
+  // ADR-001: fresh, non-degraded token resolution by default for every test (see
+  // this file's own comment above on why the cache must be reset per test).
+  invokeImpl = () => Promise.resolve("test-resolve-token");
+  delete import.meta.env.VITE_RESOLVE_TOKEN;
+  __resetResolveTokenCacheForTests();
 });
 
 afterEach(() => {
   global.fetch = originalFetch;
+  __resetResolveTokenCacheForTests();
   cleanup();
 });
 
@@ -704,6 +733,236 @@ describe("ChatView", () => {
         expect(screen.getByText("bash")).toBeTruthy();
       });
       expect(screen.getByText("tool")).toBeTruthy();
+    });
+  });
+
+  // Task 8 (SPEC.md's "web_fetch" approval-gate feature): a `kind: "confirm"`
+  // pending interaction, delivered via ChatView's own independent poll of
+  // GET /api/conversations/:id/pending-interaction (App.tsx's sibling
+  // `usePendingRenderInteractionWatcher` polls the same endpoint but only ever
+  // acts on `kind: "render"` — these two pollers are intentionally separate,
+  // see App.tsx's own comment), renders as a standalone approve/deny chip in
+  // the transcript, not attached to any specific message.
+  describe("pending-interaction approval chip (Task 8)", () => {
+    function fetchMockFor(
+      conversationId: string,
+      opts: {
+        interaction?: { id: string; kind: "confirm" | "render"; host?: string } | null;
+        onResolve?: (interactionId: string, body: unknown) => Response | Promise<Response>;
+      },
+    ) {
+      const fetchCalls: { url: string; body?: unknown; headers?: Record<string, string> }[] = [];
+      const fn = mock((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const body = init?.body ? (JSON.parse(init.body as string) as unknown) : undefined;
+        const headers = init?.headers ? (init.headers as Record<string, string>) : undefined;
+        fetchCalls.push({ url, body, headers });
+
+        if (url.endsWith(`/api/conversations/${conversationId}/messages`)) {
+          return Promise.resolve(jsonResponse([]));
+        }
+        if (url.endsWith(`/api/conversations/${conversationId}/pending-interaction`)) {
+          return Promise.resolve(jsonResponse({ interaction: opts.interaction ?? null }));
+        }
+        const resolveMatch = url.match(
+          new RegExp(`/api/conversations/${conversationId}/pending-interaction/([^/]+)/resolve$`),
+        );
+        if (resolveMatch) {
+          const interactionId = resolveMatch[1];
+          if (opts.onResolve) return Promise.resolve(opts.onResolve(interactionId, body));
+          return Promise.resolve(jsonResponse({ resolved: true }));
+        }
+        return Promise.reject(new Error(`unexpected fetch: ${url}`));
+      }) as unknown as typeof fetch;
+      return { fn, fetchCalls };
+    }
+
+    test("AC-8.1: a pending confirm-kind interaction renders a chip with the literal host and visible Approve/Deny controls", async () => {
+      const { fn } = fetchMockFor("conv-confirm-1", {
+        interaction: { id: "int-1", kind: "confirm", host: "192.168.1.50" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-confirm-1" model="" conversationId="conv-confirm-1" />);
+
+      // Literal host text, verbatim — not a paraphrase, not truncated.
+      await waitFor(() => {
+        expect(screen.getByText("192.168.1.50")).toBeTruthy();
+      });
+      expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+    });
+
+    test("AC-8.1 (contrast): no chip renders when no pending interaction exists, or when the pending interaction is render-kind", async () => {
+      const { fn } = fetchMockFor("conv-confirm-2", { interaction: null });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-confirm-2" model="" conversationId="conv-confirm-2" />);
+
+      // Give the poll a tick to run and confirm nothing renders.
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
+      });
+      expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Deny" })).toBeNull();
+    });
+
+    test("AC-8.2 [R]: clicking Approve calls resolve with { approved: true }, disables both buttons while in flight, and clears the chip once resolved", async () => {
+      let resolveResolvePost!: (res: Response) => void;
+      const pendingResolvePost = new Promise<Response>((resolve) => {
+        resolveResolvePost = resolve;
+      });
+
+      const { fn, fetchCalls } = fetchMockFor("conv-approve", {
+        interaction: { id: "int-approve", kind: "confirm", host: "10.0.0.7" },
+        onResolve: () => pendingResolvePost,
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-approve" model="" conversationId="conv-approve" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("10.0.0.7")).toBeTruthy();
+      });
+
+      const approveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
+      const denyButton = screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement;
+      fireEvent.click(approveButton);
+
+      // While the resolve POST is still in flight, both buttons must be
+      // disabled — avoids a double-submission from a second click.
+      await waitFor(() => {
+        expect(approveButton.disabled).toBe(true);
+      });
+      expect(denyButton.disabled).toBe(true);
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-approve/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.body).toEqual({ approved: true });
+
+      await act(async () => {
+        resolveResolvePost(jsonResponse({ resolved: true }));
+      });
+
+      // Chip clears once resolved (this implementation optimistically clears
+      // right after the click settles rather than waiting for the next poll
+      // tick — see ChatView.tsx's resolvePendingConfirm comment).
+      await waitFor(() => {
+        expect(screen.queryByText("10.0.0.7")).toBeNull();
+      });
+    });
+
+    test("AC-8.3: clicking Deny calls resolve with { approved: false } and clears the chip", async () => {
+      const { fn, fetchCalls } = fetchMockFor("conv-deny", {
+        interaction: { id: "int-deny", kind: "confirm", host: "127.0.0.1" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-deny" model="" conversationId="conv-deny" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("127.0.0.1")).toBeTruthy();
+      });
+
+      const denyButton = screen.getByRole("button", { name: "Deny" });
+      await act(async () => {
+        fireEvent.click(denyButton);
+      });
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-deny/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.body).toEqual({ approved: false });
+
+      await waitFor(() => {
+        expect(screen.queryByText("127.0.0.1")).toBeNull();
+      });
+    });
+
+    test("ADR-001: Approve's resolve POST carries the X-Resolve-Token header when getResolveToken() succeeds", async () => {
+      invokeImpl = () => Promise.resolve("secret-token-abc");
+
+      const { fn, fetchCalls } = fetchMockFor("conv-token-header", {
+        interaction: { id: "int-token", kind: "confirm", host: "10.0.0.9" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-token-header" model="" conversationId="conv-token-header" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("10.0.0.9")).toBeTruthy();
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      });
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-token/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.headers?.["X-Resolve-Token"]).toBe("secret-token-abc");
+    });
+
+    test("ADR-001: when getResolveToken() resolves to null (invoke() fails and no VITE_RESOLVE_TOKEN fallback), Approve/Deny are disabled and a visible error appears in the chip", async () => {
+      invokeImpl = () => Promise.reject(new Error("no Tauri bridge present"));
+      delete import.meta.env.VITE_RESOLVE_TOKEN;
+
+      const { fn } = fetchMockFor("conv-degraded", {
+        interaction: { id: "int-degraded", kind: "confirm", host: "172.16.0.5" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-degraded" model="" conversationId="conv-degraded" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("172.16.0.5")).toBeTruthy();
+      });
+
+      await waitFor(() => {
+        expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
+      });
+      expect((screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByText(/Could not verify this session — approval is unavailable\./)).toBeTruthy();
+    });
+
+    test("ADR-001: a 401 resolve response (missing/mismatched token) does NOT optimistically clear the chip, so the user can retry", async () => {
+      invokeImpl = () => Promise.resolve("stale-or-wrong-token");
+
+      const { fn, fetchCalls } = fetchMockFor("conv-401", {
+        interaction: { id: "int-401", kind: "confirm", host: "10.1.1.1" },
+        onResolve: () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }),
+      });
+      global.fetch = fn;
+
+      const errorSpy = mock((..._args: unknown[]) => undefined);
+      const originalConsoleError = console.error;
+      console.error = errorSpy as unknown as typeof console.error;
+
+      try {
+        render(<ChatView key="conv-401" model="" conversationId="conv-401" />);
+
+        await waitFor(() => {
+          expect(screen.getByText("10.1.1.1")).toBeTruthy();
+        });
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+        });
+
+        const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-401/resolve"));
+        expect(resolveCall).toBeTruthy();
+
+        // Unlike the AC-8.2/AC-8.3 success cases above, the chip must NOT clear on
+        // a 401 — the approval was never actually recorded server-side, so leaving
+        // the chip up (with buttons re-enabled for a retry) is the correct outcome.
+        await waitFor(() => {
+          expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+        });
+        expect(screen.getByText("10.1.1.1")).toBeTruthy();
+        expect(
+          errorSpy.mock.calls.some((call) => String(call[0]).includes("X-Resolve-Token") && String(call[0]).includes("ADR-001")),
+        ).toBe(true);
+      } finally {
+        console.error = originalConsoleError;
+      }
     });
   });
 });

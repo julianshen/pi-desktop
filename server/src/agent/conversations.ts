@@ -1,13 +1,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { createAgentSession, SessionManager, type AgentSession } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  SessionManager,
+  type AgentSession,
+  type ExtensionUIContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { Message as AGUIMessage } from "@ag-ui/core";
 import { env } from "../config/env.js";
 import { getAgentDeps } from "./deps.js";
 import { resolveModelById } from "./models.js";
 import { createArtifactTools } from "../artifacts/tools.js";
+import { create as createPendingInteraction } from "../web-fetch/pending-interactions.js";
+import { createWebFetchTools } from "../web-fetch/tools.js";
 
 export interface ConversationMeta {
   id: string;
@@ -18,6 +26,131 @@ export interface ConversationMeta {
 }
 
 const sessionPromises = new Map<string, Promise<AgentSession>>();
+
+/**
+ * Task 5 (SPEC.md's "The custom confirm() implementation" subsection): how long
+ * ctx.ui.confirm() waits for a human answer before the pending-interaction registry
+ * (web-fetch/pending-interactions.ts) applies its fail-closed timeout default
+ * (`{ approved: false }`, never `true` — see that file's timeoutDefaultFor()). 2
+ * minutes is a judgment call, not a value mandated by SPEC.md (which only requires
+ * *some* timeout exists, per US-06) -- long enough that a user glancing away from
+ * chat doesn't get an auto-deny for no reason, short enough that a `web_fetch` call
+ * genuinely dies rather than tying up the session indefinitely (no SDK-level timeout
+ * wraps execute() itself, confirmed against the installed SDK's compiled source).
+ */
+export const DEFAULT_CONFIRM_TIMEOUT_MS = 120_000;
+
+/**
+ * Task 5: builds the ExtensionUIContext installed on every session via
+ * session.extensionRunner.setUIContext() (see createSession() below). Every method
+ * except confirm() mirrors the SDK's own noOpUIContext defaults (see
+ * node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js) as
+ * closely as TypeScript's structural typing allows -- this app has no TUI/terminal
+ * surface for select/input/notify/widgets/etc., so every one of those stays inert.
+ *
+ * `theme` is the one deliberate divergence from mirroring noOpUIContext exactly: the
+ * real noOpUIContext's `theme` getter returns a live Theme built by pi's own
+ * modes/interactive/theme/theme.js (imported internally, not part of this package's
+ * intended embedding surface -- only `initTheme()`/`Theme` are exported from the
+ * package root, and initTheme() has vetoable side effects, e.g. an optional file
+ * watcher, that a headless Bun server has no business triggering). Nothing in this
+ * app's custom tools ever reads ctx.ui.theme (there is no rendering surface to style),
+ * so an empty placeholder cast to Theme satisfies the interface without invoking any
+ * of that machinery.
+ *
+ * confirm() is the one real implementation (AC-5.1): it creates a `kind: "confirm"`
+ * pending interaction in the shared registry (web-fetch/pending-interactions.ts,
+ * Task 3) and awaits its promise instead of returning the SDK default `false`
+ * immediately. See the design-decision comment on the `host` field below.
+ */
+function buildConfirmUIContext(conversationId: string): ExtensionUIContext {
+  return {
+    select: async () => undefined,
+    /**
+     * Design decision (documented per TASKS.md Task 5's instructions): confirm()'s
+     * signature only gives us a free-text `message` string composed by whichever
+     * custom tool called ctx.ui.confirm() (the not-yet-built web_fetch tool) -- the
+     * SDK gives no structured "what is this approval about" field alongside it.
+     * pending-interactions.ts's `kind: "confirm"` variant has a `host: string`
+     * field, but nothing in that file enforces hostname formatting on it (confirmed
+     * by reading pending-interactions.ts directly -- it's typed `string`, never
+     * parsed or validated as a hostname anywhere in create()/resolve()/getPending()).
+     *
+     * Two options were considered: (a) parse a hostname out of `message` with a
+     * regex/heuristic, or (b) pass `message` straight through as `host`, treating
+     * that field's real semantics as "human-readable description of what's being
+     * approved" rather than strictly a hostname. (a) is fragile -- it silently
+     * breaks the moment the calling tool rewords its message, and invents parsing
+     * logic against a message format that doesn't exist yet (web_fetch is a later
+     * task). (b) is simpler and more robust, and pushes the responsibility to the
+     * right place: the eventual web_fetch tool can compose a well-formatted message
+     * up front (e.g. "pi wants to fetch example.com — this targets your local
+     * machine or network.") rather than this task inventing fragile parsing for a
+     * caller that doesn't exist yet. Chose (b). The frontend (a later task) renders
+     * `host` as-is either way, so this is purely an internal naming/semantics
+     * decision, not an API contract change.
+     */
+    confirm: async (_title, message, opts) => {
+      /**
+       * create()'s second parameter is DistributiveOmit<PendingInteraction, "id" |
+       * "createdAt"> (see pending-interactions.ts), which still requires
+       * conversationId as part of the request object itself -- only "id" and
+       * "createdAt" are stripped -- so it's passed here as well as positionally,
+       * matching pending-interactions.test.ts's own established call pattern.
+       */
+      const { promise } = createPendingInteraction(conversationId, {
+        conversationId,
+        kind: "confirm",
+        host: message,
+        timeoutMs: opts?.timeout ?? DEFAULT_CONFIRM_TIMEOUT_MS,
+      });
+      const result = await promise;
+      /**
+       * create()'s declared return type is Promise<InteractionResult> (the union of
+       * ConfirmResult | RenderResult) regardless of the request's own `kind` --
+       * pending-interactions.ts doesn't (and can't easily) narrow its return type by
+       * the input's kind, so this narrows at the call site instead. Since this
+       * promise was created with `kind: "confirm"` above, and pending-
+       * interactions.ts's settle()/timeoutDefaultFor() always settle a given
+       * interaction with a result of that same kind, the `else` branch is
+       * unreachable in practice -- but it's handled explicitly (fail-closed: `false`)
+       * rather than asserted away, since a `never`-cast here would silently paper
+       * over a real bug if that invariant ever broke.
+       */
+      return result.kind === "confirm" ? result.approved : false;
+    },
+    input: async () => undefined,
+    notify: () => {},
+    onTerminalInput: () => () => {},
+    setStatus: () => {},
+    setWorkingMessage: () => {},
+    setWorkingVisible: () => {},
+    setWorkingIndicator: () => {},
+    setHiddenThinkingLabel: () => {},
+    setWidget: () => {},
+    setFooter: () => {},
+    setHeader: () => {},
+    setTitle: () => {},
+    // Generic in ExtensionUIContext's own declaration (custom<T>(...): Promise<T>);
+    // mirrored here with an explicit type parameter rather than a bare `async () =>
+    // undefined` (which doesn't type-check against an unconstrained T) -- runtime
+    // behavior is identical to the SDK's own noOpUIContext.custom.
+    custom: async <T,>() => undefined as unknown as T,
+    pasteToEditor: () => {},
+    setEditorText: () => {},
+    getEditorText: () => "",
+    editor: async () => undefined,
+    addAutocompleteProvider: () => {},
+    setEditorComponent: () => {},
+    getEditorComponent: () => undefined,
+    theme: {} as Theme,
+    getAllThemes: () => [],
+    getTheme: () => undefined,
+    setTheme: () => ({ success: false, error: "UI not available" }),
+    getToolsExpanded: () => false,
+    setToolsExpanded: () => {},
+  };
+}
 
 function registryPath(): string {
   return path.join(env.dataDir, "conversations", "index.json");
@@ -208,6 +341,17 @@ async function createSession(id: string): Promise<AgentSession> {
    * conversation's id so it always saves to *this* conversation's artifacts.json),
    * so they're built here per-session rather than being part of getAgentDeps()'s
    * memoized, conversation-agnostic bundle — appended on top, not replacing it.
+   *
+   * web-fetch's web_fetch tool (createWebFetchTools) is wired in the same way and
+   * for the same reason (AC-7.1): it's conversationId-scoped (per-conversation
+   * approved-hosts state, see web-fetch/tools.ts), so it can't live inside
+   * getAgentDeps()'s singleton bundle either — putting it there would bake in
+   * whichever conversationId happened to trigger the first getAgentDeps() call for
+   * the lifetime of the process. It is also constructed with `sessionKind:
+   * "interactive"` here, never "scheduled" — scheduler/index.ts's own session
+   * construction (createScheduledSession) passes "scheduled" independently
+   * (AC-7.2/US-05); getAgentDeps()'s memoized bundle stays completely unaware of
+   * sessionKind, on purpose.
    */
   const { session } = await createAgentSession({
     cwd,
@@ -215,9 +359,37 @@ async function createSession(id: string): Promise<AgentSession> {
     model,
     authStorage,
     modelRegistry,
-    customTools: [...customTools, ...createArtifactTools(id)],
+    customTools: [...customTools, ...createArtifactTools(id), ...createWebFetchTools(id, "interactive")],
     sessionManager: SessionManager.continueRecent(cwd),
   });
+
+  /**
+   * Task 5 (AC-5.1): install the real confirm() implementation immediately after
+   * session creation, so every custom tool's execute() (specifically the
+   * not-yet-built web_fetch tool) reaches the pending-interaction registry via
+   * ctx.ui.confirm() instead of the SDK's default noOpUIContext, which always
+   * resolves confirm() to `false` with no pause at all -- silently turning every
+   * approval prompt into a permanent auto-deny rather than a real, awaited gate.
+   *
+   * AC-5.2 (mode: "rpc" verification, documented finding): grepped the installed
+   * SDK's compiled dist/**\/*.js for `mode === "rpc"` (and `"rpc"` generally).
+   * Every RPC-mode-specific branch found lives in dist/modes/rpc/rpc-mode.js,
+   * dist/modes/rpc/rpc-client.js, dist/main.js, and dist/cli/args.js -- pi's own
+   * CLI subprocess entry point (`pi --mode rpc`), an entirely separate code path
+   * from the createAgentSession()-based programmatic embedding this app uses; this
+   * app never calls main()/runRpcMode()/RpcClient. Within core/extensions/runner.js
+   * itself, the `mode` argument passed to setUIContext() is only ever stored
+   * (`this.mode = mode`) and later read in exactly one place -- exposed verbatim as
+   * ExtensionContext.mode to extension event/command handlers (this app registers
+   * no such extensions, only a bare ExtensionUIContext) -- and via
+   * ExtensionRunner#hasUI(), which is computed from whether uiContext !==
+   * noOpUIContext, not from the mode value. No branch anywhere in core/ checks
+   * `mode === "rpc"` specifically. "rpc" is chosen over "tui"/"json"/"print" purely
+   * because ExtensionContext's own doc comment calls out "true in TUI and RPC
+   * modes" for hasUI -- the closest fit for this headless-but-really-has-a-UI-
+   * elsewhere architecture (SPEC.md) -- not because anything actually branches on it.
+   */
+  session.extensionRunner.setUIContext(buildConfirmUIContext(id), "rpc");
 
   return session;
 }
