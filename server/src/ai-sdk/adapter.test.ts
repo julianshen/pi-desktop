@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import type { AgentSessionEventSource, PiSessionEvent } from "./adapter.js";
 import { handleAiSdkRun } from "./adapter.js";
+import { create as createPendingInteraction } from "../web-fetch/pending-interactions.js";
 
 /**
  * Stub `AgentSession`-shaped event source, mirroring `agui/adapter.test.ts`'s own
@@ -55,7 +57,7 @@ describe("handleAiSdkRun", () => {
       { type: "agent_end" },
     ]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "hello"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "hello", "conv-1"));
 
     const starts = chunks.filter((c: any) => c.type === "text-start");
     const deltas = chunks.filter((c: any) => c.type === "text-delta");
@@ -81,7 +83,7 @@ describe("handleAiSdkRun", () => {
       { type: "agent_end" },
     ]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "call a tool"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "call a tool", "conv-1"));
 
     expect(chunks.some((c: any) => c.type === "text-start")).toBe(false);
     expect(chunks.some((c: any) => c.type === "text-end")).toBe(false);
@@ -103,7 +105,7 @@ describe("handleAiSdkRun", () => {
       { type: "agent_end" },
     ]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "publish something"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "publish something", "conv-1"));
 
     const inputStart = chunks.find((c: any) => c.type === "tool-input-start") as any;
     const inputAvailable = chunks.find((c: any) => c.type === "tool-input-available") as any;
@@ -128,7 +130,7 @@ describe("handleAiSdkRun", () => {
   test("AC-3.3: agent_end writes a finish part and the stream closes cleanly", async () => {
     const session = makeStubSession([{ type: "agent_end" }]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "hi"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "hi", "conv-1"));
 
     expect(chunks.length).toBe(1);
     expect((chunks[0] as any).type).toBe("finish");
@@ -154,7 +156,7 @@ describe("handleAiSdkRun", () => {
       { type: "agent_end" },
     ]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "hi"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "hi", "conv-1"));
 
     const starts = chunks.filter((c: any) => c.type === "text-start");
     const ends = chunks.filter((c: any) => c.type === "text-end");
@@ -179,7 +181,7 @@ describe("handleAiSdkRun", () => {
       { type: "message_end", message: failedMessage },
     ]);
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "hi"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "hi", "conv-1"));
 
     expect(chunks.some((c: any) => c.type === "text-start")).toBe(false);
     expect(chunks.some((c: any) => c.type === "text-end")).toBe(false);
@@ -206,12 +208,120 @@ describe("handleAiSdkRun", () => {
       },
     };
 
-    const chunks = await collectChunks(handleAiSdkRun(session, "hi"));
+    const chunks = await collectChunks(handleAiSdkRun(session, "hi", "conv-1"));
 
     const ends = chunks.filter((c: any) => c.type === "text-end");
     const errors = chunks.filter((c: any) => c.type === "error");
     expect(ends.length).toBe(1);
     expect(errors.length).toBe(1);
     expect((errors[0] as any).errorText).toBe("network exploded");
+  });
+
+  // AC-4.2 [R]: tool_execution_start for web_fetch followed by a kind: "confirm"
+  // creation-notification (pending-interactions.ts's real create(), not a stub --
+  // this is the actual cross-module signal the adapter subscribes to) for the SAME
+  // conversation writes a tool-approval-request chunk correlated by toolCallId to the
+  // earlier tool_execution_start, and writes no tool-output-available until the
+  // separate, later tool_execution_end event fires.
+  test("AC-4.2: a same-conversation kind:'confirm' creation-notification writes tool-approval-request correlated to the open tool call, with no premature tool-output-available", async () => {
+    const conversationId = randomUUID();
+    let createdInteractionId: string | undefined;
+    const listeners = new Set<(event: PiSessionEvent) => void>();
+
+    const session: AgentSessionEventSource = {
+      isStreaming: false,
+      subscribe(cb) {
+        listeners.add(cb);
+        return () => listeners.delete(cb);
+      },
+      async prompt() {
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_start", toolCallId: "call-1", toolName: "web_fetch", args: { url: "http://192.168.1.5/x" } });
+        }
+        // The real pending-interactions.ts create() -- this is what the adapter's
+        // onInteractionCreated subscription actually reacts to, not a stub.
+        const { id } = createPendingInteraction(conversationId, {
+          conversationId,
+          kind: "confirm",
+          host: "192.168.1.5",
+          timeoutMs: 20,
+        });
+        createdInteractionId = id;
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_end", toolCallId: "call-1", result: { approved: true } });
+        }
+        for (const cb of listeners) {
+          cb({ type: "agent_end" });
+        }
+      },
+    };
+
+    const chunks = await collectChunks(handleAiSdkRun(session, "fetch a private url", conversationId));
+
+    const approvalIdx = chunks.findIndex((c: any) => c.type === "tool-approval-request");
+    const outputIdx = chunks.findIndex((c: any) => c.type === "tool-output-available");
+
+    expect(approvalIdx).toBeGreaterThanOrEqual(0);
+    const approvalChunk = chunks[approvalIdx] as any;
+    expect(approvalChunk.approvalId).toBe(createdInteractionId);
+    expect(approvalChunk.toolCallId).toBe("call-1");
+    expect(approvalChunk.signature).toBeUndefined();
+
+    // No tool-output-available exists before the approval-request chunk -- it only
+    // ever comes from the separate, later tool_execution_end event.
+    expect(outputIdx).toBeGreaterThan(approvalIdx);
+    expect(chunks.filter((c: any) => c.type === "tool-output-available").length).toBe(1);
+  });
+
+  // AC-4.3 [R]: a creation-notification for a DIFFERENT conversation than the one
+  // currently being streamed must not leak a tool-approval-request chunk into this
+  // stream. Stubs traffic for both conversation ids to prove the subscription is
+  // actually scoped/filtered, not merely "never subscribes to anything."
+  test("AC-4.3: a creation-notification for a different conversation is filtered out, while the matching conversation's still comes through", async () => {
+    const streamConversationId = randomUUID();
+    const otherConversationId = randomUUID();
+    const listeners = new Set<(event: PiSessionEvent) => void>();
+    let matchingId: string | undefined;
+
+    const session: AgentSessionEventSource = {
+      isStreaming: false,
+      subscribe(cb) {
+        listeners.add(cb);
+        return () => listeners.delete(cb);
+      },
+      async prompt() {
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_start", toolCallId: "call-other", toolName: "web_fetch", args: {} });
+        }
+        // Notification for a DIFFERENT conversation than the one being streamed --
+        // must be filtered out.
+        createPendingInteraction(otherConversationId, {
+          conversationId: otherConversationId,
+          kind: "confirm",
+          host: "10.0.0.9",
+          timeoutMs: 20,
+        });
+        // Notification for THIS stream's own conversation -- must come through,
+        // proving the filter is scoping (not just globally suppressing).
+        matchingId = createPendingInteraction(streamConversationId, {
+          conversationId: streamConversationId,
+          kind: "confirm",
+          host: "10.0.0.5",
+          timeoutMs: 20,
+        }).id;
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_end", toolCallId: "call-other", result: {} });
+        }
+        for (const cb of listeners) {
+          cb({ type: "agent_end" });
+        }
+      },
+    };
+
+    const chunks = await collectChunks(handleAiSdkRun(session, "fetch", streamConversationId));
+
+    const approvalChunks = chunks.filter((c: any) => c.type === "tool-approval-request");
+    expect(approvalChunks.length).toBe(1);
+    expect((approvalChunks[0] as any).approvalId).toBe(matchingId);
   });
 });
