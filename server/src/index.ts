@@ -418,6 +418,17 @@ export function createApp(options?: CreateAppOptions): Express {
   // succeeded. Per ADR-001 step 1.3: if the server itself has no token configured
   // (options.resolveToken is null/undefined/empty), every request is rejected
   // unconditionally -- fail-closed by explicit, deliberate design, not a bug.
+  //
+  // assistant-ui-migration Task 11 / ADR-002-tool-approval-trust-boundary.md
+  // Decision point 2: this is also the resolve endpoint for the AI SDK migration's
+  // `tool-approval-request` UI chunk (server/src/ai-sdk/adapter.ts, Task 4) -- the
+  // route's `:interactionId` and the AI SDK's `approvalId` are the SAME value
+  // (the adapter sets `approvalId: interaction.id` when it writes that chunk), so
+  // no route rename was made here. Renaming to a `/tool-approvals/:approvalId/`
+  // path was considered (ADR-002 calls it "cosmetic, no bearing on the trust
+  // boundary") and deliberately rejected: it would only churn a path the
+  // frontend already needs to call correctly under a security-sensitive contract,
+  // for a naming difference that doesn't reflect a real behavioral distinction.
   app.post("/api/conversations/:id/pending-interaction/:interactionId/resolve", express.json(), (req, res) => {
     const serverToken = options?.resolveToken;
     const requestToken = req.header("X-Resolve-Token");

@@ -1166,6 +1166,17 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
  * pre-existing ".../resolve" describe block above (predating this fix) already
  * covers the route's other behaviors with TEST_RESOLVE_TOKEN attached to every
  * request; these tests cover the auth check itself.
+ *
+ * assistant-ui-migration Task 11 / ADR-002-tool-approval-trust-boundary.md
+ * Decision point 2: this exact `POST .../pending-interaction/:interactionId/resolve`
+ * route (X-Resolve-Token header, timingSafeEqual comparison, fail-closed when
+ * unconfigured) IS the endpoint ADR-002 says to port verbatim for the AI-SDK
+ * migration's tool-approval trust boundary — `interactionId` and the AI SDK's
+ * `approvalId` refer to the identical value (`PendingInteraction.id`), so no
+ * route rename was made (see this task's commit message for the full
+ * reasoning). The tests below already prove AC-11.1/AC-11.2/AC-11.3 for that
+ * feature; individual tests are tagged with their AC ids inline rather than
+ * duplicated.
  */
 describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Token auth on POST .../resolve", () => {
   async function createPendingConfirm(conversationId: string, host: string) {
@@ -1178,6 +1189,8 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     });
   }
 
+  // AC-11.2 (assistant-ui-migration Task 11): no X-Resolve-Token header -> 401,
+  // pending approval remains unresolved.
   test("missing X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1203,6 +1216,8 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     expect(pollBody.interaction?.id).toBe(id);
   });
 
+  // AC-11.2 (assistant-ui-migration Task 11): wrong X-Resolve-Token header -> 401,
+  // pending approval remains unresolved.
   test("wrong (non-matching) X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1226,6 +1241,10 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     expect(pollBody.interaction?.id).toBe(id);
   });
 
+  // AC-11.1 (assistant-ui-migration Task 11): valid X-Resolve-Token + { approved:
+  // true } -> 200 and the pending approval is marked resolved server-side (proven
+  // here via the settled promise, the same server-side signal a real ctx.ui.confirm()
+  // call is waiting on).
   test("correct X-Resolve-Token header succeeds (same behavior as before this fix)", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1278,6 +1297,9 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
       });
     });
 
+    // AC-11.3 (assistant-ui-migration Task 11): no resolve token configured at all
+    // (env var unset, no stdin handoff) -> every resolve request rejected
+    // unconditionally, fail-closed, whether or not a header is sent.
     test("every resolve request is rejected with 401, even with no header sent at all", async () => {
       const created = (await (
         await fetch(`${noTokenBaseUrl}/api/conversations`, {
