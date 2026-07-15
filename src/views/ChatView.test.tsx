@@ -144,10 +144,33 @@ mock.module("@copilotkit/react-core", () => ({
   },
 }));
 
+/**
+ * ADR-001 ("Resolve-endpoint trust boundary"): ChatView.tsx now calls
+ * `getResolveToken()` (src/lib/resolveToken.ts), which calls
+ * `invoke("get_resolve_token")` under the hood — mocked here the same way
+ * `headlessRender.test.ts`/`App.test.tsx` mock `@tauri-apps/api/core`.
+ * `invokeImpl` defaults to resolving a valid token so every pre-existing test in
+ * this file (none of which care about ADR-001) sees a normal, non-degraded
+ * approval chip, same as production behavior when `get_resolve_token()` succeeds.
+ * Tests that specifically exercise the degraded path override `invokeImpl` (and/or
+ * `import.meta.env.VITE_RESOLVE_TOKEN`) themselves.
+ */
+let invokeImpl: (cmd: string, args?: unknown) => Promise<unknown> = () => Promise.resolve("test-resolve-token");
+
+mock.module("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invokeImpl(cmd, args),
+}));
+
 // Imported dynamically, after mock.module() above registers the replacement —
 // a static top-level `import` would be hoisted ahead of that call and pick up
 // the real (unmocked) module instead.
 const { ChatView } = await import("./ChatView.js");
+// Already loaded as part of ChatView.js's own import graph above — importing it
+// again here just gets the same cached module instance, exposing its test-only
+// cache-reset helper (see resolveToken.ts's own doc comment for why this exists:
+// getResolveToken() is memoized module-wide, so without resetting it between
+// tests, whichever test runs first would "win" for every later test in this file).
+const { __resetResolveTokenCacheForTests } = await import("../lib/resolveToken.js");
 
 let originalFetch: typeof fetch;
 
@@ -163,10 +186,16 @@ beforeEach(() => {
   // don't hit the real network / log noisy ECONNREFUSED errors. Tests that DO care
   // override global.fetch themselves before rendering.
   global.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
+  // ADR-001: fresh, non-degraded token resolution by default for every test (see
+  // this file's own comment above on why the cache must be reset per test).
+  invokeImpl = () => Promise.resolve("test-resolve-token");
+  delete import.meta.env.VITE_RESOLVE_TOKEN;
+  __resetResolveTokenCacheForTests();
 });
 
 afterEach(() => {
   global.fetch = originalFetch;
+  __resetResolveTokenCacheForTests();
   cleanup();
 });
 
@@ -722,11 +751,12 @@ describe("ChatView", () => {
         onResolve?: (interactionId: string, body: unknown) => Response | Promise<Response>;
       },
     ) {
-      const fetchCalls: { url: string; body?: unknown }[] = [];
+      const fetchCalls: { url: string; body?: unknown; headers?: Record<string, string> }[] = [];
       const fn = mock((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         const body = init?.body ? (JSON.parse(init.body as string) as unknown) : undefined;
-        fetchCalls.push({ url, body });
+        const headers = init?.headers ? (init.headers as Record<string, string>) : undefined;
+        fetchCalls.push({ url, body, headers });
 
         if (url.endsWith(`/api/conversations/${conversationId}/messages`)) {
           return Promise.resolve(jsonResponse([]));
@@ -846,6 +876,93 @@ describe("ChatView", () => {
       await waitFor(() => {
         expect(screen.queryByText("127.0.0.1")).toBeNull();
       });
+    });
+
+    test("ADR-001: Approve's resolve POST carries the X-Resolve-Token header when getResolveToken() succeeds", async () => {
+      invokeImpl = () => Promise.resolve("secret-token-abc");
+
+      const { fn, fetchCalls } = fetchMockFor("conv-token-header", {
+        interaction: { id: "int-token", kind: "confirm", host: "10.0.0.9" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-token-header" model="" conversationId="conv-token-header" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("10.0.0.9")).toBeTruthy();
+      });
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+      });
+
+      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-token/resolve"));
+      expect(resolveCall).toBeTruthy();
+      expect(resolveCall!.headers?.["X-Resolve-Token"]).toBe("secret-token-abc");
+    });
+
+    test("ADR-001: when getResolveToken() resolves to null (invoke() fails and no VITE_RESOLVE_TOKEN fallback), Approve/Deny are disabled and a visible error appears in the chip", async () => {
+      invokeImpl = () => Promise.reject(new Error("no Tauri bridge present"));
+      delete import.meta.env.VITE_RESOLVE_TOKEN;
+
+      const { fn } = fetchMockFor("conv-degraded", {
+        interaction: { id: "int-degraded", kind: "confirm", host: "172.16.0.5" },
+      });
+      global.fetch = fn;
+
+      render(<ChatView key="conv-degraded" model="" conversationId="conv-degraded" />);
+
+      await waitFor(() => {
+        expect(screen.getByText("172.16.0.5")).toBeTruthy();
+      });
+
+      await waitFor(() => {
+        expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
+      });
+      expect((screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByText(/Could not verify this session — approval is unavailable\./)).toBeTruthy();
+    });
+
+    test("ADR-001: a 401 resolve response (missing/mismatched token) does NOT optimistically clear the chip, so the user can retry", async () => {
+      invokeImpl = () => Promise.resolve("stale-or-wrong-token");
+
+      const { fn, fetchCalls } = fetchMockFor("conv-401", {
+        interaction: { id: "int-401", kind: "confirm", host: "10.1.1.1" },
+        onResolve: () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }),
+      });
+      global.fetch = fn;
+
+      const errorSpy = mock((..._args: unknown[]) => undefined);
+      const originalConsoleError = console.error;
+      console.error = errorSpy as unknown as typeof console.error;
+
+      try {
+        render(<ChatView key="conv-401" model="" conversationId="conv-401" />);
+
+        await waitFor(() => {
+          expect(screen.getByText("10.1.1.1")).toBeTruthy();
+        });
+
+        await act(async () => {
+          fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+        });
+
+        const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-401/resolve"));
+        expect(resolveCall).toBeTruthy();
+
+        // Unlike the AC-8.2/AC-8.3 success cases above, the chip must NOT clear on
+        // a 401 — the approval was never actually recorded server-side, so leaving
+        // the chip up (with buttons re-enabled for a retry) is the correct outcome.
+        await waitFor(() => {
+          expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
+        });
+        expect(screen.getByText("10.1.1.1")).toBeTruthy();
+        expect(
+          errorSpy.mock.calls.some((call) => String(call[0]).includes("X-Resolve-Token") && String(call[0]).includes("ADR-001")),
+        ).toBe(true);
+      } finally {
+        console.error = originalConsoleError;
+      }
     });
   });
 });

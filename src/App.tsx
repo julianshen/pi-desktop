@@ -17,6 +17,7 @@ import { useShellState, type ViewKey } from "./state/useShellState";
 import { useConversations } from "./state/useConversations";
 import { API_BASE } from "./state/apiBase.js";
 import { renderUrlHeadless } from "./lib/headlessRender.js";
+import { getResolveToken } from "./lib/resolveToken.js";
 
 const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
 
@@ -96,11 +97,33 @@ export function usePendingRenderInteractionWatcher(conversationId: string): void
       if (cancelled) return;
 
       try {
-        await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${interaction.id}/resolve`, {
+        // ADR-001: attach the resolve-endpoint auth token this watcher shares with
+        // ChatView.tsx's approval chip (both funnel through the same memoized
+        // getResolveToken()). `token` may be `null` here (genuinely no token
+        // available anywhere) — this silent background watcher has no UI to show a
+        // degraded state in (per its own doc comment above), so it still sends the
+        // request; the server will correctly 401 it in that case, matching the
+        // "no header at all" behavior a missing/null token implies.
+        const token = await getResolveToken();
+        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${interaction.id}/resolve`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(token !== null ? { "X-Resolve-Token": token } : {}),
+          },
           body: JSON.stringify({ html }),
         });
+        if (!res.ok) {
+          // ADR-001: a 401 here means the render-kind pending interaction was
+          // NEVER actually resolved (the web_fetch tool call it belongs to is
+          // still blocked server-side) — distinguish it from other failures since
+          // there's no chip anywhere to surface this to a human, only this log.
+          console.error(
+            res.status === 401
+              ? "[App] resolve request rejected: missing/mismatched X-Resolve-Token (ADR-001) — render interaction was not resolved"
+              : `[App] resolve request failed with status ${res.status} — render interaction was not resolved`,
+          );
+        }
       } catch (error: unknown) {
         console.error("[App] failed to resolve render interaction", error);
       }

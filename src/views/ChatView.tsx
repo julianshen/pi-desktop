@@ -4,6 +4,7 @@ import { Role, TextMessage, aguiToGQL } from "@copilotkit/runtime-client-gql";
 import { Blueprint } from "../components/Blueprint";
 import { AttachIcon, FileIcon, SendIcon } from "../components/icons";
 import { API_BASE } from "../state/apiBase.js";
+import { getResolveToken } from "../lib/resolveToken.js";
 
 const GREETING =
   "Hi! I'm pi, your desktop agent. Ask me anything — I can use tools, skills, MCP servers, and remember things across conversations.";
@@ -295,6 +296,31 @@ export function ChatView({
   const [pendingConfirm, setPendingConfirm] = useState<{ id: string; host: string } | null>(null);
   const [resolvingApproval, setResolvingApproval] = useState(false);
 
+  // ADR-001 ("Resolve-endpoint trust boundary"): eagerly resolve the shared
+  // resolve-token once per mount, independent of whether a `pendingConfirm`
+  // interaction actually exists yet — `getResolveToken()` (src/lib/resolveToken.ts)
+  // is memoized process-wide, so this costs nothing extra even if App.tsx's own
+  // watcher already triggered the same underlying `invoke()` call first, and it
+  // means the token is very likely already resolved by the time a real chip shows
+  // up. `undefined` here means "still resolving" (kept deliberately distinct from
+  // `null`, "no token available anywhere," ADR-001's genuine degraded state) so the
+  // chip's Approve/Deny buttons stay usable as today during the (normally
+  // near-instant) resolution — only a confirmed `null` disables them below. This
+  // matches ADR-001's own "New coupling" consequence: a failed/slow
+  // `get_resolve_token()` needs a sensible degraded state, not an artificial
+  // loading gate on every render.
+  const [resolveToken, setResolveToken] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    let cancelled = false;
+    void getResolveToken().then((token) => {
+      if (!cancelled) setResolveToken(token);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const resolveTokenUnavailable = resolveToken === null;
+
   useEffect(() => {
     let cancelled = false;
 
@@ -339,20 +365,56 @@ export function ChatView({
   // for a fresh fetch to confirm it, and avoids an up-to-
   // PENDING_INTERACTION_POLL_MS visible lag after a click that already
   // resolved the interaction server-side.
+  //
+  // ADR-001 addendum to the above: a 401 response is a NEW, meaningful failure
+  // mode the original comment above didn't anticipate — it means the token was
+  // missing or mismatched and the approval was genuinely never recorded
+  // server-side, not a one-off network blip the optimistic-clear reasoning above
+  // was written for. Clearing the chip on a 401 would silently hide a real,
+  // actionable misconfiguration (e.g. `get_resolve_token()` failing AND no
+  // `VITE_RESOLVE_TOKEN` fallback) and strand the underlying `web_fetch` tool
+  // call with no visible way to retry. So: a 401 specifically skips the
+  // optimistic clear (buttons just re-enable via `resolvingApproval` below,
+  // letting the user try again); every other outcome — success, a network
+  // exception, a 404 from the companion server task's interactionId/
+  // conversationId-binding check, any other status — keeps the original
+  // optimistic-clear behavior unchanged.
   const resolvePendingConfirm = async (approved: boolean) => {
     if (!pendingConfirm || resolvingApproval) return;
     const { id } = pendingConfirm;
     setResolvingApproval(true);
+    let authFailed = false;
     try {
-      await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${id}/resolve`, {
+      // Fetched fresh (not read off the `resolveToken` state var) so a click that
+      // lands before the mount-effect's setState has committed still gets the
+      // getter's true current answer — getResolveToken() is memoized
+      // (src/lib/resolveToken.ts), so this is a no-op await after the first real
+      // resolution anywhere in the app, not a second network/IPC round trip.
+      const token = await getResolveToken();
+      const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/pending-interaction/${id}/resolve`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(token !== null ? { "X-Resolve-Token": token } : {}),
+        },
         body: JSON.stringify({ approved }),
       });
+      if (!res.ok) {
+        authFailed = res.status === 401;
+        console.error(
+          res.status === 401
+            ? "[ChatView] resolve request rejected: missing/mismatched X-Resolve-Token (ADR-001) — approval was not recorded"
+            : res.status === 404
+              ? "[ChatView] resolve request failed: interaction not found for this conversation (404) — approval was not recorded"
+              : `[ChatView] resolve request failed with status ${res.status} — approval was not recorded`,
+        );
+      }
     } catch (error: unknown) {
       console.error("[ChatView] failed to resolve pending interaction", error);
     } finally {
-      setPendingConfirm(null);
+      if (!authFailed) {
+        setPendingConfirm(null);
+      }
       setResolvingApproval(false);
     }
   };
@@ -517,20 +579,44 @@ export function ChatView({
                   <div style={{ display: "flex", gap: 8, marginLeft: "auto" }}>
                     <button
                       className="btn btn-primary"
-                      disabled={resolvingApproval}
+                      disabled={resolvingApproval || resolveTokenUnavailable}
                       onClick={() => void resolvePendingConfirm(true)}
                     >
                       Approve
                     </button>
                     <button
                       className="btn btn-secondary"
-                      disabled={resolvingApproval}
+                      disabled={resolvingApproval || resolveTokenUnavailable}
                       onClick={() => void resolvePendingConfirm(false)}
                     >
                       Deny
                     </button>
                   </div>
                 </div>
+                {/* ADR-001 "New coupling" consequence: get_resolve_token() failing
+                    (invoke() rejected, e.g. no Tauri bridge in npm run dev's
+                    no-window sub-mode) AND no VITE_RESOLVE_TOKEN fallback means
+                    there is genuinely no way to authenticate a resolve call —
+                    Approve/Deny are disabled above, and this banner makes that
+                    visible rather than leaving silently-disabled buttons with no
+                    explanation. Reuses the same color tokens as the last-turn
+                    error banner below (var(--color-danger)/-bg) for a consistent
+                    visual language for "something is wrong" states in this file. */}
+                {resolveTokenUnavailable && (
+                  <div
+                    style={{
+                      margin: "0 12px 10px",
+                      padding: "8px 10px",
+                      fontSize: 12.5,
+                      lineHeight: 1.4,
+                      color: "var(--color-danger)",
+                      background: "var(--color-danger-bg)",
+                      border: "1px solid var(--color-danger)",
+                    }}
+                  >
+                    Could not verify this session — approval is unavailable.
+                  </div>
+                )}
               </Blueprint>
             </div>
           )}
