@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createWebFetchTools } from "./tools.js";
 import { create as createPendingInteraction, resolve as resolvePendingInteraction, getPending } from "./pending-interactions.js";
+import { MAX_REDIRECTS } from "./fetcher.js";
 
 /**
  * Task 6 (TASKS.md) — the full execute() gated-fetch matrix for `web_fetch`.
@@ -448,3 +449,288 @@ describe("web_fetch tool", () => {
     expect(text.toLowerCase()).toContain("invalid url");
   });
 });
+
+/**
+ * REVIEW.md remediation: Critical #3 (explicit URL-scheme allowlist),
+ * Critical #1's redirect half (re-gating a redirect that lands on a private
+ * target the caller never had a chance to approve), and Important #6 (never
+ * let plainFetch()'s non-SSRF failure modes propagate out of execute()
+ * uncaught).
+ *
+ * These tests reuse this file's own established conventions (see the module
+ * doc comment above): IP-literal hostnames so the REAL classifyTarget()/
+ * resolveTarget() runs end-to-end without real DNS, and a global.fetch stub
+ * standing in for the network. Where a test needs the stub's response to
+ * depend on which URL is being requested (redirect chains), it installs its
+ * own `globalThis.fetch` directly rather than using the shared
+ * `nextFetchResponse` single-response hook — still restored by the same
+ * shared `afterEach` as every other test in this file.
+ */
+describe("web_fetch tool — REVIEW.md remediation", () => {
+  /** A ctx.ui.confirm() that always immediately approves, bypassing the pending-interaction registry — used only for the bounded-retry-loop test below, where the thing under test is the LOOP's own attempt cap, not the approval UI wiring (already covered elsewhere by buildRealConfirmContext()). */
+  function buildAutoApproveConfirmContext(): ExtensionContext {
+    return {
+      ui: {
+        confirm: async () => true,
+      },
+    } as unknown as ExtensionContext;
+  }
+
+  const REDIRECT_PRIVATE_URL = "http://10.0.0.9/private-page";
+
+  // REVIEW.md Critical #3 — a syntactically valid but non-http(s) URL must be
+  // rejected before classifyTarget() (hence before any DNS lookup) and before
+  // any fetch attempt.
+  test.each([
+    ["file:///etc/passwd", "file:"],
+    ["javascript:alert(1)", "javascript:"],
+  ])("REVIEW.md Critical #3: %s is rejected with reason unsupported-scheme, with no DNS/network call", async (url, scheme) => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildConfirmMustNotBeCalledContext(); // proves classifyTarget()'s confirm path is never reached
+
+    const result = await webFetch.execute("call-1", { url }, undefined, undefined, ctx);
+
+    // No fetch attempt at all — the same assertion this file's existing
+    // invalid-url test uses to prove "no network call happened".
+    expect(fetchCalls).toHaveLength(0);
+    expect(getPending(conversationId)).toBeUndefined();
+    expect(result.details).toMatchObject({ ok: false, reason: "unsupported-scheme" });
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain(scheme);
+  });
+
+  // REVIEW.md Critical #1 (redirect half) — a redirect from an already-gated
+  // public host to a DIFFERENT, private host is a target the human never had
+  // a chance to approve. tools.ts must re-run the same classify+confirm gate
+  // against the redirect target, naming it explicitly.
+  test("REVIEW.md Critical #1: a redirect to a different private host triggers a fresh confirm naming the redirect target; approval retries plainFetch with the redirect URL and returns success", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildRealConfirmContext(conversationId);
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push({ url });
+      if (url.startsWith("http://203.0.113.10")) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_PRIVATE_URL } });
+      }
+      return new Response("<html><body><h1>Hello</h1><p>Some real page content, not a shell.</p></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as typeof fetch;
+
+    const execPromise = webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+
+    const pending = await waitForPending(conversationId);
+    expect(pending.kind).toBe("confirm");
+    // Naming the exact literal redirect target, not a paraphrase — and
+    // mentioning the original URL too, so it's clear this is a redirect.
+    expect(pending.kind === "confirm" && pending.host).toContain(new URL(REDIRECT_PRIVATE_URL).href);
+    expect(pending.kind === "confirm" && pending.host).toContain(new URL(PUBLIC_URL).href);
+    // Only the first (redirecting) fetch has happened so far — no retry yet.
+    expect(fetchCalls).toHaveLength(1);
+
+    resolvePendingInteraction(pending.id, { kind: "confirm", approved: true });
+    const result = await execPromise;
+
+    // The retry is a fresh plainFetch() call against the redirect URL itself.
+    expect(fetchCalls).toHaveLength(2);
+    expect(fetchCalls[1]?.url).toBe(REDIRECT_PRIVATE_URL);
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain("Hello");
+    expect(result.details).toMatchObject({ ok: true });
+  });
+
+  test("REVIEW.md Critical #1: denying the confirm for a redirect target returns a clean not-approved result and does not retry", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildRealConfirmContext(conversationId);
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push({ url });
+      if (url.startsWith("http://203.0.113.10")) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_PRIVATE_URL } });
+      }
+      return new Response("<html><body><h1>Hello</h1></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as typeof fetch;
+
+    const execPromise = webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+    const pending = await waitForPending(conversationId);
+    resolvePendingInteraction(pending.id, { kind: "confirm", approved: false });
+
+    const result = await execPromise;
+    // Denial short-circuits: no retried fetch to the redirect target.
+    expect(fetchCalls).toHaveLength(1);
+    expect(result.details).toMatchObject({ ok: false, reason: "not-approved" });
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain(new URL(REDIRECT_PRIVATE_URL).host);
+    expect(text).toContain("not approved");
+  });
+
+  // REVIEW.md Critical #1 (redirect half), AC-6.3-equivalent for redirects —
+  // a redirect landing on a host ALREADY approved earlier this conversation
+  // must not re-prompt.
+  test("REVIEW.md Critical #1: a redirect to an already-approved host retries immediately without calling ctx.ui.confirm() again", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const approveCtx = buildRealConfirmContext(conversationId);
+
+    // Step 1: approve the private host directly (same shape as AC-6.3),
+    // populating approvedHostsByConversation for this conversationId.
+    const firstExec = webFetch.execute("call-1", { url: REDIRECT_PRIVATE_URL }, undefined, undefined, approveCtx);
+    const firstPending = await waitForPending(conversationId);
+    resolvePendingInteraction(firstPending.id, { kind: "confirm", approved: true });
+    await firstExec;
+    expect(fetchCalls).toHaveLength(1);
+
+    // Step 2: a public URL that redirects to that SAME already-approved
+    // host. confirm() must not be called again.
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push({ url });
+      if (url.startsWith("http://203.0.113.10")) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_PRIVATE_URL } });
+      }
+      return new Response("<html><body><h1>Hello</h1></body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as typeof fetch;
+    const noConfirmCtx = buildConfirmMustNotBeCalledContext();
+
+    const result = await webFetch.execute("call-2", { url: PUBLIC_URL }, undefined, undefined, noConfirmCtx);
+
+    expect(getPending(conversationId)).toBeUndefined();
+    // One fetch to the original public URL (redirect) + one retried fetch to
+    // the already-approved redirect target = 2 more calls, no pending
+    // interaction created for either.
+    expect(fetchCalls).toHaveLength(3);
+    expect(result.details).toMatchObject({ ok: true });
+  });
+
+  // REVIEW.md Critical #1 (redirect half) + US-05 — a scheduled/background
+  // run must hard-block a redirect to a private target exactly like it
+  // hard-blocks a directly-private original URL: never call ctx.ui.confirm().
+  test("REVIEW.md Critical #1: scheduled session hard-blocks a redirect to a private host, never calling ctx.ui.confirm()", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "scheduled");
+    const ctx = buildConfirmMustNotBeCalledContext();
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push({ url });
+      if (url.startsWith("http://203.0.113.10")) {
+        return new Response(null, { status: 302, headers: { location: REDIRECT_PRIVATE_URL } });
+      }
+      return new Response("should never be reached", { status: 200 });
+    }) as typeof fetch;
+
+    const result = await webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx);
+
+    expect(fetchCalls).toHaveLength(1); // no retry after the hard block
+    expect(getPending(conversationId)).toBeUndefined();
+    expect(result.details).toMatchObject({ ok: false, reason: "scheduled-private-blocked" });
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain(new URL(REDIRECT_PRIVATE_URL).host);
+    expect(text).toContain("not permitted in a background run");
+  });
+
+  // REVIEW.md Critical #1 — fetcher.ts's own MAX_REDIRECTS hop cap, exceeded
+  // WITHIN a single plainFetch() call (a same-host chain that never
+  // settles), must come back as a clean error result, not an uncaught throw.
+  test("REVIEW.md Critical #1: plainFetch() throwing TooManyRedirectsError returns a clean error result, not an uncaught throw", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildConfirmMustNotBeCalledContext();
+
+    let hop = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCalls.push({ url: String(input) });
+      hop++;
+      // Same host every time -> never triggers PrivateRedirectError, only
+      // fetcher.ts's own MAX_REDIRECTS cap.
+      return new Response(null, { status: 302, headers: { location: `http://203.0.113.10/hop-${hop}` } });
+    }) as typeof fetch;
+
+    const result = await expectNotToThrow(
+      webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx),
+    );
+
+    expect(result.details).toMatchObject({ ok: false, reason: "too-many-redirects" });
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text.toLowerCase()).toContain("too many redirects");
+  });
+
+  // REVIEW.md Important #6 — any OTHER rejection from plainFetch() (network
+  // failure, timeout/AbortError, DNS failure on a hop, etc.) must never
+  // propagate out of execute() uncaught; it must come back as a clean
+  // WebFetchDetails-shaped failure result.
+  test("REVIEW.md Important #6: a generic network error from plainFetch() (simulated AbortError) returns a clean failure result rather than propagating", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    const ctx = buildConfirmMustNotBeCalledContext();
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      fetchCalls.push({ url: String(input) });
+      throw new DOMException("The operation was aborted.", "AbortError");
+    }) as typeof fetch;
+
+    const result = await expectNotToThrow(
+      webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx),
+    );
+
+    expect(result.details).toMatchObject({ ok: false, reason: "fetch-failed" });
+    const text = result.content.map((c) => ("text" in c ? c.text : "")).join("");
+    expect(text).toContain(new URL(PUBLIC_URL).href);
+  });
+
+  // REVIEW.md Critical #1 — a redirect chain that keeps landing on a NEW
+  // distinct private host on every hop (each requiring its own approval)
+  // must not turn into an unbounded prompt loop. tools.ts's own
+  // MAX_REDIRECT_GATE_ATTEMPTS (reusing fetcher.ts's MAX_REDIRECTS) bounds
+  // the number of fresh plainFetch() retries.
+  test("REVIEW.md Critical #1: a redirect-approval loop hitting a new private host every hop stops at the bound and returns a clean error, not an infinite loop", async () => {
+    const conversationId = randomUUID();
+    const [webFetch] = createWebFetchTools(conversationId, "interactive");
+    // Auto-approve every prompt — the thing under test is the LOOP's own
+    // cap, not the approval UI (already covered by the tests above).
+    const ctx = buildAutoApproveConfirmContext();
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      fetchCalls.push({ url });
+      const match = /^http:\/\/10\.0\.0\.(\d+)\//.exec(url);
+      const nextHostNumber = match ? Number(match[1]) + 1 : 1;
+      // Every hop redirects to a brand-new distinct private host — a
+      // pathological chain that never settles and never repeats a host, so
+      // the "already-approved" fast path never kicks in either.
+      return new Response(null, { status: 302, headers: { location: `http://10.0.0.${nextHostNumber}/page` } });
+    }) as typeof fetch;
+
+    const result = await expectNotToThrow(
+      webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx),
+    );
+
+    expect(result.details).toMatchObject({ ok: false, reason: "too-many-redirect-approvals" });
+    // Bounded: at most MAX_REDIRECTS fresh plainFetch() calls were made.
+    expect(fetchCalls.length).toBeLessThanOrEqual(MAX_REDIRECTS);
+    expect(fetchCalls.length).toBeGreaterThan(0);
+  });
+});
+
+/** Small helper making the "must not throw" assertion explicit at the call site for the Important #6 / TooManyRedirectsError tests above, rather than relying on an unhandled rejection failing the test opaquely. */
+async function expectNotToThrow<T>(promise: Promise<T>): Promise<T> {
+  try {
+    return await promise;
+  } catch (error) {
+    throw new Error(
+      `Expected execute() to return a clean error result, but it threw instead: ${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+    );
+  }
+}

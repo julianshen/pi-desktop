@@ -10,7 +10,15 @@
  */
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { plainFetch, toReadableContent, looksLikeEmptySpaShell, type FetchedPage } from "./fetcher.js";
+import {
+  plainFetch,
+  toReadableContent,
+  looksLikeEmptySpaShell,
+  PrivateRedirectError,
+  TooManyRedirectsError,
+  MAX_REDIRECTS,
+  type FetchedPage,
+} from "./fetcher.js";
 import { classifyTarget, DnsResolutionError } from "./safety.js";
 import { create as createPendingInteraction } from "./pending-interactions.js";
 
@@ -70,7 +78,34 @@ function approvedHostsFor(conversationId: string): Set<string> {
  */
 type WebFetchDetails =
   | { ok: true; url: string; title: string | null; status: number; contentType: string | null; fetchedAt: string }
-  | { ok: false; url: string; reason: "invalid-url" | "dns-error" | "scheduled-private-blocked" | "not-approved" };
+  | {
+      ok: false;
+      url: string;
+      reason:
+        | "invalid-url"
+        | "dns-error"
+        | "scheduled-private-blocked"
+        | "not-approved"
+        // REVIEW.md Critical #3: a syntactically valid but non-http(s) input
+        // URL (file:, javascript:, data:, ftp:, ...) rejected before
+        // classifyTarget() ever runs.
+        | "unsupported-scheme"
+        // REVIEW.md Critical #1 (redirect half): fetcher.ts's own
+        // MAX_REDIRECTS-hop cap was exceeded within a single plainFetch()
+        // call (a same-host or already-gated-host redirect chain that just
+        // never settles) — distinct from the tools.ts-level cap below, which
+        // bounds the number of FRESH plainFetch() calls across re-approved
+        // private redirect targets.
+        | "too-many-redirects"
+        // REVIEW.md Critical #1 (redirect half): the redirect-re-gating
+        // retry loop below (see MAX_REDIRECT_GATE_ATTEMPTS) exhausted its
+        // attempt budget without settling — a chain that keeps bouncing
+        // through a new distinct private host on every hop.
+        | "too-many-redirect-approvals"
+        // REVIEW.md Important #6: plainFetch() rejected with something that
+        // isn't one of the classes above — a plain network/DNS/abort error.
+        | "fetch-failed";
+    };
 
 function textResult(text: string, details: WebFetchDetails) {
   return { content: [{ type: "text" as const, text }], details };
@@ -153,6 +188,88 @@ export function createWebFetchTools(conversationId: string, sessionKind: Session
         });
       }
 
+      // (a.1) REVIEW.md Critical #3: explicit scheme allowlist, checked
+      // immediately after a successful parse and BEFORE classifyTarget() (no
+      // DNS lookup, no network activity at all for a rejected scheme). A
+      // syntactically valid URL with a non-http(s) scheme (file:, javascript:,
+      // data:, ftp:, ...) would otherwise sail straight through classification
+      // (which only inspects the hostname) and, for schemes classifyTarget()
+      // can't even meaningfully evaluate, potentially straight into plainFetch().
+      // Note this only guards the tool's own *initial* input URL — fetcher.ts's
+      // plainFetch() already independently re-checks every individual redirect
+      // hop's scheme (see its own `nextUrl.protocol !== "http:" && ...` check),
+      // so there is no need to duplicate hop-level checking here.
+      if (target.protocol !== "http:" && target.protocol !== "https:") {
+        return textResult(
+          `Unsupported URL scheme "${target.protocol}". Only http and https URLs can be fetched.`,
+          { ok: false, url: target.href, reason: "unsupported-scheme" },
+        );
+      }
+
+      const approvedHosts = approvedHostsFor(conversationId);
+
+      // Shared private-target gate, used both for the original input URL
+      // (classified below) and for a redirect target surfaced later via
+      // fetcher.ts's PrivateRedirectError (REVIEW.md Critical #1's redirect
+      // half) — a target the human never had a chance to approve, because
+      // plainFetch() discovered it was private mid-redirect-chain, not via
+      // this function's own upfront classifyTarget() call. `redirectFrom`,
+      // when present, is used only to word the block/prompt message so it's
+      // clear this is a redirect and names both URLs (never a paraphrase —
+      // same rule the original-URL prompt below follows); it does NOT change
+      // the gating logic itself (scheduled hard-block / per-conversation
+      // per-host approval memory / ctx.ui.confirm()).
+      async function gatePrivateTarget(
+        privateTarget: URL,
+        redirectFrom?: URL,
+      ): Promise<{ approved: true } | { approved: false; result: ReturnType<typeof textResult> }> {
+        if (sessionKind === "scheduled") {
+          // (c) Scheduled sessions hard-block immediately — never call
+          // ctx.ui.confirm(), never create a pending interaction (AC-6.4,
+          // US-05: an unattended run must never hang waiting on an approval
+          // nobody will give). Same rule applies to a redirect target.
+          const message = redirectFrom
+            ? `Fetching ${privateTarget.host} (a redirect from ${redirectFrom.href} to ${privateTarget.href}) is not permitted in a background run.`
+            : `Fetching ${privateTarget.host} is not permitted in a background run.`;
+          return {
+            approved: false,
+            result: textResult(message, { ok: false, url: target.href, reason: "scheduled-private-blocked" }),
+          };
+        }
+
+        if (approvedHosts.has(privateTarget.host)) {
+          return { approved: true };
+        }
+
+        // The composed message IS the pending interaction's `host` field
+        // downstream (agent/conversations.ts's buildConfirmUIContext passes
+        // `message` straight through as `host`) — so it must name the exact
+        // literal URL(s), not a paraphrase (SPEC.md Boundaries: "Always show
+        // the literal host/URL in the approval prompt, never a paraphrase.").
+        const message = redirectFrom
+          ? `pi wants to fetch ${redirectFrom.href}, which redirected to ${privateTarget.href} — this targets your local machine or network (${privateTarget.host}). Allow this fetch?`
+          : `pi wants to fetch ${privateTarget.href} — this targets your local machine or network (${privateTarget.host}). Allow this fetch?`;
+        const approved = await ctx.ui.confirm("Allow local network fetch?", message, {
+          timeout: CONFIRM_TIMEOUT_MS,
+        });
+        if (!approved) {
+          // (AC-6.5) Denied (explicit or timeout default) — return an
+          // explicit error and stop. Never proceed to fetch anyway.
+          return {
+            approved: false,
+            result: textResult(`Fetch of ${privateTarget.host} was not approved.`, {
+              ok: false,
+              url: target.href,
+              reason: "not-approved",
+            }),
+          };
+        }
+        // Remembered for this conversation's in-memory session lifetime only
+        // (AC-6.3) — never persisted to disk.
+        approvedHosts.add(privateTarget.host);
+        return { approved: true };
+      }
+
       // (b) Classify once, upfront, before either the plain-fetch or
       // (future) webview-render path — SPEC.md's Boundaries: "Always
       // resolve DNS and classify the resolved IP before any fetch attempt
@@ -169,48 +286,87 @@ export function createWebFetchTools(conversationId: string, sessionKind: Session
       }
 
       if (classification === "private") {
-        // (c) Scheduled sessions hard-block immediately — never call
-        // ctx.ui.confirm(), never create a pending interaction (AC-6.4,
-        // US-05: an unattended run must never hang waiting on an approval
-        // nobody will give).
-        if (sessionKind === "scheduled") {
-          return textResult(`Fetching ${target.host} is not permitted in a background run.`, {
-            ok: false,
-            url: target.href,
-            reason: "scheduled-private-blocked",
-          });
-        }
-
-        const approvedHosts = approvedHostsFor(conversationId);
-        if (!approvedHosts.has(target.host)) {
-          // The composed message IS the pending interaction's `host` field
-          // downstream (agent/conversations.ts's buildConfirmUIContext
-          // passes `message` straight through as `host`) — so it must name
-          // the exact target.href itself, not a paraphrase (SPEC.md
-          // Boundaries: "Always show the literal host/URL in the approval
-          // prompt, never a paraphrase.").
-          const approved = await ctx.ui.confirm(
-            "Allow local network fetch?",
-            `pi wants to fetch ${target.href} — this targets your local machine or network (${target.host}). Allow this fetch?`,
-            { timeout: CONFIRM_TIMEOUT_MS },
-          );
-          if (!approved) {
-            // (AC-6.5) Denied (explicit or timeout default) — return an
-            // explicit error and stop. Never proceed to fetch anyway.
-            return textResult(`Fetch of ${target.host} was not approved.`, {
-              ok: false,
-              url: target.href,
-              reason: "not-approved",
-            });
-          }
-          // Remembered for this conversation's in-memory session lifetime
-          // only (AC-6.3) — never persisted to disk.
-          approvedHosts.add(target.host);
-        }
+        const gate = await gatePrivateTarget(target);
+        if (!gate.approved) return gate.result;
       }
 
-      // (d) Plain fetch.
-      const { html, response } = await plainFetch(target);
+      // (d) Plain fetch, wrapped in a bounded retry loop (REVIEW.md Critical
+      // #1's redirect half + fetcher.ts's own documented recovery contract —
+      // see that file's module doc comment). plainFetch() can now reject
+      // with:
+      //   - PrivateRedirectError: a redirect hop landed on a private/
+      //     loopback/link-local address on a DIFFERENT host than whatever
+      //     was passed in — i.e. a target this function never had a chance
+      //     to gate. Recovery is to run it through the exact same
+      //     gatePrivateTarget() gate used above and, on approval, call
+      //     plainFetch() again as a FRESH top-level call starting from
+      //     error.redirectUrl (fetcher.ts's own contract: that fresh call's
+      //     hop 0 is then treated as "already gated", same as the original
+      //     input URL was here).
+      //   - TooManyRedirectsError: fetcher.ts's own MAX_REDIRECTS hop cap
+      //     was exceeded inside a single plainFetch() call.
+      //   - Any other Error: a plain network/DNS/abort failure (REVIEW.md
+      //     Important #6) — connection refused, per-hop timeout, aborted
+      //     signal, etc.
+      // None of these may ever propagate out of execute() uncaught — see
+      // WebFetchDetails's own doc comment on this tool's error-signaling
+      // convention (always return, never throw).
+      //
+      // MAX_REDIRECT_GATE_ATTEMPTS bounds the number of FRESH plainFetch()
+      // calls this loop will make in response to repeated PrivateRedirectErrors
+      // (a chain that bounces through more than one distinct private host,
+      // each requiring its own approval) — reusing fetcher.ts's own
+      // MAX_REDIRECTS constant rather than inventing a new number: a single
+      // legitimate redirect-to-one-freshly-approved-private-host case only
+      // ever needs 2 attempts, so capping the *retry* budget at the same
+      // order of magnitude as a single plainFetch() call's own internal
+      // per-hop redirect cap comfortably covers any real-world case while
+      // still turning a pathological "every hop is a new private host"
+      // chain into a bounded, clean failure instead of an unbounded prompt
+      // loop.
+      const MAX_REDIRECT_GATE_ATTEMPTS = MAX_REDIRECTS;
+      let currentUrl = target;
+      let html: string;
+      let response: Response;
+      let attempt = 0;
+      while (true) {
+        attempt++;
+        if (attempt > MAX_REDIRECT_GATE_ATTEMPTS) {
+          return textResult(
+            `Fetching ${target.href} involved too many redirects to private/internal targets requiring approval (gave up after ${MAX_REDIRECT_GATE_ATTEMPTS} attempts, most recently redirected to ${currentUrl.href}).`,
+            { ok: false, url: target.href, reason: "too-many-redirect-approvals" },
+          );
+        }
+        try {
+          const fetched = await plainFetch(currentUrl);
+          html = fetched.html;
+          response = fetched.response;
+          break;
+        } catch (error) {
+          if (error instanceof PrivateRedirectError) {
+            const gate = await gatePrivateTarget(error.redirectUrl, currentUrl);
+            if (!gate.approved) return gate.result;
+            currentUrl = error.redirectUrl;
+            continue;
+          }
+          if (error instanceof TooManyRedirectsError) {
+            return textResult(`Fetching ${target.href} involved too many redirects.`, {
+              ok: false,
+              url: target.href,
+              reason: "too-many-redirects",
+            });
+          }
+          // Any other rejection: a plain network/DNS/abort failure
+          // (REVIEW.md Important #6) — never let this propagate out of
+          // execute() uncaught.
+          const message = error instanceof Error ? error.message : String(error);
+          return textResult(`Could not fetch ${target.href}: ${message}`, {
+            ok: false,
+            url: target.href,
+            reason: "fetch-failed",
+          });
+        }
+      }
       const plainPage = toReadableContent(html, target, response);
 
       // (e)/(f)/(g): if the plain fetch doesn't look like an empty SPA
