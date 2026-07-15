@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { PassThrough } from "node:stream";
 import type { Server } from "node:http";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
@@ -25,6 +26,19 @@ import type { ConversationMeta } from "./agent/conversations.js";
  * supertest (or similar) devDependency, and the task instructions say not to add
  * one just for this.
  */
+/**
+ * ADR-001: this file's main app instance now needs a configured resolveToken so
+ * the large pre-existing block of ".../resolve" tests below (which predate the
+ * ADR-001 auth requirement) keep exercising the route's *other* behaviors
+ * (body-shape validation, 404s, promise resolution) rather than being blocked at
+ * the very first check by a 401. TEST_RESOLVE_TOKEN is attached via the
+ * X-Resolve-Token header on every one of those pre-existing tests; the new
+ * "ADR-001 resolve-token auth" describe block below covers the auth check itself,
+ * including the no-header / wrong-token / no-server-token cases this constant
+ * doesn't exercise.
+ */
+const TEST_RESOLVE_TOKEN = "test-resolve-token-abc123";
+
 let server: Server;
 let baseUrl: string;
 let tmpRoot: string;
@@ -37,7 +51,7 @@ beforeAll(async () => {
   delete process.env.PI_DESKTOP_MODEL;
 
   const { createApp } = await import("./index.js");
-  const app = createApp();
+  const app = createApp({ resolveToken: TEST_RESOLVE_TOKEN });
 
   await new Promise<void>((resolve) => {
     server = app.listen(0, "127.0.0.1", () => resolve());
@@ -773,7 +787,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: true }),
     });
     expect(res.status).toBe(200);
@@ -805,7 +819,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: false }),
     });
     expect(res.status).toBe(200);
@@ -836,7 +850,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ html: "<html>rendered</html>" }),
     });
     expect(res.status).toBe(200);
@@ -860,7 +874,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
       `${baseUrl}/api/conversations/${created.id}/pending-interaction/${randomUUID()}/resolve`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
         body: JSON.stringify({ approved: true }),
       },
     );
@@ -889,14 +903,14 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
     const resolveUrl = `${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`;
     const first = await fetch(resolveUrl, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: true }),
     });
     expect(first.status).toBe(200);
 
     const second = await fetch(resolveUrl, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: false }),
     });
     expect(second.status).toBe(404);
@@ -909,7 +923,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
       `${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/pending-interaction/${randomUUID()}/resolve`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
         body: JSON.stringify({ approved: true }),
       },
     );
@@ -942,7 +956,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({}),
     });
     expect(res.status).toBe(400);
@@ -967,7 +981,7 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: true, html: "<p>x</p>" }),
     });
     expect(res.status).toBe(400);
@@ -992,9 +1006,319 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
 
     const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
       body: JSON.stringify({ approved: "yes" }),
     });
     expect(res.status).toBe(400);
+  });
+});
+
+/**
+ * ADR-001 (server/src/index.ts's own doc comment on CreateAppOptions.resolveToken
+ * and readResolveToken() has the full design): the resolve route's X-Resolve-Token
+ * auth check, closing REVIEW.md's High finding ("self-approval bypass" — this
+ * route previously had no auth beyond CORS, so the agent's own unrestricted
+ * `bash` tool could poll the pending-interaction GET and auto-POST
+ * `{"approved":true}` before a human ever saw the approval chip). The large
+ * pre-existing ".../resolve" describe block above (predating this fix) already
+ * covers the route's other behaviors with TEST_RESOLVE_TOKEN attached to every
+ * request; these tests cover the auth check itself.
+ */
+describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Token auth on POST .../resolve", () => {
+  async function createPendingConfirm(conversationId: string, host: string) {
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    return createPendingInteraction(conversationId, {
+      conversationId,
+      kind: "confirm",
+      host,
+      timeoutMs: 5000,
+    });
+  }
+
+  test("missing X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "auth: missing header" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { id } = await createPendingConfirm(created.id, "10.0.1.1");
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ approved: true }),
+    });
+    expect(res.status).toBe(401);
+
+    // The interaction must genuinely still be pending -- not silently approved --
+    // proven via the (deliberately unauthenticated) poll route.
+    const pollRes = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction`);
+    const pollBody = (await pollRes.json()) as { interaction: { id: string } | null };
+    expect(pollBody.interaction?.id).toBe(id);
+  });
+
+  test("wrong (non-matching) X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "auth: wrong token" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { id } = await createPendingConfirm(created.id, "10.0.1.2");
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Resolve-Token": "not-the-right-token" },
+      body: JSON.stringify({ approved: true }),
+    });
+    expect(res.status).toBe(401);
+
+    const pollRes = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction`);
+    const pollBody = (await pollRes.json()) as { interaction: { id: string } | null };
+    expect(pollBody.interaction?.id).toBe(id);
+  });
+
+  test("correct X-Resolve-Token header succeeds (same behavior as before this fix)", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "auth: correct token" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { id, promise } = await createPendingConfirm(created.id, "10.0.1.3");
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+      body: JSON.stringify({ approved: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ resolved: true });
+    expect(await promise).toEqual({ kind: "confirm", approved: true });
+  });
+
+  /**
+   * ADR-001 step 1.3: the "no token was ever established" fail-closed case --
+   * explicit, deliberate design (not a fail-open fallback). Own app instance with
+   * resolveToken deliberately omitted, own ephemeral port + teardown, mirroring
+   * this file's existing "Task 6" describe block's modelServer pattern above.
+   */
+  describe("with no resolveToken configured server-side (ADR-001 step 1.3 fail-closed)", () => {
+    let noTokenServer: Server;
+    let noTokenBaseUrl: string;
+
+    beforeAll(async () => {
+      const { createApp } = await import("./index.js");
+      const app = createApp(); // resolveToken deliberately left unset -> null/undefined
+
+      await new Promise<void>((resolve) => {
+        noTokenServer = app.listen(0, "127.0.0.1", () => resolve());
+      });
+
+      const address = noTokenServer.address();
+      if (!address || typeof address === "string") {
+        throw new Error("expected server.address() to be a net.AddressInfo");
+      }
+      noTokenBaseUrl = `http://127.0.0.1:${address.port}`;
+    });
+
+    afterAll(async () => {
+      await new Promise<void>((resolve, reject) => {
+        noTokenServer.close((error) => (error ? reject(error) : resolve()));
+      });
+    });
+
+    test("every resolve request is rejected with 401, even with no header sent at all", async () => {
+      const created = (await (
+        await fetch(`${noTokenBaseUrl}/api/conversations`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title: "no server token configured" }),
+        })
+      ).json()) as ConversationMeta;
+
+      const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+      const { id } = createPendingInteraction(created.id, {
+        conversationId: created.id,
+        kind: "confirm",
+        host: "10.0.1.4",
+        timeoutMs: 5000,
+      });
+
+      const noHeaderRes = await fetch(
+        `${noTokenBaseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ approved: true }),
+        },
+      );
+      expect(noHeaderRes.status).toBe(401);
+
+      // Even attaching some arbitrary header value must not somehow succeed --
+      // there is nothing valid to compare against server-side, so this is a
+      // fail-closed 401 unconditionally, per ADR-001 step 1.3, not fail-open.
+      const withHeaderRes = await fetch(
+        `${noTokenBaseUrl}/api/conversations/${created.id}/pending-interaction/${id}/resolve`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-Resolve-Token": "anything-at-all" },
+          body: JSON.stringify({ approved: true }),
+        },
+      );
+      expect(withHeaderRes.status).toBe(401);
+
+      // The interaction must still be genuinely pending after both attempts.
+      const pollRes = await fetch(`${noTokenBaseUrl}/api/conversations/${created.id}/pending-interaction`);
+      const pollBody = (await pollRes.json()) as { interaction: { id: string } | null };
+      expect(pollBody.interaction?.id).toBe(id);
+    });
+  });
+});
+
+/**
+ * Low finding (REVIEW.md finding #4, "Important"): POST .../resolve never
+ * verified that :interactionId actually belongs to the conversation named by
+ * :id in the URL -- so knowing/guessing/enumerating another conversation's
+ * pending interaction id let it be resolved via a different conversation's URL.
+ * Fixed by binding on getPending(req.params.id) before calling resolve().
+ */
+describe("Low finding (REVIEW.md #4): interactionId is bound to conversationId on resolve", () => {
+  test("resolving conversation A's interaction via conversation B's URL returns 404 and leaves A's interaction pending", async () => {
+    const convA = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "binding: conversation A" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const convB = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "binding: conversation B" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const { create: createPendingInteraction } = await import("./web-fetch/pending-interactions.js");
+    const { id: interactionIdForA, promise } = createPendingInteraction(convA.id, {
+      conversationId: convA.id,
+      kind: "confirm",
+      host: "10.0.2.1",
+      timeoutMs: 5000,
+    });
+
+    // Attempt to resolve A's interaction via B's URL, with a correct token.
+    const mismatchRes = await fetch(
+      `${baseUrl}/api/conversations/${convB.id}/pending-interaction/${interactionIdForA}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(mismatchRes.status).toBe(404);
+
+    // A's interaction must be unaffected: still pending, and still resolvable via
+    // its own conversation's URL.
+    const pollRes = await fetch(`${baseUrl}/api/conversations/${convA.id}/pending-interaction`);
+    const pollBody = (await pollRes.json()) as { interaction: { id: string } | null };
+    expect(pollBody.interaction?.id).toBe(interactionIdForA);
+
+    const properRes = await fetch(
+      `${baseUrl}/api/conversations/${convA.id}/pending-interaction/${interactionIdForA}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(properRes.status).toBe(200);
+    expect(await promise).toEqual({ kind: "confirm", approved: true });
+  });
+});
+
+// ADR-001: the polling GET route is explicitly, deliberately left unauthenticated
+// (it only leaks "something is pending" and the literal host/URL, not an ability
+// to act) -- a quick regression sanity check that this fix didn't accidentally
+// add auth there too.
+describe("GET .../pending-interaction poll route remains unauthenticated (ADR-001)", () => {
+  test("still works with no X-Resolve-Token header at all", async () => {
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "poll stays unauthenticated" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const res = await fetch(`${baseUrl}/api/conversations/${created.id}/pending-interaction`);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ interaction: null });
+  });
+});
+
+/**
+ * ADR-001 step 1: readResolveToken()'s pure logic, unit-tested with an injected
+ * env/stdin rather than the real process.stdin/process.env -- the HTTP-level
+ * tests above already cover the resolve route's auth behavior via createApp({
+ * resolveToken }); these cover the token-acquisition function itself, per the
+ * task's own "your judgment on how much to test at that level" allowance.
+ */
+describe("readResolveToken (ADR-001 step 1)", () => {
+  test("PI_DESKTOP_RESOLVE_TOKEN env var present short-circuits without touching stdin", async () => {
+    const { readResolveToken } = await import("./index.js");
+    // A stdin whose isTTY getter throwing would fail this test if the function
+    // ever touched it -- proving the env-var path truly short-circuits.
+    const stdinThatMustNotBeTouched = {
+      get isTTY(): boolean {
+        throw new Error("stdin must not be touched when the env var is set");
+      },
+    } as unknown as NodeJS.ReadableStream & { isTTY?: boolean };
+
+    const token = await readResolveToken({
+      env: { PI_DESKTOP_RESOLVE_TOKEN: "from-env-var" } as NodeJS.ProcessEnv,
+      stdin: stdinThatMustNotBeTouched,
+    });
+    expect(token).toBe("from-env-var");
+  });
+
+  test("TTY stdin skips the read entirely and resolves null when the env var is unset", async () => {
+    const { readResolveToken } = await import("./index.js");
+    const fakeStdin = { isTTY: true } as unknown as NodeJS.ReadableStream & { isTTY?: boolean };
+
+    const token = await readResolveToken({ env: {} as NodeJS.ProcessEnv, stdin: fakeStdin });
+    expect(token).toBeNull();
+  });
+
+  test("reads one line from a piped (non-TTY) stdin, matching the packaged Rust stdin-handoff channel", async () => {
+    const { readResolveToken } = await import("./index.js");
+    const stream = Object.assign(new PassThrough(), { isTTY: false }) as unknown as NodeJS.ReadableStream & {
+      isTTY?: boolean;
+    };
+    (stream as unknown as PassThrough).end("piped-token-value\n");
+
+    const token = await readResolveToken({ env: {} as NodeJS.ProcessEnv, stdin: stream });
+    expect(token).toBe("piped-token-value");
+  });
+
+  test("bounded timeout resolves null (not hang) when non-TTY stdin never sends a line", async () => {
+    const { readResolveToken } = await import("./index.js");
+    const stream = Object.assign(new PassThrough(), { isTTY: false }) as unknown as NodeJS.ReadableStream & {
+      isTTY?: boolean;
+    };
+
+    const token = await readResolveToken({ env: {} as NodeJS.ProcessEnv, stdin: stream, timeoutMs: 50 });
+    expect(token).toBeNull();
+
+    (stream as unknown as PassThrough).end();
   });
 });
