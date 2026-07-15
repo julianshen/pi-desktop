@@ -619,6 +619,149 @@ describe("GET /api/conversations/:id/artifacts/:artifactId", () => {
   });
 });
 
+/**
+ * Task 5 (TASKS.md): the new Vercel AI SDK / Assistant UI chat route, wired
+ * alongside (not replacing yet) /agui. Real HTTP over app.listen(), same
+ * convention as every other describe block in this file.
+ *
+ * Driving a real turn end-to-end would require real provider auth this scratch
+ * test env never configures (agent/conversations.ts's createSession() ->
+ * getAgentDeps() -> real auth.json/model registry) -- these tests instead get a
+ * REAL AgentSession via getOrCreateSession() (same helper the route itself calls)
+ * and spy on its subscribe()/prompt() methods, same established pattern as the
+ * "PATCH /api/conversations/:id/model with an already-live cached session" block
+ * above (spyOn(session, "setModel")). Overriding subscribe() to capture the
+ * listener the adapter registers (rather than letting the real SDK's internal
+ * event bus drive it) lets prompt()'s mock implementation manually replay a
+ * controlled, conversation-specific sequence of pi session events through that
+ * exact listener -- proving the route's plumbing (getOrCreateSession ->
+ * handleAiSdkRun -> pipeUIMessageStreamToResponse) actually carries THIS
+ * conversation's session activity into the HTTP response, without needing a real
+ * model call.
+ */
+describe("POST /api/conversations/:id/chat", () => {
+  // `listener`/the events fed into it below are typed `any` deliberately: this test
+  // double drives ai-sdk/adapter.ts's PiSessionEvent shape (a narrower, hand-picked
+  // duck type — see that file's own doc comment) through the real SDK's
+  // AgentSessionEventListener slot, and those two types are related in neither
+  // direction under `tsc`'s strict structural check (same mismatch documented at
+  // index.ts's handleAiSdkRun() call site) — `any` here is the pragmatic escape
+  // hatch for a test double, not a production code path.
+  function stubSessionTurn(session: Awaited<ReturnType<typeof import("./agent/conversations.js").getOrCreateSession>>, replyText: string) {
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: replyText },
+      });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+    return { subscribeSpy, promptSpy };
+  }
+
+  // AC-5.1 [R]: Given a real HTTP POST to the new route for a given conversation
+  // id, when the request carries a valid AI-SDK-shaped body ({ messages:
+  // UIMessage[] }), then it receives a real AI-SDK-shaped UI message stream
+  // response reflecting that SPECIFIC conversation's actual AgentSession activity
+  // — proven here via two distinct conversations, each with its own stubbed
+  // session reply, confirming conversation A's response body carries only A's
+  // text and never B's (direct re-verification of wire-chat-backend's
+  // "Cross-conversation message isolation" catalog entry under the new
+  // transport, per TASKS.md's AC-5.1).
+  test("AC-5.1: two conversations' chat responses reflect only their own session activity", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+
+    const convA = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "chat route conversation A" }),
+      })
+    ).json()) as ConversationMeta;
+    const convB = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "chat route conversation B" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const sessionA = await getOrCreateSession(convA.id);
+    const sessionB = await getOrCreateSession(convB.id);
+    const { subscribeSpy: subscribeSpyA, promptSpy: promptSpyA } = stubSessionTurn(
+      sessionA,
+      "reply-only-for-conversation-A",
+    );
+    const { subscribeSpy: subscribeSpyB, promptSpy: promptSpyB } = stubSessionTurn(
+      sessionB,
+      "reply-only-for-conversation-B",
+    );
+
+    const chatBody = (text: string) =>
+      JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text }] }],
+      });
+
+    const resA = await fetch(`${baseUrl}/api/conversations/${convA.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: chatBody("hello from A"),
+    });
+    expect(resA.status).toBe(200);
+    const bodyA = await resA.text();
+    expect(bodyA).toContain("reply-only-for-conversation-A");
+    expect(bodyA).not.toContain("reply-only-for-conversation-B");
+
+    const resB = await fetch(`${baseUrl}/api/conversations/${convB.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: chatBody("hello from B"),
+    });
+    expect(resB.status).toBe(200);
+    const bodyB = await resB.text();
+    expect(bodyB).toContain("reply-only-for-conversation-B");
+    expect(bodyB).not.toContain("reply-only-for-conversation-A");
+
+    // Each conversation's own session.prompt() was driven with ITS request's
+    // extracted user text, not the other conversation's — the userText argument
+    // handleAiSdkRun forwards straight to session.prompt(text, ...) per
+    // ai-sdk/adapter.ts.
+    expect(promptSpyA).toHaveBeenCalledWith("hello from A", undefined);
+    expect(promptSpyB).toHaveBeenCalledWith("hello from B", undefined);
+
+    subscribeSpyA.mockRestore();
+    promptSpyA.mockRestore();
+    subscribeSpyB.mockRestore();
+    promptSpyB.mockRestore();
+  });
+
+  // AC-5.2 [R]: Given a malformed conversation id (path-traversal-style, matching
+  // assertSafeConversationId's existing convention), when the new route is
+  // called, then it returns 400 with no leaked stack trace — same convention as
+  // every other per-conversation route in this file (GET .../messages,
+  // .../artifacts/latest, .../artifacts/:artifactId above), re-verifying this bug
+  // class doesn't regress a third time under a brand-new route.
+  test("AC-5.2: malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] }] }),
+    });
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+});
+
 // Security-review finding (Critical, /tgd-review security-auditor): createApp() used
 // to mount `cors()` with no options, which is the `cors` package's wildcard default
 // (Access-Control-Allow-Origin: *). Combined with zero auth on any route, that let any

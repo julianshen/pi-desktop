@@ -2,9 +2,11 @@ import express, { type Express } from "express";
 import cors from "cors";
 import readline from "node:readline";
 import { timingSafeEqual } from "node:crypto";
+import { pipeUIMessageStreamToResponse, type UIMessage } from "ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
 import { handleAguiRun } from "./agui/adapter.js";
+import { handleAiSdkRun, type AgentSessionEventSource } from "./ai-sdk/adapter.js";
 import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
 import { settingsRouter } from "./settings/routes.js";
@@ -17,6 +19,7 @@ import {
   getConversationMessages,
   getLastTurnError,
   conversationCwd,
+  getOrCreateSession,
 } from "./agent/conversations.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
@@ -140,6 +143,32 @@ function tokensMatch(expected: string, actual: string): boolean {
   const actualBuf = Buffer.from(actual);
   if (expectedBuf.length !== actualBuf.length) return false;
   return timingSafeEqual(expectedBuf, actualBuf);
+}
+
+/**
+ * Task 5: the AI SDK's `UIMessage` shape (verified against the installed
+ * `ai@6.0.224` package's own types, `node_modules/ai/dist/index.d.ts:1580`)
+ * represents a message's content as `parts: Array<UIMessagePart<...>>`, NOT a
+ * plain string like AG-UI's `RunAgentInput` messages (`agui/adapter.ts`'s
+ * `extractLatestUserText` reads `message.content` directly) -- a text part is
+ * `{ type: 'text', text: string }` (index.d.ts:1609). Mirrors
+ * `extractLatestUserText`'s own logic: walk backward from the end of `messages`,
+ * return the first `role: "user"` message's text, joining that message's text
+ * parts (a message could in principle carry more than one, e.g. text interleaved
+ * with file parts) with a blank line. Returns "" for no user message or a user
+ * message with no text parts at all (e.g. attachment-only) -- same
+ * never-throw-on-a-plausible-but-empty-input convention as the AG-UI helper.
+ */
+function extractLatestUserTextFromUIMessages(messages: UIMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") continue;
+    return message.parts
+      .filter((part): part is Extract<UIMessage["parts"][number], { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n\n");
+  }
+  return "";
 }
 
 /**
@@ -446,11 +475,77 @@ export function createApp(options?: CreateAppOptions): Express {
   });
 
   // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
+  // Task 5 (TASKS.md): NOT removed yet -- the new route below is added ALONGSIDE this
+  // one; TASKS.md's own sequencing note says the old CopilotKit/AG-UI path stays until
+  // Task 8's frontend rebuild proves the new one works end-to-end, so there's never a
+  // window with no working chat at all.
   app.post("/agui", express.json({ limit: "10mb" }), (req, res) => {
     handleAguiRun(req, res).catch((error: unknown) => {
       console.error("[agui] unhandled error", error);
       if (!res.headersSent) res.status(500).end();
     });
+  });
+
+  // Task 5 (AC-5.1/AC-5.2): the new Vercel AI SDK / Assistant UI chat route, replacing
+  // /agui once Task 8's frontend proves it out. Per-conversation-scoped via the URL
+  // path param (SPEC.md's API Contract explicitly rules out a single global /api/chat
+  // endpoint, matching /agui's existing threadId-scoped precedent and every other
+  // per-conversation route in this file) -- Assistant UI's transport
+  // (`AssistantChatTransport`) is configured with a per-conversation `api` URL, so
+  // this shape composes directly with Task 6's eventual frontend wiring without a
+  // conversationId body field to trust/validate separately.
+  //
+  // Body shape: `{ messages: UIMessage[] }`, the AI SDK's own standard chat request
+  // body (verified against the installed `ai@6.0.224` package's own `UIMessage`
+  // export, node_modules/ai/dist/index.d.ts:1580 -- content is `parts: Array<...>`,
+  // not a plain string; see extractLatestUserTextFromUIMessages() above for the
+  // exact extraction, mirroring agui/adapter.ts's extractLatestUserText for the
+  // AG-UI shape).
+  //
+  // getOrCreateSession(id) rejects (not throws synchronously) for a malformed id --
+  // createSession() is an `async function`, so conversationCwd()'s synchronous throw
+  // (assertSafeConversationId, agent/conversations.ts) is captured into the returned
+  // promise's rejection rather than escaping synchronously. That's why this route
+  // uses the same async .catch() convention as GET /api/conversations/:id/messages
+  // and GET /api/conversations/:id/last-error above (both of which reject via the
+  // exact same code path), not the synchronous try/catch convention used by the
+  // .../artifacts/latest routes (whose getLatestArtifact()/getArtifactById() call
+  // conversationCwd() directly, outside any Promise chain, so IT throws
+  // synchronously instead). Same "Invalid conversation id" message-prefix check,
+  // same 400-no-stack-trace-leaked / 500-logged-first split.
+  app.post("/api/conversations/:id/chat", express.json({ limit: "10mb" }), (req, res) => {
+    getOrCreateSession(req.params.id)
+      .then((session) => {
+        const body = req.body as { messages?: UIMessage[] } | undefined;
+        const messages = Array.isArray(body?.messages) ? body.messages : [];
+        const userText = extractLatestUserTextFromUIMessages(messages);
+        // ai-sdk/adapter.ts's own doc comment claims a real AgentSession "structurally
+        // satisfies AgentSessionEventSource ... with no adapter shape changes" needed
+        // to wire it in here -- true at the RUNTIME level (the adapter's switch only
+        // ever reads the handful of fields PiSessionEvent models, and pi's real
+        // AgentSessionEvent variants carry those same fields, just with additional
+        // ones the adapter never touches), but NOT true under `tsc --noEmit`'s strict
+        // structural check: pi's real `AgentSessionEvent` union has extra variants
+        // (`agent_start`, `queue_update`, etc., see
+        // node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts)
+        // with no PiSessionEvent counterpart, and its `message`-carrying variants use
+        // pi's own richer `AgentMessage` type rather than this adapter's intentionally
+        // loose duck-typed `AssistantMessage` -- so neither the covariant nor the
+        // contravariant half of TS's listener-parameter check succeeds outright. Route
+        // wiring (this file, Task 5's actual scope) is the right place for this cast,
+        // not adapter.ts (out of scope here, and its own module doc already documents
+        // the intended duck-typed contract in detail).
+        const stream = handleAiSdkRun(session as unknown as AgentSessionEventSource, userText, req.params.id);
+        pipeUIMessageStreamToResponse({ response: res, stream });
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && error.message.startsWith("Invalid conversation id")) {
+          res.status(400).end();
+          return;
+        }
+        console.error("[api/conversations/:id/chat] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
   });
 
   // Settings routes (provider status, connect/disconnect, model selection). Mounted as its
