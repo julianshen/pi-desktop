@@ -55,9 +55,33 @@ pub async fn render_url_headless(
     let label = format!("web-fetch-render-{}-{}", std::process::id(), seq);
     let event_name = format!("web-fetch:rendered:{label}");
 
+    // Captured before `parsed` is moved into `WebviewUrl::External` below, so
+    // `on_navigation` can compare every later navigation's host against the
+    // one already gated by the approval flow before this command ever ran.
+    let original_host = parsed.host_str().map(str::to_owned);
+
     let window = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed))
         .visible(false) // must never flash on screen
         .initialization_script(&build_init_script(&event_name))
+        // REVIEW.md finding #7: contain the hidden webview to the originally
+        // requested host. Without this, a server-side redirect or
+        // client-side JS navigation inside the rendered page could freely
+        // reach a private/internal address *after* `classifyTarget()` (on
+        // the TypeScript side, in server/src/web-fetch/safety.ts) already
+        // approved only the original URL — the same class of gap as the
+        // plain-fetch redirect bypass, just via a real browser engine
+        // instead of `fetch()`.
+        //
+        // This is a deliberately narrow same-host check, not a second
+        // implementation of `classifyTarget()`'s IP-range classification
+        // logic in Rust: duplicating that logic across two languages would
+        // just be a second place for the two to drift out of sync, and the
+        // render fallback never had a legitimate reason to hop to an
+        // unrelated host mid-render anyway. The original URL's own
+        // public/private classification already happened on the TypeScript
+        // side before this command was ever invoked; this handler's only job
+        // is making sure the webview stays on that same host once inside.
+        .on_navigation(move |dest| is_same_host(original_host.as_deref(), dest.host_str()))
         .build()
         .map_err(|e| format!("failed to create hidden render window: {e}"))?;
 
@@ -129,4 +153,63 @@ fn build_init_script(event_name: &str) -> String {
         event_name = event_name,
         settle_delay = SETTLE_DELAY_MS,
     )
+}
+
+/// Pure host-comparison logic backing `render_url_headless`'s
+/// `on_navigation` handler (REVIEW.md finding #7). Extracted so it's
+/// testable without a real webview/`MockRuntime`, unlike the window-lifecycle
+/// behavior this file otherwise documents as untestable (AC-9.2).
+///
+/// `None` for `original_host` (which shouldn't happen in practice — the
+/// scheme check above guarantees an absolute `http`/`https` URL, which always
+/// has a host) is treated as "reject everything," not "allow everything" —
+/// fail closed rather than fail open.
+fn is_same_host(original_host: Option<&str>, dest_host: Option<&str>) -> bool {
+    original_host.is_some() && original_host == dest_host
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_same_host;
+
+    #[test]
+    fn allows_the_initial_navigation_to_the_original_host() {
+        assert!(is_same_host(Some("example.com"), Some("example.com")));
+    }
+
+    #[test]
+    fn rejects_navigation_to_a_different_host() {
+        assert!(!is_same_host(Some("example.com"), Some("attacker.example")));
+    }
+
+    #[test]
+    fn rejects_navigation_to_a_different_subdomain() {
+        // Same-host, not same-site: a subdomain is a plain string mismatch
+        // here, deliberately, matching this function's "no IP/domain
+        // classification, just a literal comparison" design.
+        assert!(!is_same_host(Some("example.com"), Some("evil.example.com")));
+    }
+
+    #[test]
+    fn rejects_when_the_destination_has_no_host() {
+        assert!(!is_same_host(Some("example.com"), None));
+    }
+
+    #[test]
+    fn fails_closed_when_the_original_host_is_missing() {
+        // Should not happen in practice (see doc comment), but must not
+        // silently allow every navigation if it ever does.
+        assert!(!is_same_host(None, Some("example.com")));
+        assert!(!is_same_host(None, None));
+    }
+
+    #[test]
+    fn is_case_sensitive_matching_url_host_str_normalization() {
+        // `url::Url::host_str()` already lowercases hostnames during
+        // parsing, so both sides of this comparison are pre-normalized by
+        // the time they reach this function — this test documents that
+        // assumption rather than re-implementing normalization here.
+        assert!(is_same_host(Some("example.com"), Some("example.com")));
+        assert!(!is_same_host(Some("Example.com"), Some("example.com")));
+    }
 }
