@@ -19,6 +19,8 @@
     "test": "bun test ./src"
   },
   "dependencies": {
+    "@assistant-ui/react": "^0.14.26",
+    "@assistant-ui/react-ai-sdk": "^1.3.40",
     "@copilotkit/react-core": "^1.62.3",
     "@copilotkit/react-ui": "^1.62.3",
     "@copilotkit/runtime-client-gql": "^1.62.3",
