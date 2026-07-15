@@ -7,7 +7,7 @@
     "server"
   ],
   "scripts": {
-    "dev": "concurrently -n web,server -c blue,green \"vite\" \"npm run dev -w server\"",
+    "dev": "bun scripts/dev-with-token.ts",
     "build": "tsc && vite build && npm run build -w server",
     "preview": "vite preview",
     "tauri": "tauri",
