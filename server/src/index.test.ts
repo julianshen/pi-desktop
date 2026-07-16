@@ -5,7 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PassThrough } from "node:stream";
 import type { Server } from "node:http";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelRegistry, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ConversationMeta } from "./agent/conversations.js";
 
@@ -759,6 +759,282 @@ describe("POST /api/conversations/:id/chat", () => {
     const text = await res.text();
     expect(text).not.toContain("at ");
     expect(text).not.toContain(".ts:");
+  });
+});
+
+// Task 13 (TASKS.md) / ADR-002-tool-approval-trust-boundary.md: regression-confirmation,
+// not a rebuild. ADR-002's Finding 3 claims `web_fetch`'s `ctx.ui.confirm()` pause
+// mechanism (`web-fetch/tools.ts`, `web-fetch/pending-interactions.ts`) is
+// protocol-agnostic Pi Agent plumbing that predates AG-UI/CopilotKit and needs ZERO
+// changes to work under the new AI-SDK-shaped chat route — this describe block proves
+// that claim end-to-end against the real, fully-migrated stack, rather than assuming it
+// from the ADR's own reasoning (this task's whole reason to exist).
+//
+// This is the ONLY suitable home for this test (over ai-sdk/adapter.test.ts): AC-13.1
+// requires driving a REAL HTTP POST against the REAL `/api/conversations/:id/chat`
+// route (Task 5) and resolving the pause via a REAL, authenticated HTTP call to the
+// already-merged `POST .../pending-interaction/:interactionId/resolve` endpoint
+// (`f503f55`, ADR-001's `X-Resolve-Token` mechanism) — adapter.test.ts's own
+// `handleAiSdkRun()` unit tests never spin up an Express app or issue real HTTP
+// requests at all (see that file's `makeStubSession`/`collectChunks` helpers), so it
+// cannot exercise the resolve endpoint's auth check or the route-to-adapter wiring
+// this task is specifically asked to re-verify. This file already has every other
+// piece the test needs (a real `app.listen()` instance, `TEST_RESOLVE_TOKEN`, the real
+// `getOrCreateSession()`).
+//
+// The ONE deliberate stub is `session.subscribe()`/`session.prompt()` itself — same
+// convention as the "POST /api/conversations/:id/chat" describe block above. Pi's own
+// model-calling loop (the part that would normally *decide* to call `web_fetch`) is
+// out of this migration's scope entirely (SPEC.md's "Never" boundary: this app never
+// reimplements or drives pi's own agentic loop) — these tests hand-drive the exact
+// `tool_execution_start`/`tool_execution_end` event pair pi's real engine emits around
+// a single tool call. Everything AFTER that point is 100% real, unstubbed production
+// code: the actual `web_fetch` `AgentTool` (`createWebFetchTools`), its real
+// `classifyTarget()`/`plainFetch()` gate, the real `pending-interactions.ts` registry
+// (including its Task-4 creation-notification hook), the real `ai-sdk/adapter.ts`
+// translation, and the real, authenticated HTTP resolve endpoint — the entire chain
+// ADR-002 claims needs zero changes.
+describe("Task 13: web_fetch / ctx.ui.confirm() full chain through the new AI SDK chat route (ADR-002 regression confirmation)", () => {
+  // A loopback target on a port nothing listens on. Chosen deliberately over stubbing
+  // `globalThis.fetch` (as web-fetch/tools.test.ts does): this file's OWN tests rely on
+  // the real, unstubbed `fetch()` to talk to `baseUrl` throughout, so overriding it here
+  // would risk breaking every other test in this file if not perfectly scoped/restored.
+  // A closed loopback port instead gets a real, near-instant ECONNREFUSED from the OS
+  // (verified directly: `curl --max-time 3 http://127.0.0.1:9/x` returns in ~20ms) — no
+  // real network access needed, fully deterministic, and it exercises the REAL
+  // `plainFetch()` network call end-to-end rather than a fake one.
+  const PRIVATE_URL = "http://127.0.0.1:9/private-page";
+
+  /** Waits for `getPending(conversationId)` to become non-undefined — same convention as web-fetch/tools.test.ts's own waitForPending(). */
+  async function waitForPending(conversationId: string, getPending: (id: string) => unknown, timeoutMs = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const pending = getPending(conversationId);
+      if (pending) return pending as { id: string; kind: string; host?: string };
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`timed out waiting for a pending interaction for conversation ${conversationId}`);
+  }
+
+  /** Real ctx.ui.confirm(), wired to the real pending-interactions.ts registry — mirrors web-fetch/tools.test.ts's own buildRealConfirmContext() (a local, unexported helper there, so duplicated here rather than imported). */
+  function buildRealConfirmContext(
+    conversationId: string,
+    createPendingInteraction: typeof import("./web-fetch/pending-interactions.js").create,
+  ): ExtensionContext {
+    return {
+      ui: {
+        confirm: async (_title: string, message: string, opts?: { timeout?: number }) => {
+          const { promise } = createPendingInteraction(conversationId, {
+            conversationId,
+            kind: "confirm",
+            host: message,
+            timeoutMs: opts?.timeout ?? 5000,
+          });
+          const result = await promise;
+          return result.kind === "confirm" ? result.approved : false;
+        },
+      },
+    } as unknown as ExtensionContext;
+  }
+
+  // AC-13.1 [R], approve direction — covers points 1, 2, 3, and 4 of the acceptance
+  // criteria in one real end-to-end run: pauses exactly as today; a
+  // `tool-approval-request` chunk appears in the AI SDK stream; the fetch does not
+  // proceed until the real resolve endpoint resolves it; and once resolved,
+  // `ctx.ui.confirm()` unblocks, `tool_execution_end` fires, and the result reaches the
+  // stream as `tool-output-available` with zero "continuation injection" code anywhere.
+  test("AC-13.1: private-target web_fetch pauses, surfaces tool-approval-request, and only completes once the real resolve endpoint approves it", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const { createWebFetchTools } = await import("./web-fetch/tools.js");
+    const { create: createPendingInteraction, getPending } = await import("./web-fetch/pending-interactions.js");
+
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "web_fetch approval chain (approve)" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const session = await getOrCreateSession(created.id);
+    const [webFetch] = createWebFetchTools(created.id, "interactive");
+    const ctx = buildRealConfirmContext(created.id, createPendingInteraction);
+
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "tool_execution_start",
+        toolCallId: "call-web-fetch-1",
+        toolName: "web_fetch",
+        args: { url: PRIVATE_URL },
+      });
+      // The REAL web_fetch execute() — this is where it actually calls
+      // ctx.ui.confirm() above, creating a REAL pending interaction and pausing this
+      // promise (and therefore this whole prompt() call, and therefore the /chat
+      // response below) until the test resolves it over real HTTP further down.
+      const result = await webFetch.execute("call-web-fetch-1", { url: PRIVATE_URL }, undefined, undefined, ctx);
+      listener({ type: "tool_execution_end", toolCallId: "call-web-fetch-1", result });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+
+    // Fire the real HTTP request against the real route, but do NOT await its body
+    // yet — execute() above is paused on ctx.ui.confirm() at this point, so the
+    // response cannot complete until this test resolves the pending interaction
+    // below (point 3: "the fetch does not proceed until the resolve endpoint...").
+    const chatPromise = fetch(`${baseUrl}/api/conversations/${created.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: `please fetch ${PRIVATE_URL}` }] }],
+      }),
+    });
+
+    // Point 1: it pauses exactly as it does today — proven by polling the REAL
+    // pending-interactions.ts registry directly (independent of whatever the AI SDK
+    // stream itself carries) for the confirm interaction ctx.ui.confirm() just created.
+    const pending = await waitForPending(created.id, getPending);
+    expect(pending.kind).toBe("confirm");
+    expect(pending.host).toContain(new URL(PRIVATE_URL).href);
+
+    // Point 3: resolve it via the REAL, authenticated HTTP endpoint (Task 11's
+    // already-merged route, commit f503f55) — not by calling
+    // pending-interactions.ts's resolve() directly, since the point of this test is to
+    // prove the HTTP endpoint itself is what unblocks ctx.ui.confirm().
+    const resolveRes = await fetch(
+      `${baseUrl}/api/conversations/${created.id}/pending-interaction/${pending.id}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(resolveRes.status).toBe(200);
+    expect(await resolveRes.json()).toEqual({ resolved: true });
+
+    // Point 4: now the /chat request can complete — ctx.ui.confirm() unblocked,
+    // web_fetch.execute() resumed (attempting a real loopback connection to a closed
+    // port: an immediate ECONNREFUSED, no real network access required), the real
+    // tool_execution_end fired, and ai-sdk/adapter.ts's PRE-EXISTING (Task 3)
+    // tool_execution_end -> tool-output-available translation carried the result into
+    // the stream — zero new "continuation injection" logic anywhere, per ADR-002
+    // Finding 3.
+    const chatRes = await chatPromise;
+    expect(chatRes.status).toBe(200);
+    const body = await chatRes.text();
+
+    // Point 2: a tool-approval-request chunk appeared, correlated to the real pending
+    // interaction's id and the real tool call's id (ADR-002 Decision point 4).
+    expect(body).toContain('"type":"tool-approval-request"');
+    expect(body).toContain(`"approvalId":"${pending.id}"`);
+    expect(body).toContain('"toolCallId":"call-web-fetch-1"');
+
+    // The literal, unparaphrased URL argument is visible via tool-input-available
+    // (ADR-002 Decision point 4's "never paraphrase" improvement).
+    expect(body).toContain('"type":"tool-input-available"');
+    expect(body).toContain(PRIVATE_URL);
+
+    // The real (fetch-failed, since nothing listens on the target port) result made it
+    // through as an ordinary tool-output-available part — the specific outcome doesn't
+    // matter here, only that SOME real result flowed through with no special-casing.
+    expect(body).toContain('"type":"tool-output-available"');
+    expect(body).toContain('"toolCallId":"call-web-fetch-1"');
+    expect(body).toContain('"ok":false');
+    expect(body).toContain('"reason":"fetch-failed"');
+
+    // The pending interaction is gone from the registry once settled (no leak).
+    expect(getPending(created.id)).toBeUndefined();
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
+  // AC-13.1 [R], deny direction — re-verifies web-fetch/TASKS.md's original
+  // denied-confirmation criteria under the fully migrated stack. ADR-002 Finding 3:
+  // a denied confirm does NOT throw — execute() resolves normally with an explicit
+  // { ok: false, reason: "not-approved" } result, so pi's own tool_execution_end fires
+  // exactly as it does for a successful fetch, and Task 3's translation needs no
+  // special-casing for the denial path either.
+  test("AC-13.1: denying the approval resolves web_fetch with an explicit not-approved result, still delivered via tool-output-available", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const { createWebFetchTools } = await import("./web-fetch/tools.js");
+    const { create: createPendingInteraction, getPending } = await import("./web-fetch/pending-interactions.js");
+
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "web_fetch approval chain (deny)" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const session = await getOrCreateSession(created.id);
+    const [webFetch] = createWebFetchTools(created.id, "interactive");
+    const ctx = buildRealConfirmContext(created.id, createPendingInteraction);
+
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "tool_execution_start",
+        toolCallId: "call-web-fetch-2",
+        toolName: "web_fetch",
+        args: { url: PRIVATE_URL },
+      });
+      const result = await webFetch.execute("call-web-fetch-2", { url: PRIVATE_URL }, undefined, undefined, ctx);
+      listener({ type: "tool_execution_end", toolCallId: "call-web-fetch-2", result });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+
+    const chatPromise = fetch(`${baseUrl}/api/conversations/${created.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: `please fetch ${PRIVATE_URL}` }] }],
+      }),
+    });
+
+    const pending = await waitForPending(created.id, getPending);
+    expect(pending.kind).toBe("confirm");
+
+    const resolveRes = await fetch(
+      `${baseUrl}/api/conversations/${created.id}/pending-interaction/${pending.id}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: false }),
+      },
+    );
+    expect(resolveRes.status).toBe(200);
+
+    const chatRes = await chatPromise;
+    expect(chatRes.status).toBe(200);
+    const body = await chatRes.text();
+
+    expect(body).toContain('"type":"tool-approval-request"');
+    expect(body).toContain('"type":"tool-output-available"');
+    expect(body).toContain('"ok":false');
+    expect(body).toContain('"reason":"not-approved"');
+    // Denial must short-circuit BEFORE any network attempt — never "proceed to fetch
+    // anyway" (the exact regression this whole approval gate exists to prevent).
+    expect(body).not.toContain('"reason":"fetch-failed"');
+
+    expect(getPending(created.id)).toBeUndefined();
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
   });
 });
 
