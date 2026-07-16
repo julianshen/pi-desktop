@@ -52,6 +52,40 @@ fn get_resolve_token(state: tauri::State<ResolveTokenState>) -> String {
     }
 }
 
+/// The window is frameless (`decorations: false` in tauri.conf.json) — these
+/// three commands are what `TitleBar.tsx`'s custom traffic-light dots actually
+/// call, replacing the real OS window-chrome buttons they visually stand in
+/// for (rather than being a non-functional copy of them, which is what this
+/// app shipped with before).
+///
+/// `Window::close()` (not `.destroy()`) emits a real `WindowEvent::CloseRequested`
+/// first, exactly like a user clicking a native close button — so the red dot
+/// reaches the same `on_window_event` handler below that already intercepts
+/// that event and hides to tray instead of quitting, with no hide-to-tray
+/// logic duplicated here.
+#[tauri::command]
+fn window_close(window: tauri::Window) -> Result<(), String> {
+    window.close().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn window_minimize(window: tauri::Window) -> Result<(), String> {
+    window.minimize().map_err(|e| e.to_string())
+}
+
+/// Green dot: maximize/restore toggle — not fullscreen. Simpler and more
+/// predictable than macOS's usual "green = fullscreen" convention for this
+/// app's small utility-window footprint.
+#[tauri::command]
+fn window_toggle_maximize(window: tauri::Window) -> Result<(), String> {
+    let is_maximized = window.is_maximized().map_err(|e| e.to_string())?;
+    if is_maximized {
+        window.unmaximize().map_err(|e| e.to_string())
+    } else {
+        window.maximize().map_err(|e| e.to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 256-bit-ish randomness, generated once per app launch, held only in
@@ -162,7 +196,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             web_fetch::render_url_headless,
-            get_resolve_token
+            get_resolve_token,
+            window_close,
+            window_minimize,
+            window_toggle_maximize
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
