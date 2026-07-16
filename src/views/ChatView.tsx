@@ -10,6 +10,7 @@ import { Thread } from "../components/chat/Thread";
 import { Blueprint } from "../components/Blueprint";
 import { FileIcon } from "../components/icons";
 import { API_BASE } from "../state/apiBase.js";
+import { ConversationIdContext } from "../lib/conversationIdContext.js";
 
 const ERROR_DISPLAY_MAX_LENGTH = 300;
 
@@ -370,13 +371,20 @@ export function ChatView({
   // approval" state, a poll of the interaction-resolution endpoint, and
   // Approve/Deny buttons posting a decision back — is deliberately NOT ported
   // here. It's replaced by Task 12's ApprovalRequest component (rendered from
-  // Task 7's Message.tsx via its own `// TODO(Task 12)` marker), not this
-  // file's job to rebuild.
+  // Task 7's Message.tsx's ToolFallback dispatch), not this file's job to
+  // rebuild. `ConversationIdContext.Provider` below is the one piece of
+  // wiring Task 12 does need from this file: `ApprovalRequest` (several
+  // component layers below `<Thread />`, inside `Message.tsx`) needs
+  // `conversationId` to build Task 11's resolve-endpoint URL, and this is the
+  // only place in the tree that has it — see conversationIdContext.ts's own
+  // doc comment for why a context, not a threaded prop.
 
   return (
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <div style={{ flex: 1, minHeight: 0 }}>
-        <Thread />
+        <ConversationIdContext.Provider value={conversationId}>
+          <Thread />
+        </ConversationIdContext.Provider>
       </div>
 
       {!isRunning && error && (

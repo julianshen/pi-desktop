@@ -28,6 +28,7 @@ import {
 } from "@assistant-ui/react";
 import { StreamdownTextPrimitive } from "@assistant-ui/react-streamdown";
 import { code as streamdownCodePlugin } from "@streamdown/code";
+import { ApprovalRequest } from "./ApprovalRequest";
 
 /**
  * Task 9 (assistant-ui-migration/TASKS.md, AC-9.1/AC-9.2/AC-9.3): real
@@ -138,24 +139,39 @@ const MessageText: TextMessagePartComponent = () => {
  * view of its arguments/result — matching this app's existing "never
  * paraphrase a tool's real input" convention (see `web-fetch/SPEC.md`).
  *
- * TODO(Task 12): render `tool-approval-request` parts (`part.approval` set,
- * `part.approval.approved === undefined`) via the `ApprovalRequest` component
- * instead of this generic fallback — this is the "obvious insertion point"
- * TASKS.md's Task 7 section calls for. `ApprovalRequest` will correlate the
- * literal target off this same part's `args`/`argsText` (carried here as
- * `toolArgsText` below), matching by `toolCallId`, per ADR-002 Decision point 4.
+ * Task 12: a tool-call part carrying a still-pending `approval` (`part.approval`
+ * set, `part.approval.approved === undefined`, `part.approval.resolution`
+ * unset) dispatches to `ApprovalRequest` instead of the generic view below —
+ * the "obvious insertion point" TASKS.md's Task 7 section called for.
+ * `result === undefined` is included in the check as well: per
+ * ADR-002-tool-approval-trust-boundary.md's Finding 3, resolving the approval
+ * does NOT touch this part's `approval` field (there is no
+ * `tool-approval-response`-shaped chunk in this app's wire protocol at all) —
+ * the ONLY signal that the underlying `web_fetch` call has actually resumed
+ * and finished is its ordinary `result` arriving via `tool-output-available`.
+ * Without this second check the approval UI would keep rendering forever
+ * after a real resolution, racing the eventual real result. `args`/`toolCallId`
+ * (not the full props object, which also carries `respondToApproval` — see
+ * `ApprovalRequest.tsx`'s header comment for why that matters) are all
+ * `ApprovalRequest` receives.
  */
-const ToolFallback: ToolCallMessagePartComponent = ({ toolName, argsText, result }) => (
-  <div className="blueprint flex flex-col gap-ds-1 bg-surface p-ds-3 font-body text-[13px] text-text">
-    <span className="font-heading text-[11px] uppercase tracking-[0.08em] text-accent">{toolName}</span>
-    {argsText && <pre className="whitespace-pre-wrap break-words text-text/80">{argsText}</pre>}
-    {result !== undefined && (
-      <pre className="whitespace-pre-wrap break-words border-t border-divider pt-ds-1 text-text/70">
-        {typeof result === "string" ? result : JSON.stringify(result, null, 2)}
-      </pre>
-    )}
-  </div>
-);
+const ToolFallback: ToolCallMessagePartComponent = ({ toolName, argsText, result, approval, toolCallId, args }) => {
+  if (approval && approval.approved === undefined && !approval.resolution && result === undefined) {
+    return <ApprovalRequest approvalId={approval.id} toolCallId={toolCallId} args={args} />;
+  }
+
+  return (
+    <div className="blueprint flex flex-col gap-ds-1 bg-surface p-ds-3 font-body text-[13px] text-text">
+      <span className="font-heading text-[11px] uppercase tracking-[0.08em] text-accent">{toolName}</span>
+      {argsText && <pre className="whitespace-pre-wrap break-words text-text/80">{argsText}</pre>}
+      {result !== undefined && (
+        <pre className="whitespace-pre-wrap break-words border-t border-divider pt-ds-1 text-text/70">
+          {typeof result === "string" ? result : JSON.stringify(result, null, 2)}
+        </pre>
+      )}
+    </div>
+  );
+};
 
 const MessageErrorBanner: FC = () => (
   <MessagePrimitive.Error>
