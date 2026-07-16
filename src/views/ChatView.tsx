@@ -690,11 +690,6 @@ export function ChatView({
               </div>
             </div>
           </Blueprint>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", marginTop: 9, padding: "0 2px" }}>
-            <span style={{ fontSize: 11, color: "color-mix(in srgb, var(--color-text) 42%, transparent)" }}>
-              Powered by <strong style={{ fontFamily: "var(--font-heading)", color: "var(--color-accent-800)" }}>CopilotKit</strong>
-            </span>
-          </div>
         </div>
       </div>
     </div>
