@@ -85,14 +85,20 @@ describe("Message (Task 7, AC-7.1)", () => {
     expect(wrapper.className).not.toContain("bg-accent");
   });
 
-  test("message text carries the font-body utility, not a hardcoded font stack", async () => {
-    renderMessages([{ role: "assistant", content: "Formatted later by Task 9" }]);
+  test("message text renders inside the font-body-classed wrapper (inherited, not hardcoded per element)", async () => {
+    const { container } = renderMessages([{ role: "assistant", content: "Rendered by Task 9" }]);
 
-    const paragraph = await waitFor(() => screen.getByText("Formatted later by Task 9"));
+    const paragraph = await waitFor(() => screen.getByText("Rendered by Task 9"));
     expect(paragraph.tagName).toBe("P");
-    expect(paragraph.className).toContain("font-body");
-    // TODO(Task 9) is a plain-text placeholder for now — never literal markdown syntax leaking through untouched.
-    expect(paragraph.textContent).toBe("Formatted later by Task 9");
+    // Task 9 replaced the Task 7 plain-`<p className="font-body ...">`
+    // placeholder with Streamdown's own paragraph renderer, which carries no
+    // class of its own (verified against the installed `streamdown`
+    // package's compiled output) — `font-body`/text size/color are inherited
+    // from the message's wrapper div instead, asserted directly below.
+    expect(paragraph.className).toBe("");
+    const wrapper = container.querySelector('[data-role="assistant"] > div');
+    expect(wrapper?.className).toContain("font-body");
+    expect(paragraph.textContent).toBe("Rendered by Task 9");
   });
 
   test("a tool-call part renders via the Blueprint-bordered ToolFallback with the literal tool name and args, not a shadcn card", async () => {
@@ -117,6 +123,114 @@ describe("Message (Task 7, AC-7.1)", () => {
     const fallback = container.querySelector(".blueprint");
     expect(fallback).toBeTruthy();
     expect(fallback?.className).toContain("bg-surface");
+  });
+});
+
+describe("Message markdown rendering (Task 9, AC-9.1/AC-9.2/AC-9.3)", () => {
+  test("AC-9.1: a heading, a list, bold text, and a fenced code block with a language tag render as real formatted HTML, with the code block syntax-highlighted", async () => {
+    const markdown = [
+      "# Heading",
+      "",
+      "- item one",
+      "- item two",
+      "",
+      "**bold text**",
+      "",
+      "```ts",
+      "const x = 1;",
+      "```",
+    ].join("\n");
+
+    const { container } = renderMessages([{ role: "assistant", content: markdown }]);
+
+    await waitFor(() => expect(screen.getByText("Heading")).toBeTruthy());
+
+    // Real formatted HTML elements — not literal `#`/`-`/`**`/`` ``` `` characters.
+    expect(container.querySelector("h1")?.textContent).toBe("Heading");
+    expect(container.querySelectorAll("li").length).toBe(2);
+    expect(container.querySelector('[data-streamdown="strong"]')?.textContent).toBe("bold text");
+    expect(container.textContent).not.toContain("**bold text**");
+    expect(container.textContent).not.toContain("# Heading");
+
+    // Syntax-highlighted code: Shiki tokenizes the fenced block into multiple
+    // per-token `<span>`s carrying real resolved hex colors via the
+    // `--sdm-c` custom property (not the library's unresolved `inherit`
+    // placeholder it renders before highlighting settles) — same
+    // DOM-structure-over-single-getByText-match approach
+    // `ArtifactCanvas.test.tsx`'s Task 10 tests use for this exact
+    // "Shiki splits code into many spans" wrinkle. Waits for the async
+    // highlight pass, which isn't synchronous with the initial render.
+    await waitFor(() => {
+      const codeSpans = container.querySelectorAll('pre code span[style*="--sdm-c"]');
+      expect(codeSpans.length).toBeGreaterThan(1);
+      const hasRealTokenColor = Array.from(codeSpans).some((el) =>
+        /--sdm-c:\s*#/i.test(el.getAttribute("style") ?? ""),
+      );
+      expect(hasRealTokenColor).toBe(true);
+    });
+    expect(container.textContent).toContain("const x = 1;");
+  });
+
+  test("AC-9.2: a user's own sent message with markdown syntax gets the same formatting treatment as an assistant message", async () => {
+    const markdown = "# User heading\n\n**bold from the user**";
+    const { container } = renderMessages([{ role: "user", content: markdown }]);
+
+    await waitFor(() => expect(screen.getByText("User heading")).toBeTruthy());
+
+    const root = container.querySelector('[data-role="user"]');
+    expect(root?.querySelector("h1")?.textContent).toBe("User heading");
+    expect(root?.querySelector('[data-streamdown="strong"]')?.textContent).toBe("bold from the user");
+    expect(container.textContent).not.toContain("**bold from the user**");
+    expect(container.textContent).not.toContain("# User heading");
+  });
+
+  // AC-9.3 — the core reason Streamdown was chosen over a static markdown
+  // renderer: a still-streaming message (`status: { type: "running" }`,
+  // matching `ThreadMessageLike`'s real shape) with genuinely incomplete
+  // markdown at the tail — where a live response is actively mid-token —
+  // must render cleanly at that intermediate state, never showing raw
+  // unterminated syntax. (An unclosed marker earlier in an *already-closed*
+  // block, followed by more text, is correctly left as literal text by
+  // CommonMark itself — not a streaming glitch — so both cases below place
+  // the incomplete syntax at the very end of `content`, mirroring how a
+  // real token-by-token stream would still be mid-line there.)
+  describe("AC-9.3: still-streaming (incomplete) markdown never shows raw unterminated syntax", () => {
+    test("an unclosed bold marker at the tail renders as real bold, not a literal `**`", async () => {
+      const { container } = renderMessages([
+        {
+          role: "assistant",
+          content: "Some emphasis: **this is bold and still typ",
+          status: { type: "running" },
+        },
+      ]);
+
+      await waitFor(() => expect(screen.getByText(/Some emphasis/)).toBeTruthy());
+
+      expect(container.querySelector('[data-status="running"]')).toBeTruthy();
+      const strong = container.querySelector('[data-streamdown="strong"]');
+      expect(strong?.textContent).toBe("this is bold and still typ");
+      expect(container.textContent).not.toContain("**");
+    });
+
+    test("an unterminated fenced code block at the tail renders as a real code block, not literal backticks", async () => {
+      const { container } = renderMessages([
+        {
+          role: "assistant",
+          content: "Here's the fix:\n\n```ts\nfunction foo() {\n  return 1;\n",
+          status: { type: "running" },
+        },
+      ]);
+
+      await waitFor(() => expect(screen.getByText(/Here's the fix/)).toBeTruthy());
+
+      const codeBlock = container.querySelector('[data-streamdown="code-block"]');
+      expect(codeBlock).toBeTruthy();
+      // Streamdown's own marker for "this fence hasn't closed yet" — the
+      // block still renders as real code, it just knows it's not finished.
+      expect(codeBlock?.getAttribute("data-incomplete")).toBe("true");
+      expect(container.textContent).not.toContain("```");
+      expect(container.textContent).toContain("function foo()");
+    });
   });
 });
 

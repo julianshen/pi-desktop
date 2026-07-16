@@ -17,32 +17,120 @@
  * Radix collapsible/dialog primitives (and their own CSS keyframes) that
  * `design-system.css` doesn't define and this task has no mandate to add.
  */
-import type { FC } from "react";
+import { useRef, type FC } from "react";
 import {
   ErrorPrimitive,
   MessagePrimitive,
   useAuiState,
+  useMessagePartText,
   type TextMessagePartComponent,
   type ToolCallMessagePartComponent,
 } from "@assistant-ui/react";
+import { StreamdownTextPrimitive } from "@assistant-ui/react-streamdown";
+import { code as streamdownCodePlugin } from "@streamdown/code";
 
 /**
- * Renders a message's plain-text content.
+ * Task 9 (assistant-ui-migration/TASKS.md, AC-9.1/AC-9.2/AC-9.3): real
+ * markdown rendering for a message's text content, for both assistant AND
+ * user messages alike (`markdown-rendering/PRD.md`'s US-01 through US-04) —
+ * replaces Task 7's plain-`<p>` placeholder.
  *
- * TODO(Task 9): Streamdown message-content rendering — replace this plain
- * `<p>` with `@assistant-ui/react-streamdown`'s message-part renderer, for
- * both assistant AND user messages alike (`markdown-rendering/PRD.md`'s
- * US-01 through US-04). This plain-text version is the explicit, documented
- * placeholder Task 7 is scoped to ship.
+ * `StreamdownTextPrimitive` (`@assistant-ui/react-streamdown`) reads the
+ * current message part via `useMessagePartText()` internally
+ * (`node_modules/@assistant-ui/react-streamdown/src/primitives/StreamdownText.tsx:70`)
+ * rather than a `text` prop — `MessagePrimitive.Parts` already wraps
+ * whichever component it's given for `components.Text` in the matching
+ * `TextMessagePartProvider` context (verified against the installed
+ * package's own `src/__tests__/StreamdownText.test.tsx`, which renders this
+ * exact primitive with no props of its own, wrapped only in
+ * `<TextMessagePartProvider text=... isRunning=...>`). No explicit `text-*`
+ * color/`font-*`/size utility is set here on purpose, same reasoning as
+ * Task 7's placeholder it replaces: those are inherited from whichever
+ * wrapper this renders inside (`text-text` for assistant, `text-bg`-on-
+ * `bg-accent` for the user bubble — see `Message` below) since Streamdown's
+ * own default element renderers (`p`, `li`, headings, ...) don't hardcode a
+ * text color themselves (verified against the installed `streamdown`
+ * package's compiled output — e.g. its paragraph/heading renderers only add
+ * sizing/weight classes like `font-semibold text-3xl`, never a `text-*`
+ * color class).
+ *
+ * `mode` is left at `StreamdownTextPrimitiveProps`'s own default
+ * (`"streaming"`) — required for AC-9.3: Streamdown's `remend`-based
+ * incomplete-markdown repair (closing an unterminated code fence or bold
+ * marker before parsing) only runs when `mode === "streaming"`, and
+ * `MessagePrimitive.Parts` renders this same component for a message's text
+ * whether it's still arriving or already complete, so `mode="static"` (used
+ * by `ArtifactCanvas.tsx`'s Task 10 code tab, where content is always
+ * already-fetched) would be wrong here.
+ *
+ * `key={generation}` below: `ArtifactCanvas.tsx`'s Task 10 doc comment
+ * already flagged this exact `streamdown` limitation ("Streamdown's internal
+ * block memoization does not reliably re-highlight on a plain content-prop
+ * change alone") and worked around it with a `key` tied to content identity.
+ * Reproduced here empirically: `ThreadRuntime.reset()` replacing a thread's
+ * messages in place (`ChatView.tsx`'s conversation-switch history-seeding
+ * effect, and — separately re-verified — a plain `.reset()` alone with no
+ * `switchToNewThread()` involved) updates the SAME
+ * `MessagePrimitive.Root`/part-position rather than unmounting it, and
+ * `streamdown`'s own paragraph/heading memo comparator
+ * (`node_modules/streamdown/dist/chunk-*.js`'s `E(e,t) => e.className===
+ * t.className && qe(e.node,t.node)`) compares AST node *position*, not
+ * text — two different one-paragraph messages produce a structurally
+ * identical position, so it wrongly treats them as equal and never
+ * re-renders, permanently freezing the old text on screen (confirmed by
+ * direct reproduction: swapping this out for a plain `<p>{text}</p>` made
+ * the freeze disappear; reintroducing bare `Streamdown` alone, with no
+ * custom props, reintroduced it — this is `streamdown`'s own bug, not
+ * `@assistant-ui/react-streamdown`'s wrapping).
+ *
+ * The enclosing message's own `id` (`useAuiState((s) => s.message.id)`)
+ * looked like the obvious key at first, but doesn't reliably change here:
+ * `ChatView.test.tsx`'s own cross-conversation-isolation fixture (a
+ * regression test this task must not break) intentionally reuses the same
+ * `"history-0"` id for the first message of every conversation, and nothing
+ * about a real server response guarantees otherwise either. Instead this
+ * tracks *content continuity* directly: `text` growing token-by-token during
+ * a real streaming turn is always a superset of what a ref remembers from
+ * the previous render (`text.startsWith(prevText)`); a `.reset()`-caused
+ * swap to a genuinely different message is not. Only a real discontinuity
+ * bumps `generation` (and therefore the `key`), so a live turn's incremental
+ * updates never remount mid-stream (preserving AC-9.3/AC-8.3), while a
+ * conversation switch reliably does.
  */
-const MessageText: TextMessagePartComponent = ({ text }) => (
-  // No explicit `text-*` color utility here on purpose — this renders inside
-  // both the assistant's `text-text`-colored wrapper and the user's
-  // `text-bg`-on-`bg-accent` bubble (see `Message` below); inheriting `color`
-  // from whichever wrapper it's nested in keeps both legible instead of
-  // hardcoding one role's contrast onto the other.
-  <p className="whitespace-pre-wrap font-body text-[15px] leading-[1.55]">{text}</p>
-);
+const MessageText: TextMessagePartComponent = () => {
+  const { text } = useMessagePartText();
+  const prevTextRef = useRef("");
+  const generationRef = useRef(0);
+  if (!text.startsWith(prevTextRef.current)) {
+    generationRef.current += 1;
+  }
+  prevTextRef.current = text;
+
+  return (
+    <StreamdownTextPrimitive
+      key={generationRef.current}
+      plugins={{ code: streamdownCodePlugin }}
+      // Pinned to one light theme for both of Streamdown's light/dark shiki
+      // slots — `design-system.css` has no dark-mode tokens anywhere else in
+      // this app, so intentionally not using Streamdown's own
+      // `["github-light","github-dark"]` default pair, which would only ever
+      // diverge from this if the app started toggling a `dark` class it
+      // never does.
+      shikiTheme={["github-light", "github-light"]}
+      // `{ enabled: true }` is already `streamdown`'s own default for
+      // `linkSafety` when the prop is omitted (verified against the
+      // installed `streamdown` package's compiled output — its `Streamdown`
+      // component binds `linkSafety = { enabled: true }` when no value is
+      // passed). Set explicitly here, not to override that default, but to
+      // document the decision: pi's responses can include `web_fetch`-
+      // sourced content, and this app's reviewed stance
+      // (`markdown-rendering/SPEC.md`) is that a link-confirmation step
+      // before opening an external link is a deliberate safety default, not
+      // an accidental one worth leaving implicit.
+      linkSafety={{ enabled: true }}
+    />
+  );
+};
 
 /**
  * Fallback renderer for any tool-call message part (e.g. `publish_artifact`,
