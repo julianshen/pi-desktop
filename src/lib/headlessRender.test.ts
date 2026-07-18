@@ -3,14 +3,15 @@ import { describe, expect, mock, test } from "bun:test";
 /**
  * Task 10. Mocks `@tauri-apps/api/core`'s `invoke` the same way this repo's
  * established convention mocks other packages via `mock.module()` (see
- * `src/views/ChatView.test.tsx`'s `@copilotkit/react-core` mock). `invokeImpl`
- * is reassigned per test so each test controls whether the (mocked) Rust
- * command resolves or rejects, without re-registering the module mock.
+ * `src/App.test.tsx`'s own `@tauri-apps/api/core` mock, and
+ * `src/lib/resolveToken.test.ts`'s). `invokeImpl` is reassigned per test so
+ * each test controls whether the (mocked) Rust command resolves or rejects,
+ * without re-registering the module mock.
  *
  * `headlessRender.ts` is imported dynamically, after `mock.module()` runs —
  * a static top-level `import` would be hoisted ahead of that call and pick up
  * the real (unmocked) `@tauri-apps/api/core`, same reasoning as
- * `ChatView.test.tsx`'s own dynamic-import comment.
+ * `App.test.tsx`'s own dynamic-import comment.
  */
 let invokeImpl: (cmd: string, args?: unknown) => Promise<unknown> = () =>
   Promise.reject(new Error("invokeImpl not configured for this test"));

@@ -1,968 +1,436 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { useCallback, useReducer, useState } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { Role, TextMessage } from "@copilotkit/runtime-client-gql";
+import { afterEach, describe, expect, mock, test } from "bun:test";
+import type { MutableRefObject } from "react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  AssistantRuntimeProvider,
+  InMemoryThreadListAdapter,
+  useLocalRuntime,
+  useThreadRuntime,
+  type ChatModelAdapter,
+  type ChatModelRunResult,
+  type ThreadRuntime,
+} from "@assistant-ui/react";
+import { ChatView } from "./ChatView.js";
 
 /**
- * Task 12 critical-bug-fix CopilotKit-mocking pattern (supersedes Task 12's original
- * mock — see git history for that version and its now-stale header comment).
- *
- * Task 12's original mock modeled "whatever the real CopilotKit singleton agent
- * currently holds" as a thread store keyed by an externally-set `activeThreadId`,
- * flipped directly via a test-only `setActiveThread()` helper. That mock passed even
- * though the REAL installed library sent the SAME threadId for every conversation
- * (verified via live E2E reproduction, see ChatView.tsx's call-site comment) — because
- * the mock never exercised the actual mechanism ChatView uses to pick a thread, it just
- * asserted rendering was correct *given* per-conversation data that nothing in the real
- * app was actually producing.
- *
- * This version closes that gap by also mocking `useThreads()` (the hook ChatView now
- * calls to route `conversationId` onto the shared thread store) and driving thread
- * selection exclusively through ChatView's own `conversationId` prop + effect, the same
- * path production code takes — not a side-channel test helper. `setThreadId` mutates the
- * same module-level `activeThreadId` the real ThreadsProvider's `setThreadId` mutates
- * conceptually (a single shared value, since CopilotKit's `agent` is a singleton), and
- * forces a re-render the way the real ThreadsProvider's `useState` would.
- *
- * This does NOT model the real HttpAgent's actual isFreshRestore clear-on-switch timing
- * (see ChatView.tsx's now-updated seeding-effect comment for the real mechanics). This
- * mock's per-thread store deliberately keeps each thread's messages indefinitely by
- * default so the tests above (AC-12.1/AC-12.2) can prove ChatView's own rendering logic
- * (greeting vs. transcript, local draft-state reset) is correct given each thread's data,
- * independent of CopilotKit's own clear/reconnect lifecycle — full-fidelity proof that
- * the real app's history survives a same-session switch-and-back requires the live E2E
- * check documented in the Task 12 critical-fix commit, not this file.
- *
- * Critical fix (/tgd-review — closes US-03's P0 acceptance criterion / TASKS.md's
- * AC-12.2): `useCopilotChatInternal()` also returns `isAvailable` (mocked constant
- * `true` here — this file's own docstring above already explains why full connect-
- * lifecycle timing isn't modeled) and `setMessages` (mocked below to mirror the real
- * `agent.setMessages()`: it writes into whichever thread is *currently* active, matching
- * the real singleton-agent's behavior of not caring which conversationId the caller
- * thinks it's writing for). The dedicated test below drives a thread that starts with an
- * empty local store (modeling the post-clear state after a reload) and a mocked
- * `fetch()` standing in for the new `GET /api/conversations/:id/messages` endpoint, to
- * prove ChatView's seeding effect actually calls `setMessages()` with the fetched
- * history rather than leaving the transcript empty.
+ * Test-environment-only fix, unrelated to ChatView.tsx's own behavior: both
+ * `useLocalRuntime()` (this file's harness) and the real `useChatRuntime()`
+ * (App.tsx) share the same underlying thread-list runtime core (confirmed:
+ * node_modules/@assistant-ui/core/dist/react/runtimes/useLocalRuntime.js also
+ * calls `useRemoteThreadListRuntime()`), which auto-generates a title after a
+ * thread's very first completed run
+ * (node_modules/@assistant-ui/core/dist/react/runtimes/
+ * RemoteThreadListHookInstanceManager.js's `runEnd` -> `generateTitle()`) by
+ * calling into `InMemoryThreadListAdapter.generateTitle()` (the no-cloud
+ * default; `node_modules/@assistant-ui/core/dist/runtimes/remote-thread-list/
+ * adapter/in-memory.js`) and piping the result through `assistant-stream`'s
+ * `AssistantMessageAccumulator` — a `class ... extends TransformStream`
+ * defined once, the first time any file in this whole `bun test` process
+ * imports `@assistant-ui/react` (module evaluation is cached process-wide).
+ * In this project's happy-dom-backed test environment that first evaluation
+ * leaves the class unable to `pipeThrough()` a genuine, later-constructed
+ * `ReadableStream` ("readable should be ReadableStream") — confirmed via a
+ * standalone repro: reassigning `globalThis.ReadableStream`/`TransformStream`
+ * to Node's native `node:stream/web` classes from THIS file has no effect
+ * once an earlier test file in the same run (Thread.test.tsx/Message.test.tsx/
+ * Composer.test.tsx, Task 7, all import `@assistant-ui/react` too) has already
+ * triggered that one-time class evaluation — by the time this file's own
+ * top-level code runs, the class is already permanently defined. This is a
+ * pre-existing gap in this feature's test infrastructure (none of Task 7's
+ * tests ever drove a real completed run, only static `initialMessages`), not
+ * a ChatView.tsx defect, and does not reflect real browser behavior (a real
+ * browser has exactly one native Streams implementation — this collision is
+ * an artifact of this specific polyfilled test environment). Rather than
+ * fight the class's already-poisoned prototype chain, this stubs out the
+ * specific method that reaches it: `generateTitle()`'s return value is never
+ * awaited by its own caller (a fire-and-forget `aui.threadListItem().generateTitle()`
+ * call, same file) and this test suite has no assertions about thread titles,
+ * so a promise that never settles is a safe, inert no-op — it simply means
+ * the internal auto-title machinery never reaches the `pipeThrough()` call
+ * that would otherwise crash.
  */
-
-type MockMessage = InstanceType<typeof TextMessage>;
-
-interface ThreadState {
-  messages: MockMessage[];
-  isLoading: boolean;
-}
-
-let activeThreadId = "default";
-const threadStore = new Map<string, ThreadState>();
-const threadIdRequestLog: string[] = [];
-
-function threadFor(id: string): ThreadState {
-  let state = threadStore.get(id);
-  if (!state) {
-    state = { messages: [], isLoading: false };
-    threadStore.set(id, state);
-  }
-  return state;
-}
-
-function resetThreads(): void {
-  threadStore.clear();
-  activeThreadId = "default";
-  threadIdRequestLog.length = 0;
-}
-
-// Task 12.1 critical-bug-fix note: `useCopilotChat()` itself is never called by
-// ChatView.tsx anymore — the component reads messages via `useCopilotChatInternal()`
-// instead, because the real installed @copilotkit/react-core@1.62.3 only populates a
-// `messages` field there (not the `visibleMessages` field `useCopilotChat()` wraps it in,
-// which is unconditionally `undefined` at runtime; see ChatView.tsx's call-site comment).
-// This mock therefore mirrors `useCopilotChatInternal()`'s real shape — returning raw
-// AG-UI-format messages under `messages` — and ChatView.tsx itself is responsible for
-// running `aguiToGQL()` over them, same as it does against the real library. Mocking under
-// the old `visibleMessages` key (as this file originally did) would validate nothing: it
-// would pass even if ChatView.tsx regressed back to reading the always-`undefined`
-// `visibleMessages` field, because the mock — not the real library's actual behavior —
-// would be supplying the data.
-mock.module("@copilotkit/react-core", () => ({
-  useCopilotChatInternal: () => {
-    // Real @copilotkit/react-core re-renders on message changes via a subscription
-    // (`agent.setMessages()`/`addMessage()` notify `onMessagesChanged`, which
-    // `useAgent()` turns into a `forceUpdate`) — this module-level thread store is
-    // plain mutable state with no such subscription of its own, so this mock needs its
-    // own forceUpdate to reproduce that: without it, mutating `state.messages` from
-    // `setMessages()` (below) would update the store but never schedule a re-render,
-    // and screen assertions would hang waiting for text that's in the data but not on
-    // screen. (AC-12.1's `appendMessage` case happens to work without this too, but
-    // only incidentally — because `submit()` also calls the real `setDraft("")`, which
-    // triggers ChatView's own re-render as a side effect. `setMessages` has no such
-    // incidental trigger, so it needs its own.)
-    const [, forceRender] = useReducer((x: number) => x + 1, 0);
-    const state = threadFor(activeThreadId);
-    return {
-      messages: state.messages,
-      isLoading: state.isLoading,
-      appendMessage: async (message: MockMessage) => {
-        state.messages = [...state.messages, message];
-        forceRender();
-      },
-      // Real @copilotkit/react-core flips this false->true around the isFreshRestore
-      // clear+swallowed-connect settling (see ChatView.tsx's seeding-effect comment).
-      // This file's docstring above explains why that timing isn't modeled — constant
-      // `true` still exercises the seeding effect's `conversationId` dependency on every
-      // switch, which is what the dedicated seeding test below needs.
-      isAvailable: true,
-      // Mirrors the real `agent.setMessages()`: writes into whichever thread is
-      // *currently* active at call time (not whichever thread was active when
-      // useCopilotChatInternal() was invoked) — a real singleton `agent.messages` has no
-      // notion of "which conversationId asked for this."
-      setMessages: (messages: MockMessage[]) => {
-        threadFor(activeThreadId).messages = messages;
-        forceRender();
-      },
-    };
-  },
-  // Mirrors ThreadsContextValue's real shape (@copilotkit/react-core's
-  // index.d.mts): { threadId, setThreadId, isThreadIdExplicit }. Backed by real
-  // React state (via useState, a real hook — safe to call here since this factory's
-  // functions run as hooks inside ChatView's own render) so that calling
-  // `setThreadId` from ChatView's effect actually triggers a re-render, the same way
-  // the real ThreadsProvider's `useState`-backed `setThreadId` does.
-  useThreads: () => {
-    const [id, setId] = useState(activeThreadId);
-    // useCallback with an empty dep array, mirroring the real ThreadsProvider's own
-    // `setThreadId` (@copilotkit/react-core's threads-context.tsx: `useCallback(...,
-    // [])`) — a referentially-stable setter is required for ChatView's
-    // `useEffect(() => setThreadId(conversationId), [conversationId, setThreadId])`
-    // to only fire once per `conversationId` change rather than on every render.
-    const setThreadId = useCallback((value: string) => {
-      activeThreadId = value;
-      threadIdRequestLog.push(value);
-      setId(value);
-    }, []);
-    return { threadId: id, isThreadIdExplicit: true, setThreadId };
-  },
-}));
+InMemoryThreadListAdapter.prototype.generateTitle = () => new Promise<never>(() => {});
 
 /**
- * ADR-001 ("Resolve-endpoint trust boundary"): ChatView.tsx now calls
- * `getResolveToken()` (src/lib/resolveToken.ts), which calls
- * `invoke("get_resolve_token")` under the hood — mocked here the same way
- * `headlessRender.test.ts`/`App.test.tsx` mock `@tauri-apps/api/core`.
- * `invokeImpl` defaults to resolving a valid token so every pre-existing test in
- * this file (none of which care about ADR-001) sees a normal, non-degraded
- * approval chip, same as production behavior when `get_resolve_token()` succeeds.
- * Tests that specifically exercise the degraded path override `invokeImpl` (and/or
- * `import.meta.env.VITE_RESOLVE_TOKEN`) themselves.
+ * Task 8 (assistant-ui-migration/TASKS.md): ChatView.tsx no longer talks to
+ * @copilotkit/react-core at all — it reads/writes chat state entirely through
+ * whatever `AssistantRuntimeProvider` supplies (App.tsx builds the real one via
+ * useChatRuntime(); here, a real (not mocked) `useLocalRuntime()` — the same
+ * "real render through a stub ChatModelAdapter, no mock.module() of
+ * @assistant-ui/react itself" convention Task 7's Thread.test.tsx/
+ * Message.test.tsx/Composer.test.tsx already established, followed here for
+ * consistency across this feature's test suite (per this task's own
+ * instructions). Unlike the pre-migration file, there is no
+ * `@tauri-apps/api/core`/resolve-token mocking needed at all — ChatView.tsx no
+ * longer touches ADR-001's resolve-token flow (Task 8, item 3: the old
+ * web_fetch approval chip is deleted, not ported).
  */
-let invokeImpl: (cmd: string, args?: unknown) => Promise<unknown> = () => Promise.resolve("test-resolve-token");
 
-mock.module("@tauri-apps/api/core", () => ({
-  invoke: (cmd: string, args?: unknown) => invokeImpl(cmd, args),
-}));
+const jsonResponse = (body: unknown, status = 200): Response =>
+  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
-// Imported dynamically, after mock.module() above registers the replacement —
-// a static top-level `import` would be hoisted ahead of that call and pick up
-// the real (unmocked) module instead.
-const { ChatView } = await import("./ChatView.js");
-// Already loaded as part of ChatView.js's own import graph above — importing it
-// again here just gets the same cached module instance, exposing its test-only
-// cache-reset helper (see resolveToken.ts's own doc comment for why this exists:
-// getResolveToken() is memoized module-wide, so without resetting it between
-// tests, whichever test runs first would "win" for every later test in this file).
-const { __resetResolveTokenCacheForTests } = await import("../lib/resolveToken.js");
+interface FetchCall {
+  url: string;
+}
+
+/** Quick, non-streaming stub model — resolves a turn in one shot. */
+const quickModel: ChatModelAdapter = {
+  run: async () => ({ content: [{ type: "text", text: "OK" }] }),
+};
+
+/** Streaming stub model (AC-8.3) — yields growing partial text over several ticks. */
+async function* streamingRun(): AsyncGenerator<ChatModelRunResult> {
+  yield { content: [{ type: "text", text: "Hel" }] };
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  yield { content: [{ type: "text", text: "Hello wor" }] };
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  yield { content: [{ type: "text", text: "Hello world" }] };
+}
+const streamingModel: ChatModelAdapter = { run: streamingRun };
+
+/**
+ * Captures the current `ThreadRuntime` into a ref so tests can imperatively
+ * drive a real run (`.append({ role: "user", ..., startRun: true })`) the
+ * same way Task 7's Composer.tsx's real send button ultimately does, without
+ * needing to simulate raw textarea typing/Enter for every test. Rendered as a
+ * sibling of `<ChatView />` under the same `AssistantRuntimeProvider`.
+ */
+function RuntimeCapture({ runtimeRef }: { runtimeRef: MutableRefObject<ThreadRuntime | null> }) {
+  runtimeRef.current = useThreadRuntime();
+  return null;
+}
+
+/**
+ * Standard harness: one real `useLocalRuntime()` per render, matching
+ * Thread.test.tsx/Message.test.tsx's own convention. No `initialMessages`
+ * option — ChatView's own history-seeding effect unconditionally clears the
+ * thread on mount (see ChatView.tsx's `.reset([])` doc comment), so any
+ * pre-seeded runtime content would be wiped before a test could observe it;
+ * tests that need specific history seed it via a mocked
+ * GET /api/conversations/:id/messages response instead (`mockFetch()` below).
+ */
+function Harness({
+  conversationId = "default",
+  model = "",
+  adapter = quickModel,
+  runtimeRef,
+  onTurnComplete,
+  onOpenArtifact,
+}: {
+  conversationId?: string;
+  model?: string;
+  adapter?: ChatModelAdapter;
+  runtimeRef?: MutableRefObject<ThreadRuntime | null>;
+  onTurnComplete?: () => void;
+  onOpenArtifact?: (artifactId: string) => void;
+}) {
+  const runtime = useLocalRuntime(adapter, {});
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      {runtimeRef && <RuntimeCapture runtimeRef={runtimeRef} />}
+      <ChatView model={model} conversationId={conversationId} onTurnComplete={onTurnComplete} onOpenArtifact={onOpenArtifact} />
+    </AssistantRuntimeProvider>
+  );
+}
+
+/**
+ * Cross-conversation-isolation harness (item 5): unlike `Harness` above, the
+ * `useLocalRuntime()` call lives in a component that is NOT remounted when
+ * `conversationId` changes — only `<ChatView key={conversationId} />` is —
+ * mirroring App.tsx's real structure exactly: `useAssistantChatRuntime()`
+ * (the runtime) is called once per `App()` render and persists across
+ * conversation switches, while only `<ChatView key={state.activeConv} .../>`
+ * remounts (App.tsx's own doc comment on that `key`).
+ */
+function IsolationHarness({ conversationId, adapter = quickModel }: { conversationId: string; adapter?: ChatModelAdapter }) {
+  const runtime = useLocalRuntime(adapter, {});
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ChatView key={conversationId} model="" conversationId={conversationId} />
+    </AssistantRuntimeProvider>
+  );
+}
 
 let originalFetch: typeof fetch;
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-}
-
-beforeEach(() => {
-  resetThreads();
-  originalFetch = global.fetch;
-  // Default stub for the seeding effect's GET /api/conversations/:id/messages call
-  // (added by the US-03 fix below) so tests that don't care about history-seeding
-  // don't hit the real network / log noisy ECONNREFUSED errors. Tests that DO care
-  // override global.fetch themselves before rendering.
-  global.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
-  // ADR-001: fresh, non-degraded token resolution by default for every test (see
-  // this file's own comment above on why the cache must be reset per test).
-  invokeImpl = () => Promise.resolve("test-resolve-token");
-  delete import.meta.env.VITE_RESOLVE_TOKEN;
-  __resetResolveTokenCacheForTests();
-});
-
 afterEach(() => {
-  global.fetch = originalFetch;
-  __resetResolveTokenCacheForTests();
+  if (originalFetch) global.fetch = originalFetch;
   cleanup();
 });
 
-const GREETING_SNIPPET = "Hi! I'm pi, your desktop agent.";
-
-describe("ChatView", () => {
-  test("AC-12.1: conversationId prop drives distinct threads — a message sent in conversation A does not leak into B", async () => {
-    const { rerender } = render(<ChatView key="conv-a" model="pi-2 Sonnet" conversationId="conv-a" />);
-
-    const textarea = screen.getByPlaceholderText(/Message pi/);
-    fireEvent.change(textarea, { target: { value: "Hello from A" } });
-    await act(async () => {
-      fireEvent.keyDown(textarea, { key: "Enter" });
-    });
-
-    expect(screen.getByText("Hello from A")).toBeTruthy();
-    // Both the remount key AND the conversationId prop must have carried "conv-a"
-    // through to the underlying thread-routing hook — this is the exact call
-    // Task 12's original implementation never made (it had no `conversationId` prop
-    // at all), which is why both conversations silently shared one thread.
-    expect(threadIdRequestLog).toEqual(["conv-a"]);
-
-    // Switch to conversation B: App.tsx remounts ChatView via `key={activeConv}` AND
-    // passes a new `conversationId`.
-    await act(async () => {
-      rerender(<ChatView key="conv-b" model="pi-2 Sonnet" conversationId="conv-b" />);
-    });
-
-    expect(threadIdRequestLog).toEqual(["conv-a", "conv-b"]);
-    expect(screen.queryByText("Hello from A")).toBeNull();
-    expect(screen.getByText(GREETING_SNIPPET, { exact: false })).toBeTruthy();
-
-    // Switch back to conversation A — in this mock's idealized per-thread store (see
-    // file header), A's message is still there because nothing ever discarded it.
-    await act(async () => {
-      rerender(<ChatView key="conv-a" model="pi-2 Sonnet" conversationId="conv-a" />);
-    });
-
-    expect(threadIdRequestLog).toEqual(["conv-a", "conv-b", "conv-a"]);
-    expect(screen.getByText("Hello from A")).toBeTruthy();
-  });
-
-  test("AC-12.2: the active conversation's pre-existing messages show on load, not an empty greeting", async () => {
-    const priorUser = new TextMessage({ id: "u1", content: "What's the weather API key stored as?", role: Role.User });
-    const priorAssistant = new TextMessage({ id: "a1", content: "It's WEATHER_API_KEY in your .env.", role: Role.Assistant });
-    threadFor("default").messages = [priorUser, priorAssistant];
-
-    render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
-
-    expect(screen.getByText("What's the weather API key stored as?")).toBeTruthy();
-    expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
-    expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
-  });
-
-  // Regression test for the "chat transcript always renders empty" bug (found live,
-  // fixed alongside Task 12's routing work). The real @copilotkit/react-core's
-  // `agent.messages` — what `useCopilotChatInternal()`'s `messages` field is actually
-  // sourced from — holds plain `@ag-ui/core` message objects (`{ role, content, id }`),
-  // NOT `@copilotkit/runtime-client-gql` `TextMessage`/`ActionExecutionMessage` class
-  // instances. This test feeds the mock exactly that plain AG-UI shape (unlike the other
-  // tests above, which use GQL `TextMessage` instances directly) to prove ChatView.tsx's
-  // `aguiToGQL()` conversion step actually runs and produces objects with working
-  // `.isTextMessage()` methods. Before the fix, this would have failed two ways: (1) the
-  // old code read `useCopilotChat().visibleMessages`, which this mock never populates
-  // (it only backs `useCopilotChatInternal()`), so nothing would render; and (2) even a
-  // naive `visibleMessages` -> `messages` rename without the `aguiToGQL()` conversion
-  // would crash calling `.isTextMessage()` on a plain object that doesn't have it.
-  test("renders plain AG-UI-shaped messages (agent.messages' real shape) via the aguiToGQL conversion", async () => {
-    threadFor("default").messages = [
-      { id: "u1", role: "user", content: "What's the weather API key stored as?" },
-      { id: "a1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
-    ] as unknown as MockMessage[];
-
-    render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
-
-    expect(screen.getByText("What's the weather API key stored as?")).toBeTruthy();
-    expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
-    expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
-  });
-
-  // Bug fix (live-usage report: a real multi-step bash tool-use conversation —
-  // generating a PDF from an SVG — showed a stack of empty chat bubbles).
-  // Root-caused via direct DOM/data inspection: the backend's AG-UI history is
-  // correct (an assistant message with toolCalls and no `content` field, the
-  // normal shape for a pure tool-call turn with no accompanying explanation),
-  // but @copilotkit/runtime-client-gql's own aguiToGQL() unconditionally
-  // synthesizes a TextMessage for every assistant message with toolCalls —
-  // `content: message.content || ""` — producing an empty-content TextMessage
-  // ChatView then rendered as a blank bubble, IN ADDITION to (not instead of)
-  // the real ActionExecutionMessage for the tool call. Both must show correctly:
-  // no empty bubble, and the tool chip still renders for every call, not just
-  // ones that happen to also carry explanatory text.
-  test("bug fix: an assistant message with toolCalls and no text (pure tool-call turn) renders only the tool chip, never an empty bubble", async () => {
-    threadFor("default").messages = [
-      { id: "u1", role: "user", content: "做成Pdf" },
-      {
-        id: "a1",
-        role: "assistant",
-        toolCalls: [{ type: "function", id: "bash_1", function: { name: "bash", arguments: '{"command":"ls -lh out.pdf"}' } }],
-      },
-      { id: "t1", role: "tool", toolCallId: "bash_1", toolName: "bash", content: "-rw-r--r-- 1 user staff 23K out.pdf" },
-      { id: "a2", role: "assistant", content: "PDF 做好了！" },
-    ] as unknown as MockMessage[];
-
-    render(<ChatView key="default" model="pi-2 Sonnet" conversationId="default" />);
-
-    await waitFor(() => {
-      expect(screen.getByText("bash")).toBeTruthy();
-    });
-    expect(screen.getByText("PDF 做好了！")).toBeTruthy();
-
-    // No empty assistant bubble: every rendered paragraph must have real text.
-    const paragraphs = Array.from(document.querySelectorAll("p"));
-    const emptyParagraphs = paragraphs.filter((p) => p.textContent?.trim() === "");
-    expect(emptyParagraphs.length).toBe(0);
-  });
-
-  // Task 13 follow-up (App.tsx previously flagged `refreshSignal` as unwired pending
-  // both Task 12 and Task 13 landing): proves ChatView's new `onTurnComplete` callback
-  // fires exactly on the true -> false edge of isLoading, not on every render where
-  // isLoading happens to be false — in particular, not on initial mount, where
-  // isLoading already starts false.
-  test("onTurnComplete fires exactly once on isLoading true->false, and not on initial mount", async () => {
-    const state = threadFor("conv-turn");
-    let onTurnCompleteCalls = 0;
-    const onTurnComplete = () => {
-      onTurnCompleteCalls += 1;
-    };
-
-    const { rerender } = render(
-      <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
-    );
-
-    // Initial mount: isLoading starts false. Must NOT fire.
-    expect(onTurnCompleteCalls).toBe(0);
-
-    // Turn starts: isLoading -> true. Still must not fire (only the false->true edge
-    // happened, not true->false).
-    state.isLoading = true;
-    await act(async () => {
-      rerender(
-        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
-      );
-    });
-    expect(onTurnCompleteCalls).toBe(0);
-
-    // Turn completes: isLoading -> false. This is the true->false edge — must fire
-    // exactly once.
-    state.isLoading = false;
-    await act(async () => {
-      rerender(
-        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
-      );
-    });
-    expect(onTurnCompleteCalls).toBe(1);
-
-    // Re-rendering again with isLoading still false must not fire a second time.
-    await act(async () => {
-      rerender(
-        <ChatView key="conv-turn" model="pi-2 Sonnet" conversationId="conv-turn" onTurnComplete={onTurnComplete} />,
-      );
-    });
-    expect(onTurnCompleteCalls).toBe(1);
-  });
-
-  // Critical fix (/tgd-review code-reviewer finding — closes US-03's P0 acceptance
-  // criterion / TASKS.md's AC-12.2): "switching to a previously-open conversation shows
-  // an empty transcript, not its real prior messages." Unlike AC-12.1/AC-12.2 above
-  // (which pre-populate the mock's idealized per-thread store to prove ChatView's
-  // *rendering* logic), this test starts the thread's local store genuinely empty — the
-  // real post-isFreshRestore-clear state — and proves ChatView's *seeding effect* is what
-  // repopulates it: a mocked `fetch()` stands in for the new
-  // `GET /api/conversations/:id/messages` endpoint, and the assertion is that the fetched
-  // history actually reaches the screen via the mock's `setMessages()` (which, like the
-  // real `agent.setMessages()`, is the only thing that can put messages into the thread
-  // store here — nothing else in this test ever populates it).
-  test("US-03 fix: switching to a conversation with server-side history replays it via fetch + setMessages, not an empty greeting", async () => {
-    threadFor("conv-with-history").messages = [];
-
-    const fetchCalls: string[] = [];
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      fetchCalls.push(url);
-      if (url.endsWith("/api/conversations/conv-with-history/messages")) {
-        return Promise.resolve(
-          jsonResponse([
-            { id: "history-0", role: "user", content: "What's the weather API key stored as?" },
-            { id: "history-1", role: "assistant", content: "It's WEATHER_API_KEY in your .env." },
-          ]),
-        );
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    render(<ChatView key="conv-with-history" model="pi-2 Sonnet" conversationId="conv-with-history" />);
-
-    await waitFor(() => {
-      expect(screen.getByText("What's the weather API key stored as?")).toBeTruthy();
-    });
-    expect(screen.getByText("It's WEATHER_API_KEY in your .env.")).toBeTruthy();
-    expect(screen.queryByText(GREETING_SNIPPET, { exact: false })).toBeNull();
-    expect(fetchCalls.some((url) => url.endsWith("/api/conversations/conv-with-history/messages"))).toBe(true);
-  });
-
-  // Contrast case: a conversation the server genuinely has no history for (a brand-new
-  // conversation) must stay on the greeting, not error out or render anything from a
-  // dangling previous fetch — `setMessages()` must not even be called for an empty
-  // response (see ChatView.tsx's seeding-effect comment on why: avoiding a no-op notify).
-  test("US-03 fix (contrast): an empty server-side history leaves the greeting shown, not a crash or stale content", async () => {
-    threadFor("conv-empty-history").messages = [];
-
-    const fetchCalls: string[] = [];
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      fetchCalls.push(url);
-      if (url.endsWith("/api/conversations/conv-empty-history/messages")) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    render(<ChatView key="conv-empty-history" model="pi-2 Sonnet" conversationId="conv-empty-history" />);
-
-    // Confirm the seeding effect actually ran (fetched) before asserting on its
-    // aftermath — otherwise this test would trivially pass even if the effect never
-    // fired at all, since the greeting is already what an untouched empty thread shows.
-    await waitFor(() => {
-      expect(fetchCalls.some((url) => url.endsWith("/api/conversations/conv-empty-history/messages"))).toBe(true);
-    });
-    expect(screen.getByText(GREETING_SNIPPET, { exact: false })).toBeTruthy();
-  });
-
-  // Regression test for a bug found LIVE via /tgd-verify (a real running app in a real
-  // browser): useShellState.ts used to initialize `model: "pi-2 Sonnet"`, a stale mock
-  // default, and this composer footer rendered it verbatim (`<span>{model}</span>`)
-  // even before any real model was ever selected — visibly inconsistent with
-  // MainHeader's own picker, which correctly showed the honest "Select model" empty
-  // state directly above it in the same live check. The fix: `model` now starts as ""
-  // (App.tsx passes `state.model` straight through), and this component must render
-  // nothing in the footer rather than ever falling back to a fake name.
-  test("composer footer renders nothing (no fake model name) when model is empty on initial load", () => {
-    render(<ChatView key="default" model="" conversationId="default" />);
-
-    expect(screen.queryByText("pi-2 Sonnet")).toBeNull();
-    // The textarea and send button must still render normally — only the model label
-    // span is conditionally omitted.
-    expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
-  });
-
-  // Bug fix (live-usage report: a chat turn failed against a real, misconfigured
-  // provider — OpenRouter 402 "insufficient credits" — with zero visible indication
-  // anywhere in the UI, even after adapter.ts was fixed to emit a real RUN_ERROR).
-  // The installed CopilotKit version's `<CopilotKit onError>` prop turned out to
-  // silently no-op without a `publicApiKey` (this app is deliberately self-hosted,
-  // no license key — confirmed by reading the installed package's own source), so
-  // ChatView instead polls the new GET /api/conversations/:id/last-error on the
-  // same isLoading true->false edge `onTurnComplete` already fires on.
-  test("bug fix: a failed turn (last-error endpoint returns a message) renders as a visible banner, and clears on the next send", async () => {
-    const state = threadFor("conv-failing");
-
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/api/conversations/conv-failing/messages")) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      if (url.endsWith("/api/conversations/conv-failing/last-error")) {
-        return Promise.resolve(jsonResponse({ message: "402: insufficient credits for this request" }));
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    const { rerender } = render(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
-
-    // Turn starts, then completes (isLoading true -> false) — the edge that
-    // triggers the last-error check, same as onTurnComplete.
-    state.isLoading = true;
-    await act(async () => {
-      rerender(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
-    });
-    state.isLoading = false;
-    await act(async () => {
-      rerender(<ChatView key="conv-failing" model="" conversationId="conv-failing" />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText("402: insufficient credits for this request")).toBeTruthy();
-    });
-
-    // Sending a new message clears the banner immediately, without waiting for a
-    // fresh last-error check.
-    const textarea = screen.getByPlaceholderText(/Message pi/);
-    fireEvent.change(textarea, { target: { value: "try again" } });
-    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
-
-    await waitFor(() => {
-      expect(screen.queryByText("402: insufficient credits for this request")).toBeNull();
-    });
-  });
-
-  test("no error banner renders when a turn completes successfully (last-error endpoint returns null)", async () => {
-    const state = threadFor("conv-ok");
-
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/api/conversations/conv-ok/messages")) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      if (url.endsWith("/api/conversations/conv-ok/last-error")) {
-        return Promise.resolve(jsonResponse({ message: null }));
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    const { rerender } = render(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
-
-    state.isLoading = true;
-    await act(async () => {
-      rerender(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
-    });
-    state.isLoading = false;
-    await act(async () => {
-      rerender(<ChatView key="conv-ok" model="" conversationId="conv-ok" />);
-    });
-
-    expect(screen.queryByText(/insufficient credits/)).toBeNull();
-  });
-
-  // Bug fix (found in review): the last-error fetch had no ordering guard against a
-  // user immediately retrying after a failed turn — a still-in-flight fetch from the
-  // turn the user already moved past could resolve AFTER the new turn's own
-  // last-error check and clobber the fresh state with a stale error banner.
-  test("bug fix: a stale last-error fetch from a turn the user already moved past does not overwrite a fresher state", async () => {
-    const state = threadFor("conv-race");
-
-    let resolveStaleFetch!: (res: Response) => void;
-    const staleFetch = new Promise<Response>((resolve) => {
-      resolveStaleFetch = resolve;
-    });
-
-    let lastErrorCallCount = 0;
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/api/conversations/conv-race/messages")) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      if (url.endsWith("/api/conversations/conv-race/last-error")) {
-        lastErrorCallCount += 1;
-        // First call (turn 1's failure) is left in flight; second call (turn 2,
-        // which succeeded) resolves immediately.
-        return lastErrorCallCount === 1 ? staleFetch : Promise.resolve(jsonResponse({ message: null }));
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    const { rerender } = render(<ChatView key="conv-race" model="" conversationId="conv-race" />);
-
-    // Turn 1 completes (failed) -- fires the first (stale) last-error fetch, left in flight.
-    state.isLoading = true;
-    await act(async () => {
-      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
-    });
-    state.isLoading = false;
-    await act(async () => {
-      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
-    });
-
-    // User immediately sends a follow-up (submit() clears error + bumps the request id).
-    const textarea = screen.getByPlaceholderText(/Message pi/);
-    fireEvent.change(textarea, { target: { value: "try again" } });
-    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
-
-    // Turn 2 completes successfully -- its own last-error fetch resolves with null.
-    state.isLoading = true;
-    await act(async () => {
-      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
-    });
-    state.isLoading = false;
-    await act(async () => {
-      rerender(<ChatView key="conv-race" model="" conversationId="conv-race" />);
-    });
-
-    // Now the STALE turn-1 fetch finally resolves, with an error -- after turn 2
-    // already succeeded. Without the request-id guard this would clobber the
-    // correct "no error" state with turn 1's stale message.
-    await act(async () => {
-      resolveStaleFetch(jsonResponse({ message: "402: stale insufficient credits error" }));
-    });
-
-    expect(screen.queryByText(/stale insufficient credits/)).toBeNull();
-  });
-
-  // Bug fix follow-up (found live: the real OpenRouter 402 error, once actually
-  // surfaced, turned out to be an HTTP-status-prefixed JSON string —
-  // `"402: {...}"`, not bare JSON — wrapping a much longer structure with a
-  // `previous_errors` array repeating the same text per retry attempt.
-  // Rendering it verbatim dumped a wall of raw JSON dominating the whole
-  // transcript; the initial fix's JSON.parse also silently failed on the raw
-  // string because of the un-stripped `"402: "` prefix. Extract just the
-  // human-readable top-level `message` field after stripping that prefix.
-  test("bug fix follow-up: a JSON-shaped provider error (real OpenRouter 402 shape, status-prefixed) renders its clean message, not the raw JSON", async () => {
-    const state = threadFor("conv-json-error");
-    // Exact raw shape captured live: "<status>: <json>", not bare JSON.
-    const rawOpenRouterError = `402: ${JSON.stringify({
-      message: "This request requires more credits, or fewer max_tokens.",
-      code: 402,
-      metadata: {
-        provider_name: null,
-        previous_errors: [
-          { code: 402, message: "This request requires more credits, or fewer max_tokens." },
-          { code: 402, message: "This request requires more credits, or fewer max_tokens." },
-        ],
-      },
-    })}`;
-
-    global.fetch = mock((input: RequestInfo | URL) => {
-      const url = String(input);
-      if (url.endsWith("/api/conversations/conv-json-error/messages")) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      if (url.endsWith("/api/conversations/conv-json-error/last-error")) {
-        return Promise.resolve(jsonResponse({ message: rawOpenRouterError }));
-      }
-      return Promise.reject(new Error(`unexpected fetch: ${url}`));
-    }) as unknown as typeof fetch;
-
-    const { rerender } = render(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
-
-    state.isLoading = true;
-    await act(async () => {
-      rerender(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
-    });
-    state.isLoading = false;
-    await act(async () => {
-      rerender(<ChatView key="conv-json-error" model="" conversationId="conv-json-error" />);
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText("This request requires more credits, or fewer max_tokens.")).toBeTruthy();
-    });
-    // The raw JSON (metadata, previous_errors, code, etc.) must never render.
-    expect(screen.queryByText(/previous_errors/)).toBeNull();
-    expect(screen.queryByText(/"metadata"/)).toBeNull();
-  });
-
-  // New feature: a publish_artifact tool call renders as a clickable attachment
-  // chip (title + language), distinct from the generic "tool: {name}" chip other
-  // tool calls get, and clicking it calls onOpenArtifact with the published
-  // artifact's id — the args a publish_artifact call carries are already the full
-  // { id, title, language, code } payload (server/src/artifacts/tools.ts), so the
-  // chip needs no extra fetch to render.
-  describe("artifacts-as-chat-attachments", () => {
-    test("a publish_artifact tool call renders as an attachment chip with its title and language, not the generic tool chip", async () => {
-      threadFor("conv-artifact").messages = [
-        { id: "u1", role: "user", content: "chart the weather" },
-        {
-          id: "a1",
-          role: "assistant",
-          toolCalls: [
-            {
-              type: "function",
-              id: "call_1",
-              function: {
-                name: "publish_artifact",
-                arguments: JSON.stringify({
-                  id: "weather-chart",
-                  title: "weather_chart.tsx",
-                  language: "tsx",
-                  code: "export const Chart = () => null;",
-                }),
-              },
-            },
-          ],
-        },
-        { id: "t1", role: "tool", toolCallId: "call_1", toolName: "publish_artifact", content: "Published." },
-      ] as unknown as MockMessage[];
-
-      render(<ChatView key="conv-artifact" model="" conversationId="conv-artifact" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("weather_chart.tsx")).toBeTruthy();
-      });
-      expect(screen.getByText("tsx")).toBeTruthy();
-      // Not the generic tool chip's raw tool-name rendering.
-      expect(screen.queryByText("publish_artifact")).toBeNull();
-    });
-
-    test("clicking a publish_artifact attachment chip calls onOpenArtifact with the artifact's id", async () => {
-      threadFor("conv-artifact-click").messages = [
-        {
-          id: "a1",
-          role: "assistant",
-          toolCalls: [
-            {
-              type: "function",
-              id: "call_1",
-              function: {
-                name: "publish_artifact",
-                arguments: JSON.stringify({ id: "weather-chart", title: "weather_chart.tsx", language: "tsx", code: "" }),
-              },
-            },
-          ],
-        },
-        { id: "t1", role: "tool", toolCallId: "call_1", toolName: "publish_artifact", content: "Published." },
-      ] as unknown as MockMessage[];
-
-      const openedIds: string[] = [];
-      render(
-        <ChatView
-          key="conv-artifact-click"
-          model=""
-          conversationId="conv-artifact-click"
-          onOpenArtifact={(id) => openedIds.push(id)}
-        />,
-      );
-
-      const chip = await waitFor(() => screen.getByText("weather_chart.tsx"));
-      fireEvent.click(chip);
-
-      expect(openedIds).toEqual(["weather-chart"]);
-    });
-
-    test("other tool calls (e.g. bash) still render the generic tool chip, unaffected by the artifact special-case", async () => {
-      threadFor("conv-generic-tool").messages = [
-        {
-          id: "a1",
-          role: "assistant",
-          toolCalls: [{ type: "function", id: "bash_1", function: { name: "bash", arguments: '{"command":"ls"}' } }],
-        },
-        { id: "t1", role: "tool", toolCallId: "bash_1", toolName: "bash", content: "out.pdf" },
-      ] as unknown as MockMessage[];
-
-      render(<ChatView key="conv-generic-tool" model="" conversationId="conv-generic-tool" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("bash")).toBeTruthy();
-      });
-      expect(screen.getByText("tool")).toBeTruthy();
-    });
-  });
-
-  // Task 8 (SPEC.md's "web_fetch" approval-gate feature): a `kind: "confirm"`
-  // pending interaction, delivered via ChatView's own independent poll of
-  // GET /api/conversations/:id/pending-interaction (App.tsx's sibling
-  // `usePendingRenderInteractionWatcher` polls the same endpoint but only ever
-  // acts on `kind: "render"` — these two pollers are intentionally separate,
-  // see App.tsx's own comment), renders as a standalone approve/deny chip in
-  // the transcript, not attached to any specific message.
-  describe("pending-interaction approval chip (Task 8)", () => {
-    function fetchMockFor(
-      conversationId: string,
-      opts: {
-        interaction?: { id: string; kind: "confirm" | "render"; host?: string } | null;
-        onResolve?: (interactionId: string, body: unknown) => Response | Promise<Response>;
-      },
-    ) {
-      const fetchCalls: { url: string; body?: unknown; headers?: Record<string, string> }[] = [];
-      const fn = mock((input: RequestInfo | URL, init?: RequestInit) => {
-        const url = String(input);
-        const body = init?.body ? (JSON.parse(init.body as string) as unknown) : undefined;
-        const headers = init?.headers ? (init.headers as Record<string, string>) : undefined;
-        fetchCalls.push({ url, body, headers });
-
-        if (url.endsWith(`/api/conversations/${conversationId}/messages`)) {
-          return Promise.resolve(jsonResponse([]));
-        }
-        if (url.endsWith(`/api/conversations/${conversationId}/pending-interaction`)) {
-          return Promise.resolve(jsonResponse({ interaction: opts.interaction ?? null }));
-        }
-        const resolveMatch = url.match(
-          new RegExp(`/api/conversations/${conversationId}/pending-interaction/([^/]+)/resolve$`),
-        );
-        if (resolveMatch) {
-          const interactionId = resolveMatch[1];
-          if (opts.onResolve) return Promise.resolve(opts.onResolve(interactionId, body));
-          return Promise.resolve(jsonResponse({ resolved: true }));
-        }
-        return Promise.reject(new Error(`unexpected fetch: ${url}`));
-      }) as unknown as typeof fetch;
-      return { fn, fetchCalls };
+function mockFetch(handlers: { messages?: unknown; lastError?: { message: string | null } }): FetchCall[] {
+  const calls: FetchCall[] = [];
+  originalFetch = global.fetch;
+  global.fetch = mock((url: string) => {
+    calls.push({ url });
+    if (url.includes("/last-error")) {
+      return Promise.resolve(jsonResponse(handlers.lastError ?? { message: null }));
     }
+    if (url.includes("/messages")) {
+      return Promise.resolve(jsonResponse(handlers.messages ?? []));
+    }
+    // Any other URL (in particular a pending-interaction poll, if one ever
+    // regressed back in — see the "old approval chip is gone" describe block
+    // below) is deliberately NOT handled here, so a stray call surfaces loudly
+    // in test output instead of being silently served a default 200.
+    return Promise.reject(new Error(`unexpected fetch: ${url}`));
+  }) as unknown as typeof fetch;
+  return calls;
+}
 
-    test("AC-8.1: a pending confirm-kind interaction renders a chip with the literal host and visible Approve/Deny controls", async () => {
-      const { fn } = fetchMockFor("conv-confirm-1", {
-        interaction: { id: "int-1", kind: "confirm", host: "192.168.1.50" },
-      });
-      global.fetch = fn;
-
-      render(<ChatView key="conv-confirm-1" model="" conversationId="conv-confirm-1" />);
-
-      // Literal host text, verbatim — not a paraphrase, not truncated.
-      await waitFor(() => {
-        expect(screen.getByText("192.168.1.50")).toBeTruthy();
-      });
-      expect(screen.getByRole("button", { name: "Approve" })).toBeTruthy();
-      expect(screen.getByRole("button", { name: "Deny" })).toBeTruthy();
+describe("ChatView (Task 8) — AC-8.1: history replay on load", () => {
+  test("the 'default' conversation's real prior messages render via Task 7's components, not the empty-thread greeting", async () => {
+    mockFetch({
+      messages: [
+        { id: "history-0", role: "user", content: "What's the weather?" },
+        { id: "history-1", role: "assistant", content: "I can't check live weather, but I can help with other things." },
+      ],
     });
 
-    test("AC-8.1 (contrast): no chip renders when no pending interaction exists, or when the pending interaction is render-kind", async () => {
-      const { fn } = fetchMockFor("conv-confirm-2", { interaction: null });
-      global.fetch = fn;
+    render(<Harness conversationId="default" />);
 
-      render(<ChatView key="conv-confirm-2" model="" conversationId="conv-confirm-2" />);
+    await waitFor(() => expect(screen.getByText("What's the weather?")).toBeTruthy());
+    expect(screen.getByText("I can't check live weather, but I can help with other things.")).toBeTruthy();
 
-      // Give the poll a tick to run and confirm nothing renders.
-      await waitFor(() => {
-        expect(screen.getByPlaceholderText(/Message pi/)).toBeTruthy();
-      });
-      expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Deny" })).toBeNull();
+    // Task 7's Thread.tsx welcome state ("How can I help you today?") only
+    // shows when the thread has zero messages — direct re-verification that
+    // this is NOT an empty greeting, matching wire-chat-backend's original
+    // "Default conversation's pre-existing messages show on app load" fix.
+    expect(screen.queryByText("How can I help you today?")).toBeNull();
+  });
+
+  test("a brand-new conversation with no prior history legitimately shows the empty-thread welcome state", async () => {
+    mockFetch({ messages: [] });
+
+    render(<Harness conversationId="new-conv" />);
+
+    await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
+  });
+
+  test("a failed history fetch leaves the transcript empty rather than throwing or inventing content", async () => {
+    originalFetch = global.fetch;
+    global.fetch = mock(() => Promise.reject(new Error("network down"))) as unknown as typeof fetch;
+
+    render(<Harness conversationId="default" />);
+
+    await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
+  });
+});
+
+describe("ChatView (Task 8) — AC-8.2: error banner for failed turns", () => {
+  test("a failed turn (real provider error shape) shows the error banner with the summarized message", async () => {
+    mockFetch({
+      messages: [],
+      lastError: {
+        message: '402: {"message": "Insufficient credits on this OpenRouter key.", "code": 402}',
+      },
     });
 
-    test("AC-8.2 [R]: clicking Approve calls resolve with { approved: true }, disables both buttons while in flight, and clears the chip once resolved", async () => {
-      let resolveResolvePost!: (res: Response) => void;
-      const pendingResolvePost = new Promise<Response>((resolve) => {
-        resolveResolvePost = resolve;
-      });
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+    render(<Harness conversationId="default" runtimeRef={runtimeRef} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
 
-      const { fn, fetchCalls } = fetchMockFor("conv-approve", {
-        interaction: { id: "int-approve", kind: "confirm", host: "10.0.0.7" },
-        onResolve: () => pendingResolvePost,
-      });
-      global.fetch = fn;
+    runtimeRef.current!.append("hi");
 
-      render(<ChatView key="conv-approve" model="" conversationId="conv-approve" />);
+    await waitFor(() => expect(screen.getByText("Insufficient credits on this OpenRouter key.")).toBeTruthy());
+    // The raw "402: " HTTP-status prefix and surrounding JSON wrapper must never
+    // leak into the rendered banner — summarizeError()'s whole job.
+    expect(screen.queryByText(/^402:/)).toBeNull();
+  });
 
-      await waitFor(() => {
-        expect(screen.getByText("10.0.0.7")).toBeTruthy();
-      });
+  test("a successful turn shows no error banner", async () => {
+    mockFetch({ messages: [], lastError: { message: null } });
 
-      const approveButton = screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement;
-      const denyButton = screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement;
-      fireEvent.click(approveButton);
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+    render(<Harness conversationId="default" runtimeRef={runtimeRef} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
 
-      // While the resolve POST is still in flight, both buttons must be
-      // disabled — avoids a double-submission from a second click.
-      await waitFor(() => {
-        expect(approveButton.disabled).toBe(true);
-      });
-      expect(denyButton.disabled).toBe(true);
+    runtimeRef.current!.append("hi");
 
-      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-approve/resolve"));
-      expect(resolveCall).toBeTruthy();
-      expect(resolveCall!.body).toEqual({ approved: true });
+    await waitFor(() => expect(screen.getByText("OK")).toBeTruthy());
+    expect(screen.queryByText(/Insufficient credits/)).toBeNull();
+  });
 
-      await act(async () => {
-        resolveResolvePost(jsonResponse({ resolved: true }));
-      });
-
-      // Chip clears once resolved (this implementation optimistically clears
-      // right after the click settles rather than waiting for the next poll
-      // tick — see ChatView.tsx's resolvePendingConfirm comment).
-      await waitFor(() => {
-        expect(screen.queryByText("10.0.0.7")).toBeNull();
-      });
+  test("sending a new turn clears a stale error banner from the previous turn", async () => {
+    const calls = mockFetch({
+      messages: [],
+      lastError: { message: "402: {\"message\": \"first turn failed\"}" },
     });
 
-    test("AC-8.3: clicking Deny calls resolve with { approved: false } and clears the chip", async () => {
-      const { fn, fetchCalls } = fetchMockFor("conv-deny", {
-        interaction: { id: "int-deny", kind: "confirm", host: "127.0.0.1" },
-      });
-      global.fetch = fn;
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+    render(<Harness conversationId="default" runtimeRef={runtimeRef} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
 
-      render(<ChatView key="conv-deny" model="" conversationId="conv-deny" />);
+    runtimeRef.current!.append("first");
+    await waitFor(() => expect(screen.getByText("first turn failed")).toBeTruthy());
 
-      await waitFor(() => {
-        expect(screen.getByText("127.0.0.1")).toBeTruthy();
-      });
+    // Second turn succeeds — the stale banner must clear the instant the new
+    // turn starts (not just once the new turn's own last-error check settles).
+    calls.length = 0;
+    global.fetch = mock((url: string) => {
+      calls.push({ url });
+      if (url.includes("/last-error")) return Promise.resolve(jsonResponse({ message: null }));
+      return Promise.resolve(jsonResponse([]));
+    }) as unknown as typeof fetch;
 
-      const denyButton = screen.getByRole("button", { name: "Deny" });
-      await act(async () => {
-        fireEvent.click(denyButton);
-      });
+    runtimeRef.current!.append("second");
+    await waitFor(() => expect(screen.queryByText("first turn failed")).toBeNull());
+  });
+});
 
-      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-deny/resolve"));
-      expect(resolveCall).toBeTruthy();
-      expect(resolveCall!.body).toEqual({ approved: false });
+describe("ChatView (Task 8) — AC-8.3: assistant responses stream in visibly", () => {
+  test("a streaming response renders growing partial text through Task 7's Message component, not all at once", async () => {
+    mockFetch({ messages: [] });
 
-      await waitFor(() => {
-        expect(screen.queryByText("127.0.0.1")).toBeNull();
-      });
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+    render(<Harness conversationId="default" adapter={streamingModel} runtimeRef={runtimeRef} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
+
+    runtimeRef.current!.append("hi");
+
+    // First a smaller intermediate chunk is visible...
+    await waitFor(() => expect(screen.getByText("Hel")).toBeTruthy());
+    // ...before the final, complete text ever appears — proving the message
+    // rendered incrementally rather than materializing complete in one paint.
+    await waitFor(() => expect(screen.getByText("Hello world")).toBeTruthy());
+  });
+});
+
+describe("ChatView (Task 8) — item 3: the old web_fetch approval chip is gone", () => {
+  test("ChatView.tsx's source contains no remaining pendingConfirm state or pending-interaction poll", async () => {
+    const source = await Bun.file(new URL("./ChatView.tsx", import.meta.url)).text();
+    expect(source).not.toMatch(/pendingConfirm/);
+    expect(source).not.toMatch(/pending-interaction/);
+    expect(source).not.toMatch(/getResolveToken/);
+    expect(source).not.toMatch(/@copilotkit\//);
+  });
+
+  test("no fetch call to a pending-interaction endpoint is ever made, even while a turn is running", async () => {
+    const calls = mockFetch({ messages: [] });
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+    render(<Harness conversationId="default" runtimeRef={runtimeRef} adapter={streamingModel} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
+
+    runtimeRef.current!.append("hi");
+    await waitFor(() => expect(screen.getByText("Hello world")).toBeTruthy());
+
+    expect(calls.some((c) => c.url.includes("pending-interaction"))).toBe(false);
+    expect(screen.queryByText("approval needed")).toBeNull();
+  });
+});
+
+describe("ChatView (Task 8) — item 4: onTurnComplete/onOpenArtifact prop contract", () => {
+  test("onTurnComplete fires exactly once, only on the isRunning true -> false edge (not on mount)", async () => {
+    mockFetch({ messages: [] });
+    let turnCompleteCount = 0;
+    const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
+
+    render(<Harness conversationId="default" runtimeRef={runtimeRef} onTurnComplete={() => (turnCompleteCount += 1)} />);
+    await waitFor(() => expect(runtimeRef.current).not.toBeNull());
+
+    // Give the mount/history-seed effects a moment to settle — must not fire on mount.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(turnCompleteCount).toBe(0);
+
+    runtimeRef.current!.append("hi");
+    await waitFor(() => expect(screen.getByText("OK")).toBeTruthy());
+    await waitFor(() => expect(turnCompleteCount).toBe(1));
+
+    // Stays at 1 — not re-fired on subsequent unrelated renders.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(turnCompleteCount).toBe(1);
+  });
+
+  test("onOpenArtifact fires with the clicked publish_artifact tool call's literal id", async () => {
+    // Seeded via the real GET /messages history path (toThreadMessageLikeHistory()),
+    // not useLocalRuntime()'s own `initialMessages` — ChatView's history-seeding
+    // effect unconditionally clears the thread on mount (this file's "AC-8.1"
+    // describe block above), so anything seeded only via `initialMessages` would
+    // be wiped before this test could observe it. Exercising the real fetch path
+    // here also happens to double-check that a history-replayed tool call renders
+    // through the same publishArtifactToolUI registration as a live one.
+    mockFetch({
+      messages: [
+        {
+          id: "history-0",
+          role: "assistant",
+          toolCalls: [
+            {
+              type: "function",
+              id: "call-1",
+              function: {
+                name: "publish_artifact",
+                arguments: JSON.stringify({ id: "artifact-42", title: "Quarterly Report", language: "markdown" }),
+              },
+            },
+          ],
+        },
+      ],
     });
 
-    test("ADR-001: Approve's resolve POST carries the X-Resolve-Token header when getResolveToken() succeeds", async () => {
-      invokeImpl = () => Promise.resolve("secret-token-abc");
+    let openedArtifactId: string | undefined;
+    render(<Harness conversationId="default" onOpenArtifact={(id) => (openedArtifactId = id)} />);
 
-      const { fn, fetchCalls } = fetchMockFor("conv-token-header", {
-        interaction: { id: "int-token", kind: "confirm", host: "10.0.0.9" },
-      });
-      global.fetch = fn;
+    await waitFor(() => expect(screen.getByText("Quarterly Report")).toBeTruthy());
+    fireEvent.click(screen.getByText("Quarterly Report"));
 
-      render(<ChatView key="conv-token-header" model="" conversationId="conv-token-header" />);
+    expect(openedArtifactId).toBe("artifact-42");
+  });
+});
 
-      await waitFor(() => {
-        expect(screen.getByText("10.0.0.9")).toBeTruthy();
-      });
-
-      await act(async () => {
-        fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-      });
-
-      const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-token/resolve"));
-      expect(resolveCall).toBeTruthy();
-      expect(resolveCall!.headers?.["X-Resolve-Token"]).toBe("secret-token-abc");
-    });
-
-    test("ADR-001: when getResolveToken() resolves to null (invoke() fails and no VITE_RESOLVE_TOKEN fallback), Approve/Deny are disabled and a visible error appears in the chip", async () => {
-      invokeImpl = () => Promise.reject(new Error("no Tauri bridge present"));
-      delete import.meta.env.VITE_RESOLVE_TOKEN;
-
-      const { fn } = fetchMockFor("conv-degraded", {
-        interaction: { id: "int-degraded", kind: "confirm", host: "172.16.0.5" },
-      });
-      global.fetch = fn;
-
-      render(<ChatView key="conv-degraded" model="" conversationId="conv-degraded" />);
-
-      await waitFor(() => {
-        expect(screen.getByText("172.16.0.5")).toBeTruthy();
-      });
-
-      await waitFor(() => {
-        expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(true);
-      });
-      expect((screen.getByRole("button", { name: "Deny" }) as HTMLButtonElement).disabled).toBe(true);
-      expect(screen.getByText(/Could not verify this session — approval is unavailable\./)).toBeTruthy();
-    });
-
-    test("ADR-001: a 401 resolve response (missing/mismatched token) does NOT optimistically clear the chip, so the user can retry", async () => {
-      invokeImpl = () => Promise.resolve("stale-or-wrong-token");
-
-      const { fn, fetchCalls } = fetchMockFor("conv-401", {
-        interaction: { id: "int-401", kind: "confirm", host: "10.1.1.1" },
-        onResolve: () => new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }),
-      });
-      global.fetch = fn;
-
-      const errorSpy = mock((..._args: unknown[]) => undefined);
-      const originalConsoleError = console.error;
-      console.error = errorSpy as unknown as typeof console.error;
-
-      try {
-        render(<ChatView key="conv-401" model="" conversationId="conv-401" />);
-
-        await waitFor(() => {
-          expect(screen.getByText("10.1.1.1")).toBeTruthy();
-        });
-
-        await act(async () => {
-          fireEvent.click(screen.getByRole("button", { name: "Approve" }));
-        });
-
-        const resolveCall = fetchCalls.find((c) => c.url.endsWith("/pending-interaction/int-401/resolve"));
-        expect(resolveCall).toBeTruthy();
-
-        // Unlike the AC-8.2/AC-8.3 success cases above, the chip must NOT clear on
-        // a 401 — the approval was never actually recorded server-side, so leaving
-        // the chip up (with buttons re-enabled for a retry) is the correct outcome.
-        await waitFor(() => {
-          expect((screen.getByRole("button", { name: "Approve" }) as HTMLButtonElement).disabled).toBe(false);
-        });
-        expect(screen.getByText("10.1.1.1")).toBeTruthy();
-        expect(
-          errorSpy.mock.calls.some((call) => String(call[0]).includes("X-Resolve-Token") && String(call[0]).includes("ADR-001")),
-        ).toBe(true);
-      } finally {
-        console.error = originalConsoleError;
+// assistant-ui-migration/AC-15.1: also the re-verification that cross-conversation
+// isolation (wire-chat-backend's original catalog entry) holds under the new
+// Assistant UI runtime -- re-confirmed in Task 15, no new test needed since this
+// one already covers the exact behavior AC-15.1 requires.
+describe("ChatView (Task 8) — item 5: cross-conversation isolation", () => {
+  test("switching conversationId clears the previous conversation's messages and seeds the new one's real history", async () => {
+    const calls: FetchCall[] = [];
+    originalFetch = global.fetch;
+    global.fetch = mock((url: string) => {
+      calls.push({ url });
+      if (url.includes("/last-error")) return Promise.resolve(jsonResponse({ message: null }));
+      if (url.includes("/conversations/conv-A/messages")) {
+        return Promise.resolve(jsonResponse([{ id: "history-0", role: "user", content: "Message from conversation A" }]));
       }
-    });
+      if (url.includes("/conversations/conv-B/messages")) {
+        return Promise.resolve(jsonResponse([{ id: "history-0", role: "user", content: "Message from conversation B" }]));
+      }
+      return Promise.resolve(jsonResponse([]));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<IsolationHarness conversationId="conv-A" />);
+    await waitFor(() => expect(screen.getByText("Message from conversation A")).toBeTruthy());
+
+    rerender(<IsolationHarness conversationId="conv-B" />);
+
+    await waitFor(() => expect(screen.getByText("Message from conversation B")).toBeTruthy());
+    // The critical assertion: conversation A's message must NOT still be visible
+    // once B's history has loaded — direct re-verification of wire-chat-backend's
+    // "Cross-conversation message isolation" catalog entry under Assistant UI.
+    expect(screen.queryByText("Message from conversation A")).toBeNull();
+
+    // Switching back to A re-fetches and re-shows A's own history, not B's.
+    rerender(<IsolationHarness conversationId="conv-A" />);
+    await waitFor(() => expect(screen.getByText("Message from conversation A")).toBeTruthy());
+    expect(screen.queryByText("Message from conversation B")).toBeNull();
+  });
+
+  test("switching to a conversation with no history clears the previous conversation's messages rather than leaving them visible", async () => {
+    originalFetch = global.fetch;
+    global.fetch = mock((url: string) => {
+      if (url.includes("/last-error")) return Promise.resolve(jsonResponse({ message: null }));
+      if (url.includes("/conversations/conv-A/messages")) {
+        return Promise.resolve(jsonResponse([{ id: "history-0", role: "user", content: "Message from conversation A" }]));
+      }
+      return Promise.resolve(jsonResponse([]));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<IsolationHarness conversationId="conv-A" />);
+    await waitFor(() => expect(screen.getByText("Message from conversation A")).toBeTruthy());
+
+    rerender(<IsolationHarness conversationId="conv-empty" />);
+
+    await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
+    expect(screen.queryByText("Message from conversation A")).toBeNull();
   });
 });

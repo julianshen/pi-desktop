@@ -53,6 +53,13 @@ describe("ArtifactCanvas", () => {
     expect(screen.queryByText("Weekly Active Users")).toBeNull();
   });
 
+  // assistant-ui-migration/AC-16.1: this is also the re-verification that
+  // publish_artifact's Canvas live-update behavior holds now that tool-call
+  // visibility flows through the new ai-sdk/adapter.ts instead of the old
+  // agui/adapter.ts (Task 16, re-run and re-confirmed unmodified). Note the
+  // "AC-13.2" in this test's own name is markdown-rendering's unrelated AC
+  // numbering (a pre-existing coincidental id collision, not this feature's
+  // own AC-13.2 -- see server/src/scheduler/index.test.ts for that one).
   test("AC-13.2: after the current turn completes (refreshSignal changes), the canvas transitions through the updating state and then shows the real published artifact", async () => {
     const initial = makeArtifact({ id: "a1", title: "initial.tsx", code: "const a = 1;" });
     const published = makeArtifact({ id: "a2", title: "published.tsx", code: "const b = 2;" });
@@ -69,15 +76,18 @@ describe("ArtifactCanvas", () => {
       return secondFetch;
     }) as unknown as typeof fetch;
 
-    const { rerender } = render(
+    const { container, rerender } = render(
       <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" refreshSignal={0} />,
     );
 
-    // Initial artifact loads and renders.
+    // Initial artifact loads and renders. Task 10: the Code tab now renders through
+    // Streamdown/Shiki, which splits highlighted code into multiple per-token spans —
+    // so code content is asserted via `textContent` (survives that splitting) rather
+    // than `getByText` (requires a single element's text to match exactly).
     await waitFor(() => {
       expect(screen.getByText("initial.tsx")).toBeTruthy();
     });
-    expect(screen.getByText("const a = 1;")).toBeTruthy();
+    expect(container.textContent ?? "").toContain("const a = 1;");
 
     // Simulate a completed turn: refreshSignal changes, fetch is still in flight.
     rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" refreshSignal={1} />);
@@ -86,7 +96,7 @@ describe("ArtifactCanvas", () => {
       expect(screen.getByText("updating")).toBeTruthy();
     });
     // The prior content stays visible (dimmed underneath), not blanked, while updating.
-    expect(screen.getByText("const a = 1;")).toBeTruthy();
+    expect(container.textContent ?? "").toContain("const a = 1;");
 
     // Resolve the refetch with the newly published artifact.
     resolveSecondFetch(jsonResponse(published));
@@ -94,7 +104,9 @@ describe("ArtifactCanvas", () => {
     await waitFor(() => {
       expect(screen.getByText("published.tsx")).toBeTruthy();
     });
-    expect(screen.getByText("const b = 2;")).toBeTruthy();
+    await waitFor(() => {
+      expect(container.textContent ?? "").toContain("const b = 2;");
+    });
     expect(screen.queryByText("updating")).toBeNull();
   });
 
@@ -168,6 +180,81 @@ describe("ArtifactCanvas", () => {
     });
   });
 
+  // Bug fix (test-engineer persona, /tgd-review): ArtifactCanvas.tsx's two
+  // independent effects (the [conversationId, pinnedArtifactId]-keyed one and the
+  // [refreshSignal]-keyed one, ArtifactCanvas.tsx:122-145) both call the shared
+  // `load()` function, but each effect's own `cancelled` closure only guards its
+  // OWN next invocation, not the other effect's in-flight fetch. Since App.tsx
+  // renders <ArtifactCanvas> with no `key` prop (it persists across a conversation
+  // switch, unlike key-remounted ChatView), a refreshSignal-triggered fetch for
+  // conversation A that's still in flight when the user switches to conversation B
+  // can resolve AFTER B's fetch and silently clobber B's correct, already-visible
+  // artifact with A's stale one.
+  test("BUG: a stale refreshSignal-triggered fetch for conversation A landing after switching to conversation B must not clobber B's artifact", async () => {
+    const artifactA = makeArtifact({ id: "a1", title: "conv-a-initial.tsx", code: "const a = 1;" });
+    const artifactAUpdated = makeArtifact({ id: "a2", title: "conv-a-updated.tsx", code: "const a2 = 2;" });
+    const artifactB = makeArtifact({ id: "b1", title: "conv-b.tsx", code: "const b = 1;" });
+
+    let resolveStaleAFetch!: (res: Response) => void;
+    const staleAFetch = new Promise<Response>((resolve) => {
+      resolveStaleAFetch = resolve;
+    });
+
+    // fetchArtifact always hits the same "latest" URL per conversation, so a
+    // call-count-aware mock is used to distinguish the first (immediate) conv-a
+    // fetch (initial mount load) from the second (held pending, simulating "a turn
+    // completed on A, refetch is in flight") one.
+    let convACallCount = 0;
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/conversations/conv-a/")) {
+        convACallCount += 1;
+        if (convACallCount === 1) return Promise.resolve(jsonResponse(artifactA));
+        return staleAFetch;
+      }
+      if (url.includes("/conversations/conv-b/")) {
+        return Promise.resolve(jsonResponse(artifactB));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-a" refreshSignal={0} />,
+    );
+
+    // Initial load of conversation A resolves and renders.
+    await waitFor(() => {
+      expect(screen.getByText("conv-a-initial.tsx")).toBeTruthy();
+    });
+
+    // A turn completes on conversation A: refreshSignal changes, kicking off the
+    // second conv-a fetch — held pending (not resolved yet).
+    rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-a" refreshSignal={1} />);
+    await waitFor(() => {
+      expect(screen.getByText("updating")).toBeTruthy();
+    });
+
+    // Before that fetch resolves, the user switches to conversation B (refreshSignal
+    // unchanged). B's fetch resolves and its artifact must show.
+    rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-b" refreshSignal={1} />);
+    await waitFor(() => {
+      expect(screen.getByText("conv-b.tsx")).toBeTruthy();
+    });
+    expect(screen.queryByText("updating")).toBeNull();
+
+    // NOW resolve the still-pending stale A fetch. It must NOT be allowed to
+    // overwrite the canvas, which has already moved on to conversation B.
+    resolveStaleAFetch(jsonResponse(artifactAUpdated));
+
+    // Give the resolved promise's .then() a chance to run and (if the bug is
+    // present) clobber state.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(screen.getByText("conv-b.tsx")).toBeTruthy();
+    expect(screen.queryByText("conv-a-updated.tsx")).toBeNull();
+    expect(screen.queryByText("conv-a-initial.tsx")).toBeNull();
+  });
+
   // Preview tab: real usage (checked against actual ~/.pi-desktop artifacts.json
   // data) only ever produces standalone HTML and SVG artifacts with anything
   // visually meaningful to render — this replaces the old unconditional "No rich
@@ -228,6 +315,36 @@ describe("ArtifactCanvas", () => {
       await waitFor(() => {
         expect(screen.getByTitle("Preview: upper.html")).toBeTruthy();
       });
+    });
+  });
+
+  // Task 10 (assistant-ui-migration): the Code tab must render artifact.code as one
+  // syntax-highlighted code block, never as parsed markdown prose — a Python `#`
+  // comment must never become a markdown heading element.
+  describe("Code tab", () => {
+    test("AC-10.2: a Python artifact's `#` comment renders as literal code text, never as a markdown heading", async () => {
+      const pythonCode = "# this is a comment\nprint('hello')";
+      global.fetch = mock(() =>
+        Promise.resolve(jsonResponse(makeArtifact({ language: "python", title: "script.py", code: pythonCode }))),
+      ) as unknown as typeof fetch;
+
+      const { container } = render(
+        <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-1" />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByText("script.py")).toBeTruthy();
+      });
+
+      // No heading element anywhere in the rendered output — the `#` must never be
+      // reinterpreted as markdown.
+      for (const tag of ["h1", "h2", "h3", "h4", "h5", "h6"]) {
+        expect(container.querySelectorAll(tag).length).toBe(0);
+      }
+
+      // The `#`-prefixed comment is present verbatim as literal code text somewhere
+      // in the rendered code block.
+      expect(container.textContent ?? "").toContain("# this is a comment");
     });
   });
 });

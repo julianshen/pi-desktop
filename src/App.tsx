@@ -1,4 +1,5 @@
-import { CopilotKit } from "@copilotkit/react-core";
+import { AssistantRuntimeProvider } from "@assistant-ui/react";
+import { AssistantChatTransport, useChatRuntime } from "@assistant-ui/react-ai-sdk";
 import "./styles/design-system.css";
 import { TitleBar } from "./components/TitleBar";
 import { IconRail } from "./components/IconRail";
@@ -12,14 +13,12 @@ import { CodingAgentsView } from "./views/CodingAgentsView";
 import { McpServersView } from "./views/McpServersView";
 import { SkillsLibraryView } from "./views/SkillsLibraryView";
 import { SettingsView } from "./views/SettingsView";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useShellState, type ViewKey } from "./state/useShellState";
 import { useConversations } from "./state/useConversations";
 import { API_BASE } from "./state/apiBase.js";
 import { renderUrlHeadless } from "./lib/headlessRender.js";
 import { getResolveToken } from "./lib/resolveToken.js";
-
-const RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
 
 /**
  * Task 10 (SPEC.md's "Headless render bridge" section). Public shape returned
@@ -139,6 +138,62 @@ export function usePendingRenderInteractionWatcher(conversationId: string): void
   }, [conversationId]);
 }
 
+/**
+ * Task 6 (TASKS.md / AC-6.1 / AC-6.2): builds Assistant UI's runtime, replacing
+ * the old `<CopilotKit runtimeUrl={RUNTIME_URL} ...>` wrapper. Points at Task
+ * 5's new per-conversation route (`POST /api/conversations/:id/chat`,
+ * `server/src/index.ts`) rather than a single global endpoint.
+ *
+ * Per-conversation routing mechanism, and why it differs from the
+ * CopilotKit-era fix: the Task 12 critical-bug comment on `<ChatView>` in
+ * `App()` below documents that CopilotKit's own `agent` singleton (owned by
+ * the un-remounted `<CopilotKit>` provider that used to wrap this tree) kept
+ * reusing ONE `threadId` across every conversation, which required both a
+ * `key={state.activeConv}` remount of `ChatView` AND an explicit
+ * `useThreads().setThreadId()` push to fix. That fix doesn't map 1:1 here,
+ * and isn't needed here: the `AssistantChatTransport` below is reconstructed
+ * fresh whenever `conversationId` changes (`useMemo`), and `useChatRuntime`
+ * itself doesn't require a remount to pick that up — verified against the
+ * installed `@assistant-ui/react-ai-sdk@1.3.40` source
+ * (`node_modules/@assistant-ui/react-ai-sdk/dist/ui/use-chat/useChatRuntime.js`,
+ * `useDynamicChatTransport`): it wraps whatever `transport` object is passed
+ * in behind a `Proxy` backed by a `ref` that a `useEffect` updates to the
+ * latest transport after every render, so the *next* HTTP request always
+ * reads the current `.api` URL — no `key`/remount required. This is a
+ * genuinely simpler situation than CopilotKit's: each conversation now gets
+ * a distinct server ROUTE (not just a distinct `threadId` value sent to one
+ * shared route), so there's no shared-singleton state for a stale `api`
+ * string to leak through.
+ *
+ * Scope note: this only proves the transport points at the right ROUTE per
+ * conversation (this task's actual responsibility — see AC-6.2's own doc
+ * comment in App.test.tsx). Full end-to-end cross-conversation message-
+ * content isolation also depends on Assistant UI's own thread-list/thread-
+ * switching model inside `ChatView.tsx`, which this task deliberately does
+ * not touch (Task 8 rebuilds `ChatView.tsx` and re-verifies the full
+ * regression there).
+ *
+ * Exported (rather than kept as an inline call in `App()`) for the same
+ * reason `usePendingRenderInteractionWatcher` above is exported: it lets
+ * App.test.tsx exercise this wiring directly via `renderHook()` without
+ * mounting the rest of the app shell. At the time this hook was written
+ * (Task 6), `ChatView.tsx` still called `@copilotkit/react-core`'s hooks
+ * directly and threw with no `<CopilotKit>` provider in the tree, which made
+ * a full `render(<App />)` unusable as a test vehicle until Task 8 rebuilt
+ * `ChatView.tsx` onto Assistant UI. Task 8 has since landed and
+ * `ChatView.tsx` no longer has that dependency (deleted CopilotKit stack
+ * confirmed by /tgd-review remediation), but the exported-hook test shape
+ * established here was kept rather than churned just because the original
+ * reason for it no longer applies.
+ */
+export function useAssistantChatRuntime(conversationId: string) {
+  const transport = useMemo(
+    () => new AssistantChatTransport({ api: `${API_BASE}/api/conversations/${conversationId}/chat` }),
+    [conversationId],
+  );
+  return useChatRuntime({ transport });
+}
+
 const WINDOW_TITLES: Record<ViewKey, string> = {
   chat: "Chat",
   artifacts: "Artifact Store",
@@ -187,8 +242,10 @@ function App() {
   // view, not just Chat.
   usePendingRenderInteractionWatcher(state.activeConv);
 
+  const runtime = useAssistantChatRuntime(state.activeConv);
+
   return (
-    <CopilotKit runtimeUrl={RUNTIME_URL} showDevConsole={false} enableInspector={false}>
+    <AssistantRuntimeProvider runtime={runtime}>
       <div
         style={{
           width: "100%",
@@ -221,14 +278,21 @@ function App() {
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
               <MainHeader state={state} actions={actions} conversations={conversations} />
 
-              {/* Task 12 critical-bug fix: `key={state.activeConv}` alone does NOT scope which
-                  server-side thread ChatView talks to — CopilotKit's `agent` singleton (owned by
-                  the un-remounted <CopilotKit> above) previously kept sending the SAME threadId
-                  for every conversation. ChatView now also receives `conversationId` and pushes it
-                  onto that singleton via `useThreads().setThreadId()` (see ChatView.tsx's call-site
-                  comment for the full mechanism). The `key` remount is kept alongside it — it still
-                  usefully resets ChatView's own local UI state (draft text, scroll position) and the
-                  connect-effect's ref bookkeeping per switch. */}
+              {/* Task 12 critical-bug fix (historical, CopilotKit era): `key={state.activeConv}` alone
+                  did NOT scope which server-side thread ChatView talked to — CopilotKit's `agent`
+                  singleton (owned by the un-remounted <CopilotKit> that used to wrap this tree) kept
+                  sending the SAME threadId for every conversation, requiring an explicit
+                  `useThreads().setThreadId()` push alongside the `key` remount to fix (pre-Task-6
+                  mechanism, no longer present in the code).
+                  Task 6 (TASKS.md) replaced the `<CopilotKit>` provider above with
+                  `<AssistantRuntimeProvider>` (see that construction's own doc comment above), and Task 8
+                  rebuilt ChatView.tsx onto Assistant UI entirely — it no longer imports
+                  `@copilotkit/react-core` at all. Per-conversation isolation is now handled by
+                  `useAssistantChatRuntime()` routing each conversation to its own server route
+                  (`POST /api/conversations/:id/chat`) rather than a shared threadId, so there is no
+                  `setThreadId()`-equivalent push to make. The `key` remount here is kept regardless —
+                  it still usefully resets ChatView's own local UI state (draft text, scroll position)
+                  and effect ref bookkeeping per conversation switch. */}
               {state.view === "chat" && (
                 <ChatView
                   key={state.activeConv}
@@ -267,7 +331,7 @@ function App() {
           </div>
         </div>
       </div>
-    </CopilotKit>
+    </AssistantRuntimeProvider>
   );
 }
 

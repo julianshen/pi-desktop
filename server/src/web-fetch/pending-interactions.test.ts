@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { create, resolve, getPending } from "./pending-interactions.js";
+import { create, resolve, getPending, onInteractionCreated } from "./pending-interactions.js";
 
 /**
  * Tests for the shared PendingInteraction registry (Task 3, SPEC.md's
@@ -187,5 +187,134 @@ describe("pending-interactions", () => {
 
   test("getPending() returns undefined for a conversation with no pending interaction", () => {
     expect(getPending(randomUUID())).toBeUndefined();
+  });
+});
+
+/**
+ * Tests for the creation-notification hook (Task 4,
+ * ADR-002-tool-approval-trust-boundary.md Decision point 4 -- "Visualization-only
+ * bridge"). `ai-sdk/adapter.ts` subscribes to this so it can write a
+ * `tool-approval-request` chunk purely for frontend visualization -- covered here in
+ * isolation from the adapter itself.
+ */
+describe("pending-interactions: onInteractionCreated (Task 4)", () => {
+  // AC-4.1 [R]: create() with a kind: "confirm" request fires the notification hook
+  // synchronously with the created interaction's public shape (id, conversationId,
+  // host) -- never the internal resolver/timer, matching getPending()'s own
+  // "never expose the resolver" convention.
+  test("AC-4.1: create() with kind:'confirm' fires onInteractionCreated synchronously with the interaction's public shape", () => {
+    const conversationId = randomUUID();
+    let callCount = 0;
+    let notified: unknown;
+
+    const unsubscribe = onInteractionCreated((interaction) => {
+      callCount += 1;
+      notified = interaction;
+    });
+
+    const { id } = create(conversationId, {
+      conversationId,
+      kind: "confirm",
+      host: "172.16.0.4",
+      timeoutMs: 20,
+    });
+
+    unsubscribe();
+
+    // Fired synchronously -- no await needed between create() and this assertion.
+    expect(callCount).toBe(1);
+    expect(notified).toMatchObject({
+      id,
+      conversationId,
+      kind: "confirm",
+      host: "172.16.0.4",
+    });
+    expect(typeof (notified as { createdAt: unknown }).createdAt).toBe("string");
+    // Public shape only -- must never leak the internal resolver/timer.
+    expect(Object.values(notified as object).some((v) => typeof v === "function")).toBe(false);
+  });
+
+  // AC-4.1's companion case: kind: "render" (the headless-webview bridge) does NOT
+  // notify today -- see the doc comment on creationEmitter in pending-interactions.ts.
+  // A future feature wanting the render bridge to also surface over the AI SDK stream
+  // needs to extend this hook, not assume it already does.
+  test("AC-4.1: create() with kind:'render' does NOT fire onInteractionCreated (confirm-kind only)", () => {
+    const conversationId = randomUUID();
+    let callCount = 0;
+
+    const unsubscribe = onInteractionCreated(() => {
+      callCount += 1;
+    });
+
+    create(conversationId, {
+      conversationId,
+      kind: "render",
+      url: "https://example.com/spa",
+      timeoutMs: 20,
+    });
+
+    unsubscribe();
+
+    expect(callCount).toBe(0);
+  });
+
+  test("onInteractionCreated()'s returned unsubscribe function stops further notifications", () => {
+    const conversationId = randomUUID();
+    let callCount = 0;
+
+    const unsubscribe = onInteractionCreated(() => {
+      callCount += 1;
+    });
+    unsubscribe();
+
+    create(conversationId, {
+      conversationId,
+      kind: "confirm",
+      host: "10.0.0.1",
+      timeoutMs: 20,
+    });
+
+    expect(callCount).toBe(0);
+  });
+
+  // tgd-review (code-reviewer, Important) Finding 1: create() runs synchronously
+  // inside web_fetch's execute() (via ctx.ui.confirm(), with no surrounding
+  // try/catch in web-fetch/tools.ts) -- a throwing onInteractionCreated listener
+  // must never be able to propagate back out of create() and fail the underlying
+  // tool call. This is a "visualization-only" bridge (ADR-002 Decision point 4);
+  // it must be inert to its own subscribers' bugs.
+  test("Finding 1: a throwing onInteractionCreated listener does not prevent create() from succeeding, nor block other listeners", () => {
+    const conversationId = randomUUID();
+    let secondListenerCalled = false;
+    let createThrew = false;
+
+    const unsubscribeThrower = onInteractionCreated(() => {
+      throw new Error("simulated listener bug (e.g. writer.write() on a closed stream)");
+    });
+    const unsubscribeSecond = onInteractionCreated(() => {
+      secondListenerCalled = true;
+    });
+
+    let created: ReturnType<typeof create> | undefined;
+    try {
+      created = create(conversationId, {
+        conversationId,
+        kind: "confirm",
+        host: "192.168.50.1",
+        timeoutMs: 20,
+      });
+    } catch {
+      createThrew = true;
+    } finally {
+      unsubscribeThrower();
+      unsubscribeSecond();
+    }
+
+    expect(createThrew).toBe(false);
+    expect(created).toBeDefined();
+    expect(getPending(conversationId)).toMatchObject({ id: created!.id, conversationId });
+    // The throwing listener must not have stopped the OTHER, still-registered
+    // listener from being notified too.
+    expect(secondListenerCalled).toBe(true);
   });
 });
