@@ -276,4 +276,45 @@ describe("pending-interactions: onInteractionCreated (Task 4)", () => {
 
     expect(callCount).toBe(0);
   });
+
+  // tgd-review (code-reviewer, Important) Finding 1: create() runs synchronously
+  // inside web_fetch's execute() (via ctx.ui.confirm(), with no surrounding
+  // try/catch in web-fetch/tools.ts) -- a throwing onInteractionCreated listener
+  // must never be able to propagate back out of create() and fail the underlying
+  // tool call. This is a "visualization-only" bridge (ADR-002 Decision point 4);
+  // it must be inert to its own subscribers' bugs.
+  test("Finding 1: a throwing onInteractionCreated listener does not prevent create() from succeeding, nor block other listeners", () => {
+    const conversationId = randomUUID();
+    let secondListenerCalled = false;
+    let createThrew = false;
+
+    const unsubscribeThrower = onInteractionCreated(() => {
+      throw new Error("simulated listener bug (e.g. writer.write() on a closed stream)");
+    });
+    const unsubscribeSecond = onInteractionCreated(() => {
+      secondListenerCalled = true;
+    });
+
+    let created: ReturnType<typeof create> | undefined;
+    try {
+      created = create(conversationId, {
+        conversationId,
+        kind: "confirm",
+        host: "192.168.50.1",
+        timeoutMs: 20,
+      });
+    } catch {
+      createThrew = true;
+    } finally {
+      unsubscribeThrower();
+      unsubscribeSecond();
+    }
+
+    expect(createThrew).toBe(false);
+    expect(created).toBeDefined();
+    expect(getPending(conversationId)).toMatchObject({ id: created!.id, conversationId });
+    // The throwing listener must not have stopped the OTHER, still-registered
+    // listener from being notified too.
+    expect(secondListenerCalled).toBe(true);
+  });
 });

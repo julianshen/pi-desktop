@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import type { AgentSessionEventSource, PiSessionEvent } from "./adapter.js";
 import { handleAiSdkRun } from "./adapter.js";
-import { create as createPendingInteraction } from "../web-fetch/pending-interactions.js";
+import { create as createPendingInteraction, interactionCreatedListenerCount } from "../web-fetch/pending-interactions.js";
 
 /**
  * Stub `AgentSession`-shaped event source, mirroring `agui/adapter.test.ts`'s own
@@ -323,5 +323,85 @@ describe("handleAiSdkRun", () => {
     const approvalChunks = chunks.filter((c: any) => c.type === "tool-approval-request");
     expect(approvalChunks.length).toBe(1);
     expect((approvalChunks[0] as any).approvalId).toBe(matchingId);
+  });
+
+  // tgd-review (code-reviewer, Important) Finding 2: pi's installed SDK defaults
+  // tool execution to parallel, so two tool calls can legitimately be open at once
+  // in one conversation. A non-gated call's tool_execution_end must never clobber
+  // correlation for a still-pending GATED call's tool-approval-request -- the old
+  // single-value currentToolCallId scheme cleared unconditionally on every
+  // tool_execution_end, regardless of which tool it belonged to. This test fails
+  // against that old scheme (the approval chunk would never appear) and passes
+  // against the current openToolCallIds Set-based tracking.
+  test("Finding 2: a concurrently-open non-gated tool call finishing first does not drop a still-pending gated call's tool-approval-request", async () => {
+    const conversationId = randomUUID();
+    const listeners = new Set<(event: PiSessionEvent) => void>();
+    let approvalInteractionId: string | undefined;
+
+    const session: AgentSessionEventSource = {
+      isStreaming: false,
+      subscribe(cb) {
+        listeners.add(cb);
+        return () => listeners.delete(cb);
+      },
+      async prompt() {
+        // Two tool calls open concurrently: a gated web_fetch and a non-gated
+        // publish_artifact.
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_start", toolCallId: "call-gated", toolName: "web_fetch", args: { url: "http://192.168.1.9/x" } });
+        }
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_start", toolCallId: "call-other", toolName: "publish_artifact", args: {} });
+        }
+        // The NON-gated call finishes first, while the gated call is still open.
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_end", toolCallId: "call-other", result: { ok: true } });
+        }
+        // Only now does the gated call's confirm notification fire.
+        const { id } = createPendingInteraction(conversationId, {
+          conversationId,
+          kind: "confirm",
+          host: "192.168.1.9",
+          timeoutMs: 20,
+        });
+        approvalInteractionId = id;
+        for (const cb of listeners) {
+          cb({ type: "tool_execution_end", toolCallId: "call-gated", result: { approved: true } });
+        }
+        for (const cb of listeners) {
+          cb({ type: "agent_end" });
+        }
+      },
+    };
+
+    const chunks = await collectChunks(handleAiSdkRun(session, "do two things", conversationId));
+
+    const approvalChunk = chunks.find((c: any) => c.type === "tool-approval-request") as any;
+    expect(approvalChunk).toBeDefined();
+    expect(approvalChunk.approvalId).toBe(approvalInteractionId);
+    expect(approvalChunk.toolCallId).toBe("call-gated");
+  });
+
+  // tgd-review (test-engineer, Medium) Finding 3: session.prompt() resolving
+  // cleanly WITHOUT ever emitting agent_end (a malformed/unexpected event
+  // sequence -- not contractually impossible even if unlikely) must still
+  // unsubscribe both the session listener and the onInteractionCreated listener.
+  // Without a `finally`-guaranteed cleanup, both leak for the process lifetime --
+  // costly for onInteractionCreated specifically, since it is a single
+  // module-level EventEmitter shared across ALL conversations, not a per-request
+  // handle.
+  test("Finding 3: session.prompt() resolving without ever emitting agent_end still unsubscribes both listeners (no leak)", async () => {
+    const session = makeStubSession([
+      { type: "message_start", message: { role: "assistant" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "hi" } },
+      { type: "message_end", message: { role: "assistant" } },
+      // Deliberately no agent_end.
+    ]);
+
+    const listenersBefore = interactionCreatedListenerCount();
+    await collectChunks(handleAiSdkRun(session, "hi", "conv-1"));
+
+    expect(session.unsubscribed).toBe(true);
+    expect(interactionCreatedListenerCount()).toBe(listenersBefore);
   });
 });

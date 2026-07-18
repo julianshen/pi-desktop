@@ -99,14 +99,42 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
       // only write `text-end` if `text-start` was actually written.
       let textStarted = false;
 
-      // Tracks "the currently-open tool call for this conversation" as a single
-      // value -- the exact same simplification agui/adapter.ts:90-106 already uses
-      // for currentMessageId. Set on tool_execution_start, cleared on
-      // tool_execution_end. This is a deliberate, documented simplification (ADR-002's
-      // residual-risk note): correct today because no tool in this codebase calls
-      // ctx.ui.confirm() concurrently within one conversation, but it would
-      // silently mis-correlate toolCallIds if a future tool ever did.
-      let currentToolCallId: string | undefined;
+      // tgd-review (code-reviewer, Important) Finding 2: tracks every currently-open
+      // tool call id for this conversation, not a single mutable "currentToolCallId"
+      // value. The single-value version (this file's previous approach, mirroring
+      // agui/adapter.ts:90-106's currentMessageId simplification) was broader-risk
+      // than ADR-002 originally documented: pi's own installed SDK defaults
+      // toolExecution to "parallel" (confirmed against
+      // node_modules/@earendil-works/pi-coding-agent's own bundled pi-agent-core
+      // types.d.ts -- "preflight tool calls sequentially, then execute allowed tools
+      // concurrently"), and nothing in this codebase overrides that default. So ANY
+      // two tool calls -- not just a hypothetical future one -- can already be open
+      // at once in one conversation today (e.g. a non-gated publish_artifact running
+      // alongside a gated web_fetch). Under the old single-value scheme, the
+      // non-gated call's tool_execution_end unconditionally cleared
+      // currentToolCallId to undefined, regardless of which tool it belonged to --
+      // silently dropping the still-pending gated call's tool-approval-request chunk.
+      //
+      // Fix: add the id on tool_execution_start, remove that SPECIFIC id (never
+      // "clear everything") on tool_execution_end. See openToolCallIdForApproval()
+      // below for how a confirm notification correlates back to one of these ids --
+      // pending-interactions.ts's PendingInteraction carries no toolCallId of its
+      // own (Alternatives Considered in ADR-002: threading one through pi's
+      // ExtensionUIContext.confirm() signature would be an SDK-facing change, out of
+      // scope), so exact correlation is only unambiguous when exactly one tool call
+      // is open at notification time. See ADR-002's updated residual-risk note for
+      // the (narrower) remaining edge case: two or more tool calls simultaneously
+      // open AND unresolved at the exact instant a confirm notification fires.
+      const openToolCallIds = new Set<string>();
+
+      // Best-effort correlation for the ambiguous multi-open case: the oldest
+      // still-open call (Set preserves insertion order in JS) is used as the
+      // approval-request's toolCallId. When exactly one call is open -- true for
+      // every case this remediation's regression test exercises, and the common
+      // case in general -- this is exact, not a heuristic at all.
+      function openToolCallIdForApproval(): string | undefined {
+        return openToolCallIds.values().next().value;
+      }
 
       // Task 4 / ADR-002 Decision point 4 -- "Visualization-only bridge". Scoped to
       // this run's conversationId so a kind: "confirm" interaction created for a
@@ -127,19 +155,58 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
         // A kind: "confirm" interaction is only ever created from inside a tool's
         // own execute() (e.g. web_fetch's ctx.ui.confirm() call), which only runs
         // after this adapter has already seen that tool's tool_execution_start --
-        // so currentToolCallId is expected to always be set here. Still guarded
-        // rather than cast, since "expected" isn't "guaranteed" (see the residual-
-        // risk comment on currentToolCallId's declaration above).
-        if (!currentToolCallId) return;
+        // so openToolCallIds is expected to be non-empty here. Still guarded rather
+        // than cast, since "expected" isn't "guaranteed" (see the residual-risk
+        // comment on openToolCallIds's declaration above).
+        const toolCallId = openToolCallIdForApproval();
+        if (!toolCallId) return;
         writer.write({
           type: "tool-approval-request",
           approvalId: interaction.id,
-          toolCallId: currentToolCallId,
+          toolCallId,
           signature: undefined,
         });
       });
 
-      const unsubscribe = session.subscribe((event) => {
+      // tgd-review (test-engineer, Medium) Finding 3: cleanup() is declared here --
+      // *before* session.subscribe() below, not after -- for the exact same reason
+      // unsubscribeInteractions() above is subscribed before session.subscribe():
+      // some event sources invoke their subscribe() listener synchronously, during
+      // subscribe()'s own call, which would hit a temporal-dead-zone ReferenceError
+      // on cleanup()/unsubscribe if either were declared afterward instead.
+      // `unsubscribe` itself starts as `undefined` and is only assigned once
+      // session.subscribe() actually returns below; cleanup() calls it optionally
+      // so a hypothetical synchronous-during-subscribe invocation is a safe no-op
+      // rather than a crash.
+      //
+      // Guarantees unsubscribe() and unsubscribeInteractions() each run exactly
+      // once no matter how execute() exits -- normal agent_end, the message_end
+      // stopReason:"error" path, a rejected session.prompt(), OR (the bug this
+      // fixes) session.prompt() resolving cleanly without ever emitting agent_end or
+      // any error at all (a malformed/unexpected event sequence -- not contractually
+      // impossible even if unlikely). Without this, both subscriptions leak for the
+      // process lifetime; onInteractionCreated's is especially costly to leak, since
+      // it is a single module-level EventEmitter shared across ALL conversations,
+      // not a per-request handle -- a leaked listener here retains a stale
+      // writer/toolCallId closure that could misfire on a LATER, unrelated
+      // interaction for the same conversation id.
+      //
+      // Idempotent by construction (the `cleanedUp` guard): the pre-existing early
+      // calls inside the agent_end / message_end-error branches below still run
+      // synchronously, mid-stream, so the adapter unsubscribes before any
+      // still-queued events (e.g. a stub's own trailing agent_end after an error) can
+      // reach it -- calling cleanup() again from the `finally` further below when
+      // that already happened is then a safe no-op, not a double-unsubscribe.
+      let unsubscribe: (() => void) | undefined;
+      let cleanedUp = false;
+      function cleanup(): void {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        unsubscribe?.();
+        unsubscribeInteractions();
+      }
+
+      unsubscribe = session.subscribe((event) => {
         switch (event.type) {
           case "message_start": {
             if (event.message.role === "assistant") {
@@ -181,8 +248,7 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
                   type: "error",
                   errorText: event.message.errorMessage ?? "The model call failed.",
                 });
-                unsubscribe();
-                unsubscribeInteractions();
+                cleanup();
                 break;
               }
               if (textStarted) {
@@ -199,9 +265,10 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
             // invisible to this adapter until pending-interactions.ts's
             // onInteractionCreated hook (subscribed above) fires independently, mid-
             // execute(), for a kind: "confirm" interaction. This case only needs to
-            // remember the currently-open tool call's id so that later notification
-            // can be correlated to it.
-            currentToolCallId = event.toolCallId;
+            // remember that this tool call is now open, so a later notification can
+            // be correlated to it (tgd-review Finding 2: added to the open set, never
+            // overwriting a single shared value).
+            openToolCallIds.add(event.toolCallId);
             writer.write({
               type: "tool-input-start",
               toolCallId: event.toolCallId,
@@ -216,7 +283,10 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
             break;
           }
           case "tool_execution_end": {
-            currentToolCallId = undefined;
+            // tgd-review Finding 2: remove only THIS tool call's id, never every open
+            // id -- an unrelated, concurrently-open tool call finishing must not
+            // clobber a still-pending gated call's correlation.
+            openToolCallIds.delete(event.toolCallId);
             writer.write({
               type: "tool-output-available",
               toolCallId: event.toolCallId,
@@ -226,8 +296,7 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
           }
           case "agent_end": {
             writer.write({ type: "finish" });
-            unsubscribe();
-            unsubscribeInteractions();
+            cleanup();
             break;
           }
         }
@@ -244,8 +313,8 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
           writer.write({ type: "text-end", id: currentTextId });
         }
         writer.write({ type: "error", errorText: toErrorText(error) });
-        unsubscribe();
-        unsubscribeInteractions();
+      } finally {
+        cleanup();
       }
     },
   });
