@@ -322,6 +322,11 @@ describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
    * reason as index.js above -- it transitively loads config/env.js, which must not
    * resolve against the real environment before this file's top beforeAll sets the
    * scratch PI_DESKTOP_* dirs.
+   *
+   * assistant-ui-migration/AC-15.2: this block is also the re-verification that
+   * a live session still picks up a model switch immediately under the new
+   * chat route (Task 15, re-run and re-confirmed unmodified -- no new test
+   * needed since this one already covers the exact behavior AC-15.2 requires).
    */
   describe("PATCH /api/conversations/:id/model with an already-live cached session", () => {
     // (b): a conversation with a live session must have setModel() called on that

@@ -53,6 +53,13 @@ describe("ArtifactCanvas", () => {
     expect(screen.queryByText("Weekly Active Users")).toBeNull();
   });
 
+  // assistant-ui-migration/AC-16.1: this is also the re-verification that
+  // publish_artifact's Canvas live-update behavior holds now that tool-call
+  // visibility flows through the new ai-sdk/adapter.ts instead of the old
+  // agui/adapter.ts (Task 16, re-run and re-confirmed unmodified). Note the
+  // "AC-13.2" in this test's own name is markdown-rendering's unrelated AC
+  // numbering (a pre-existing coincidental id collision, not this feature's
+  // own AC-13.2 -- see server/src/scheduler/index.test.ts for that one).
   test("AC-13.2: after the current turn completes (refreshSignal changes), the canvas transitions through the updating state and then shows the real published artifact", async () => {
     const initial = makeArtifact({ id: "a1", title: "initial.tsx", code: "const a = 1;" });
     const published = makeArtifact({ id: "a2", title: "published.tsx", code: "const b = 2;" });

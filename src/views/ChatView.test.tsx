@@ -378,6 +378,10 @@ describe("ChatView (Task 8) — item 4: onTurnComplete/onOpenArtifact prop contr
   });
 });
 
+// assistant-ui-migration/AC-15.1: also the re-verification that cross-conversation
+// isolation (wire-chat-backend's original catalog entry) holds under the new
+// Assistant UI runtime -- re-confirmed in Task 15, no new test needed since this
+// one already covers the exact behavior AC-15.1 requires.
 describe("ChatView (Task 8) — item 5: cross-conversation isolation", () => {
   test("switching conversationId clears the previous conversation's messages and seeds the new one's real history", async () => {
     const calls: FetchCall[] = [];
