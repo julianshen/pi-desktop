@@ -176,11 +176,15 @@ export function usePendingRenderInteractionWatcher(conversationId: string): void
  * Exported (rather than kept as an inline call in `App()`) for the same
  * reason `usePendingRenderInteractionWatcher` above is exported: it lets
  * App.test.tsx exercise this wiring directly via `renderHook()` without
- * mounting the rest of the app shell — `ChatView.tsx` still calls
- * `@copilotkit/react-core`'s hooks directly and throws with no `<CopilotKit>`
- * provider in the tree (expected, Task 8's own scope; see this file's other
- * doc comments), so a full `render(<App />)` isn't a viable test vehicle
- * until that task lands.
+ * mounting the rest of the app shell. At the time this hook was written
+ * (Task 6), `ChatView.tsx` still called `@copilotkit/react-core`'s hooks
+ * directly and threw with no `<CopilotKit>` provider in the tree, which made
+ * a full `render(<App />)` unusable as a test vehicle until Task 8 rebuilt
+ * `ChatView.tsx` onto Assistant UI. Task 8 has since landed and
+ * `ChatView.tsx` no longer has that dependency (deleted CopilotKit stack
+ * confirmed by /tgd-review remediation), but the exported-hook test shape
+ * established here was kept rather than churned just because the original
+ * reason for it no longer applies.
  */
 export function useAssistantChatRuntime(conversationId: string) {
   const transport = useMemo(
@@ -275,19 +279,20 @@ function App() {
               <MainHeader state={state} actions={actions} conversations={conversations} />
 
               {/* Task 12 critical-bug fix (historical, CopilotKit era): `key={state.activeConv}` alone
-                  does NOT scope which server-side thread ChatView talks to — CopilotKit's `agent`
-                  singleton (owned by the un-remounted <CopilotKit> that used to wrap this tree) previously
-                  kept sending the SAME threadId for every conversation. ChatView now also receives
-                  `conversationId` and pushes it onto that singleton via `useThreads().setThreadId()` (see
-                  ChatView.tsx's call-site comment for the full mechanism). The `key` remount is kept
-                  alongside it — it still usefully resets ChatView's own local UI state (draft text, scroll
-                  position) and the connect-effect's ref bookkeeping per switch.
-                  Task 6 (TASKS.md) removed the `<CopilotKit>` provider above in favor of
-                  `<AssistantRuntimeProvider>` (see that construction's own doc comment above) — ChatView.tsx
-                  itself still calls `@copilotkit/react-core`'s `useCopilotChatInternal`/`useThreads`
-                  directly and will now throw with no provider in the tree until Task 8 rebuilds it onto
-                  Assistant UI's own thread-switching API; this comment is left describing the pre-Task-6
-                  mechanism for context on why the `key` remount pattern exists. */}
+                  did NOT scope which server-side thread ChatView talked to — CopilotKit's `agent`
+                  singleton (owned by the un-remounted <CopilotKit> that used to wrap this tree) kept
+                  sending the SAME threadId for every conversation, requiring an explicit
+                  `useThreads().setThreadId()` push alongside the `key` remount to fix (pre-Task-6
+                  mechanism, no longer present in the code).
+                  Task 6 (TASKS.md) replaced the `<CopilotKit>` provider above with
+                  `<AssistantRuntimeProvider>` (see that construction's own doc comment above), and Task 8
+                  rebuilt ChatView.tsx onto Assistant UI entirely — it no longer imports
+                  `@copilotkit/react-core` at all. Per-conversation isolation is now handled by
+                  `useAssistantChatRuntime()` routing each conversation to its own server route
+                  (`POST /api/conversations/:id/chat`) rather than a shared threadId, so there is no
+                  `setThreadId()`-equivalent push to make. The `key` remount here is kept regardless —
+                  it still usefully resets ChatView's own local UI state (draft text, scroll position)
+                  and effect ref bookkeeping per conversation switch. */}
               {state.view === "chat" && (
                 <ChatView
                   key={state.activeConv}

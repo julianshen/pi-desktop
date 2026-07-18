@@ -30,9 +30,8 @@ import type { AssistantRuntime } from "@assistant-ui/react";
  *
  * Real (unmocked) `renderUrlHeadless()` (src/lib/headlessRender.ts) is
  * exercised end-to-end, calling into a mocked `@tauri-apps/api/core`
- * `invoke` — same `mock.module()` convention `ChatView.test.tsx` established
- * for `@copilotkit/react-core`, and the same one `headlessRender.test.ts`
- * itself uses.
+ * `invoke` — the same `mock.module()` convention `headlessRender.test.ts`
+ * itself uses for that same module.
  *
  * ADR-001 ("Resolve-endpoint trust boundary") update: the watcher now also calls
  * `getResolveToken()` (src/lib/resolveToken.ts) when it resolves a render-kind
@@ -99,7 +98,7 @@ mock.module("@tauri-apps/api/core", () => ({
 // Imported dynamically, after every mock.module() above registers its
 // replacement — a static top-level `import` would be hoisted ahead of those
 // calls and pick up the real (unmocked) modules instead, same reasoning as
-// ChatView.test.tsx's own dynamic-import comment.
+// headlessRender.test.ts's own dynamic-import comment.
 const { usePendingRenderInteractionWatcher, useAssistantChatRuntime } = await import("./App.js");
 // Already loaded as part of App.js's own import graph above — importing it again
 // here just gets the same cached module instance, exposing its test-only
@@ -373,21 +372,25 @@ describe("usePendingRenderInteractionWatcher (Task 10)", () => {
  * `<CopilotKit runtimeUrl={RUNTIME_URL} ...>` wrapper) is exercised directly
  * via `renderHook()`, the same "exported hook, not `render(<App />)`"
  * convention this file's own header comment establishes for
- * `usePendingRenderInteractionWatcher` above — and for the same underlying
- * reason: `ChatView.tsx` (out of scope for Task 6, rebuilt in Task 8) still
- * imports `@copilotkit/react-core`'s `useCopilotChatInternal`/`useThreads`
- * directly, which throw synchronously ("Remember to wrap your app in a
- * `<CopilotKit>` ...", verified against the installed package's own
+ * `usePendingRenderInteractionWatcher` above. At the time Task 6 wrote this,
+ * `ChatView.tsx` (out of scope for Task 6, rebuilt in Task 8) still imported
+ * `@copilotkit/react-core`'s `useCopilotChatInternal`/`useThreads` directly,
+ * which threw synchronously ("Remember to wrap your app in a `<CopilotKit>`
+ * ...", verified against the installed package's own
  * `useCopilotContext()`/`useThreads()` source,
  * `node_modules/@copilotkit/react-core/dist/copilotkit-*.mjs`) now that
- * `App.tsx` no longer renders a `<CopilotKit>` provider — so
- * `render(<App />)` is not a usable test vehicle until Task 8 lands, and
- * mocking `./views/ChatView` away to work around that would hit this file's
- * own documented `mock.module()` process-global leak pitfall (it would
- * silently swap out the REAL ChatView module for `ChatView.test.tsx` too,
- * in the same `bun test` run). Testing the exported hook directly proves
- * exactly this task's actual scope — the runtime/transport wiring — without
- * either problem.
+ * `App.tsx` no longer rendered a `<CopilotKit>` provider — so
+ * `render(<App />)` wasn't a usable test vehicle until Task 8 landed. Task 8
+ * has since landed and `ChatView.tsx` no longer depends on CopilotKit at all
+ * (the whole `@copilotkit/*`/`agui/`/`copilot/` stack was deleted in a
+ * post-/tgd-review remediation), but this exported-hook test shape was kept
+ * as-is rather than churned now that its original constraint no longer
+ * applies -- mocking `./views/ChatView` away to use `render(<App />)` instead
+ * would still hit this file's own documented `mock.module()` process-global
+ * leak pitfall (it would silently swap out the REAL ChatView module for
+ * `ChatView.test.tsx` too, in the same `bun test` run). Testing the exported
+ * hook directly proves exactly this task's actual scope — the
+ * runtime/transport wiring — without that problem.
  */
 describe("useAssistantChatRuntime (Task 6)", () => {
   test("AC-6.1: wires useChatRuntime to Task 5's per-conversation chat route (POST /api/conversations/:id/chat)", () => {
@@ -398,14 +401,16 @@ describe("useAssistantChatRuntime (Task 6)", () => {
 
   test("AC-6.1 (grep fallback): App.tsx no longer has an `import ... from \"@copilotkit/...\"` statement anywhere", async () => {
     // A runtime assertion that "the tree has no CopilotKit provider" isn't practical
-    // without mounting the (currently-broken-pending-Task-8) ChatView subtree — see this
-    // describe block's own header comment. TASKS.md's Task 6 section explicitly allows a
-    // grep-based check here as a fallback for exactly this reason.
+    // without mounting the ChatView subtree in a way that avoids the mock.module() leak
+    // pitfall described in this describe block's own header comment. TASKS.md's Task 6
+    // section explicitly allows a grep-based check here as a fallback for exactly this
+    // reason, and it remains a valid regression guard now that the CopilotKit stack has
+    // been fully deleted (server/src/copilot/, server/src/agui/, and the @copilotkit/*
+    // dependencies -- post-/tgd-review remediation).
     //
     // Matches actual `import`/`from` statements only, not prose mentions of the package
-    // name — App.tsx's own doc comments (see this file's other Task 6 tests) legitimately
-    // explain ChatView.tsx's still-CopilotKit-dependent behavior in text, which a bare
-    // substring check would wrongly flag as a surviving import.
+    // name — App.tsx's own doc comments legitimately discuss CopilotKit-era history in
+    // text, which a bare substring check would wrongly flag as a surviving import.
     const appSource = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
     const copilotKitImportPattern = /from\s+["']@copilotkit\/(react-core|react-ui|runtime-client-gql)["']/;
     expect(copilotKitImportPattern.test(appSource)).toBe(false);

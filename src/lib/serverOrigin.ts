@@ -1,13 +1,15 @@
 /**
- * Same env var (and same fallback host/port) App.tsx's RUNTIME_URL uses for the
- * CopilotKit endpoint — derived independently here since RUNTIME_URL isn't exported.
- * Do not hardcode a second, divergent default port/host; keep this in sync with
- * App.tsx's `RUNTIME_URL` if that ever changes.
+ * Same env var (and same fallback host/port) `apiBase.ts`'s `API_BASE` uses — derived
+ * independently here since `API_BASE` isn't a bare origin (kept in sync manually; do
+ * not hardcode a second, divergent default port/host).
  *
- * Only the plain HTTP origin is exported (not a path-preserving base) — settings
- * views call REST endpoints under the server root (`/api/settings/...`), not under
- * the CopilotKit path, so any path component of the runtime URL is irrelevant here.
+ * Post-/tgd-review remediation: renamed from `VITE_COPILOTKIT_RUNTIME_URL` alongside
+ * deleting `server/src/copilot/` and `server/src/agui/` — see `apiBase.ts`'s own doc
+ * comment for the full rationale. Only the plain HTTP origin is exported (not a
+ * path-preserving base) — settings views call REST endpoints under the server root
+ * (`/api/settings/...`), so any path component would be irrelevant here even if one
+ * were configured.
  */
-const COPILOTKIT_RUNTIME_URL = import.meta.env.VITE_COPILOTKIT_RUNTIME_URL ?? "http://127.0.0.1:4319/copilotkit";
+const SERVER_BASE_URL = import.meta.env.VITE_SERVER_BASE_URL ?? "http://127.0.0.1:4319";
 
-export const SERVER_ORIGIN = new URL(COPILOTKIT_RUNTIME_URL).origin;
+export const SERVER_ORIGIN = new URL(SERVER_BASE_URL).origin;

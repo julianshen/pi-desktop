@@ -5,9 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { pipeUIMessageStreamToResponse, type UIMessage } from "ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
-import { handleAguiRun } from "./agui/adapter.js";
 import { handleAiSdkRun, type AgentSessionEventSource } from "./ai-sdk/adapter.js";
-import { createCopilotEndpoint } from "./copilot/runtime.js";
 import { startScheduler } from "./scheduler/index.js";
 import { settingsRouter } from "./settings/routes.js";
 import {
@@ -149,15 +147,16 @@ function tokensMatch(expected: string, actual: string): boolean {
  * Task 5: the AI SDK's `UIMessage` shape (verified against the installed
  * `ai@6.0.224` package's own types, `node_modules/ai/dist/index.d.ts:1580`)
  * represents a message's content as `parts: Array<UIMessagePart<...>>`, NOT a
- * plain string like AG-UI's `RunAgentInput` messages (`agui/adapter.ts`'s
- * `extractLatestUserText` reads `message.content` directly) -- a text part is
- * `{ type: 'text', text: string }` (index.d.ts:1609). Mirrors
- * `extractLatestUserText`'s own logic: walk backward from the end of `messages`,
- * return the first `role: "user"` message's text, joining that message's text
- * parts (a message could in principle carry more than one, e.g. text interleaved
- * with file parts) with a blank line. Returns "" for no user message or a user
- * message with no text parts at all (e.g. attachment-only) -- same
- * never-throw-on-a-plausible-but-empty-input convention as the AG-UI helper.
+ * plain string like the now-removed AG-UI `RunAgentInput` messages' `.content`
+ * field (the legacy `agui/adapter.ts`'s `extractLatestUserText` read that
+ * directly; deleted post-/tgd-review once this route fully replaced it) -- a
+ * text part is `{ type: 'text', text: string }` (index.d.ts:1609). Walks
+ * backward from the end of `messages`, returns the first `role: "user"`
+ * message's text, joining that message's text parts (a message could in
+ * principle carry more than one, e.g. text interleaved with file parts) with a
+ * blank line. Returns "" for no user message or a user message with no text
+ * parts at all (e.g. attachment-only) -- never throws on a plausible-but-empty
+ * input.
  */
 function extractLatestUserTextFromUIMessages(messages: UIMessage[]): string {
   for (let i = messages.length - 1; i >= 0; i -= 1) {
@@ -485,33 +484,23 @@ export function createApp(options?: CreateAppOptions): Express {
     res.json({ resolved: true });
   });
 
-  // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
-  // Task 5 (TASKS.md): NOT removed yet -- the new route below is added ALONGSIDE this
-  // one; TASKS.md's own sequencing note says the old CopilotKit/AG-UI path stays until
-  // Task 8's frontend rebuild proves the new one works end-to-end, so there's never a
-  // window with no working chat at all.
-  app.post("/agui", express.json({ limit: "10mb" }), (req, res) => {
-    handleAguiRun(req, res).catch((error: unknown) => {
-      console.error("[agui] unhandled error", error);
-      if (!res.headersSent) res.status(500).end();
-    });
-  });
-
-  // Task 5 (AC-5.1/AC-5.2): the new Vercel AI SDK / Assistant UI chat route, replacing
-  // /agui once Task 8's frontend proves it out. Per-conversation-scoped via the URL
-  // path param (SPEC.md's API Contract explicitly rules out a single global /api/chat
-  // endpoint, matching /agui's existing threadId-scoped precedent and every other
-  // per-conversation route in this file) -- Assistant UI's transport
-  // (`AssistantChatTransport`) is configured with a per-conversation `api` URL, so
-  // this shape composes directly with Task 6's eventual frontend wiring without a
-  // conversationId body field to trust/validate separately.
+  // Task 5 (AC-5.1/AC-5.2): the Vercel AI SDK / Assistant UI chat route. Originally
+  // added alongside the legacy CopilotKit/AG-UI `/agui` route (TASKS.md's Task 5
+  // sequencing note), which stayed until Task 8's frontend rebuild proved this route
+  // out end-to-end. Task 8 landed (commit 9ec4976) and `/agui`, `agui/adapter.ts`, and
+  // `copilot/runtime.ts` have since been deleted (/tgd-review code-reviewer finding,
+  // remediated post-review) -- this is now the only chat route. Per-conversation-
+  // scoped via the URL path param (SPEC.md's API Contract explicitly rules out a
+  // single global /api/chat endpoint, matching every other per-conversation route in
+  // this file) -- Assistant UI's transport (`AssistantChatTransport`) is configured
+  // with a per-conversation `api` URL, so this shape composes directly with the
+  // frontend wiring without a conversationId body field to trust/validate separately.
   //
   // Body shape: `{ messages: UIMessage[] }`, the AI SDK's own standard chat request
   // body (verified against the installed `ai@6.0.224` package's own `UIMessage`
   // export, node_modules/ai/dist/index.d.ts:1580 -- content is `parts: Array<...>`,
   // not a plain string; see extractLatestUserTextFromUIMessages() above for the
-  // exact extraction, mirroring agui/adapter.ts's extractLatestUserText for the
-  // AG-UI shape).
+  // exact extraction).
   //
   // getOrCreateSession(id) rejects (not throws synchronously) for a malformed id --
   // createSession() is an `async function`, so conversationCwd()'s synchronous throw
@@ -560,19 +549,8 @@ export function createApp(options?: CreateAppOptions): Express {
   });
 
   // Settings routes (provider status, connect/disconnect, model selection). Mounted as its
-  // own app.use() call, after /health and /agui and before the CopilotKit catch-all mount
-  // below (that mount is unauthenticated/path-agnostic per its own comment, so anything
-  // that needs its own routing must be registered before it or Express's router falls
-  // through to CopilotKit's handler instead).
+  // own app.use() call, after /health and the AI SDK chat route above.
   app.use("/api/settings", express.json(), settingsRouter);
-
-  const baseUrl = `http://${env.host}:${env.port}`;
-
-  // Mounted at root (not app.use("/copilotkit", ...)): the handler's internal router is built
-  // with basePath: "/copilotkit" and reads the raw req.url, which Express already strips of the
-  // mount prefix for path-scoped app.use() — mounting at root keeps req.url as the full path so
-  // the two agree. CopilotKit's own runtime does its own body parsing; mount unparsed.
-  app.use(createCopilotEndpoint(baseUrl));
 
   return app;
 }

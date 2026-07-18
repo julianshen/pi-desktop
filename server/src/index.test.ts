@@ -625,9 +625,12 @@ describe("GET /api/conversations/:id/artifacts/:artifactId", () => {
 });
 
 /**
- * Task 5 (TASKS.md): the new Vercel AI SDK / Assistant UI chat route, wired
- * alongside (not replacing yet) /agui. Real HTTP over app.listen(), same
- * convention as every other describe block in this file.
+ * Task 5 (TASKS.md): the Vercel AI SDK / Assistant UI chat route (originally wired
+ * alongside the legacy `/agui` route; `/agui`, `agui/adapter.ts`, and
+ * `copilot/runtime.ts` were deleted post-/tgd-review once Task 8's frontend cutover
+ * proved this route out end-to-end — see index.ts's comment above this route for the
+ * full history). Real HTTP over app.listen(), same convention as every other describe
+ * block in this file.
  *
  * Driving a real turn end-to-end would require real provider auth this scratch
  * test env never configures (agent/conversations.ts's createSession() ->
@@ -1046,9 +1049,13 @@ describe("Task 13: web_fetch / ctx.ui.confirm() full chain through the new AI SD
 // Security-review finding (Critical, /tgd-review security-auditor): createApp() used
 // to mount `cors()` with no options, which is the `cors` package's wildcard default
 // (Access-Control-Allow-Origin: *). Combined with zero auth on any route, that let any
-// web page open in the user's regular browser cross-origin POST into /agui (arbitrary
-// prompt injection, including resuming the well-known "default" conversation id) — see
-// config/env.ts's DEFAULT_CORS_ORIGINS for the fix and full origin-allowlist rationale.
+// web page open in the user's regular browser cross-origin POST into the chat route
+// (arbitrary prompt injection, including resuming the well-known "default" conversation
+// id) — see config/env.ts's DEFAULT_CORS_ORIGINS for the fix and full origin-allowlist
+// rationale. Originally exercised against the since-deleted `/agui` route; `cors()` is
+// mounted globally ahead of all routing (app.use(cors(...)) at the top of createApp()),
+// so its preflight handling is path-agnostic — these tests now hit `/api/settings`, a
+// route that still exists, rather than a deleted one.
 //
 // `Content-Type: application/json` POSTs are not CORS-"simple" requests, so browsers
 // preflight them with an OPTIONS request first; these tests drive that same preflight
@@ -1057,7 +1064,7 @@ describe("Task 13: web_fetch / ctx.ui.confirm() full chain through the new AI SD
 // does not get a permissive response, and an allowlisted one does.
 describe("CORS", () => {
   test("preflight from a disallowed origin does not get a permissive Access-Control-Allow-Origin", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://evil.example",
@@ -1076,7 +1083,7 @@ describe("CORS", () => {
   // webview navigates to directly in `tauri dev` — see config/env.ts's comment) must
   // still get a real preflight approval, not just "not blocked".
   test("preflight from the app's own dev-server origin is allowed", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "http://localhost:1420",
@@ -1092,7 +1099,7 @@ describe("CORS", () => {
   // regression here (e.g. someone "simplifying" the allowlist down to just the dev
   // origin) is caught by tests rather than only discovered in a packaged build.
   test("preflight from the packaged macOS/Linux webview origin is allowed", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "tauri://localhost",
