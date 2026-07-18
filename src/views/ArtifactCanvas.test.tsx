@@ -180,6 +180,81 @@ describe("ArtifactCanvas", () => {
     });
   });
 
+  // Bug fix (test-engineer persona, /tgd-review): ArtifactCanvas.tsx's two
+  // independent effects (the [conversationId, pinnedArtifactId]-keyed one and the
+  // [refreshSignal]-keyed one, ArtifactCanvas.tsx:122-145) both call the shared
+  // `load()` function, but each effect's own `cancelled` closure only guards its
+  // OWN next invocation, not the other effect's in-flight fetch. Since App.tsx
+  // renders <ArtifactCanvas> with no `key` prop (it persists across a conversation
+  // switch, unlike key-remounted ChatView), a refreshSignal-triggered fetch for
+  // conversation A that's still in flight when the user switches to conversation B
+  // can resolve AFTER B's fetch and silently clobber B's correct, already-visible
+  // artifact with A's stale one.
+  test("BUG: a stale refreshSignal-triggered fetch for conversation A landing after switching to conversation B must not clobber B's artifact", async () => {
+    const artifactA = makeArtifact({ id: "a1", title: "conv-a-initial.tsx", code: "const a = 1;" });
+    const artifactAUpdated = makeArtifact({ id: "a2", title: "conv-a-updated.tsx", code: "const a2 = 2;" });
+    const artifactB = makeArtifact({ id: "b1", title: "conv-b.tsx", code: "const b = 1;" });
+
+    let resolveStaleAFetch!: (res: Response) => void;
+    const staleAFetch = new Promise<Response>((resolve) => {
+      resolveStaleAFetch = resolve;
+    });
+
+    // fetchArtifact always hits the same "latest" URL per conversation, so a
+    // call-count-aware mock is used to distinguish the first (immediate) conv-a
+    // fetch (initial mount load) from the second (held pending, simulating "a turn
+    // completed on A, refetch is in flight") one.
+    let convACallCount = 0;
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/conversations/conv-a/")) {
+        convACallCount += 1;
+        if (convACallCount === 1) return Promise.resolve(jsonResponse(artifactA));
+        return staleAFetch;
+      }
+      if (url.includes("/conversations/conv-b/")) {
+        return Promise.resolve(jsonResponse(artifactB));
+      }
+      return Promise.reject(new Error(`Unexpected fetch: ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(
+      <ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-a" refreshSignal={0} />,
+    );
+
+    // Initial load of conversation A resolves and renders.
+    await waitFor(() => {
+      expect(screen.getByText("conv-a-initial.tsx")).toBeTruthy();
+    });
+
+    // A turn completes on conversation A: refreshSignal changes, kicking off the
+    // second conv-a fetch — held pending (not resolved yet).
+    rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-a" refreshSignal={1} />);
+    await waitFor(() => {
+      expect(screen.getByText("updating")).toBeTruthy();
+    });
+
+    // Before that fetch resolves, the user switches to conversation B (refreshSignal
+    // unchanged). B's fetch resolves and its artifact must show.
+    rerender(<ArtifactCanvas tab="code" onSetTab={noop} onClose={noop} conversationId="conv-b" refreshSignal={1} />);
+    await waitFor(() => {
+      expect(screen.getByText("conv-b.tsx")).toBeTruthy();
+    });
+    expect(screen.queryByText("updating")).toBeNull();
+
+    // NOW resolve the still-pending stale A fetch. It must NOT be allowed to
+    // overwrite the canvas, which has already moved on to conversation B.
+    resolveStaleAFetch(jsonResponse(artifactAUpdated));
+
+    // Give the resolved promise's .then() a chance to run and (if the bug is
+    // present) clobber state.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(screen.getByText("conv-b.tsx")).toBeTruthy();
+    expect(screen.queryByText("conv-a-updated.tsx")).toBeNull();
+    expect(screen.queryByText("conv-a-initial.tsx")).toBeNull();
+  });
+
   // Preview tab: real usage (checked against actual ~/.pi-desktop artifacts.json
   // data) only ever produces standalone HTML and SVG artifacts with anything
   // visually meaningful to render — this replaces the old unconditional "No rich

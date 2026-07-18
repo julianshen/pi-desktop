@@ -98,17 +98,45 @@ export function ArtifactCanvas({
   const [status, setStatus] = useState<Status>("loading");
   const isFirstRefreshRender = useRef(true);
 
+  /**
+   * Bug fix (test-engineer persona, /tgd-review): `ArtifactCanvas` has two
+   * independent effects below that both call `load()` — one keyed on
+   * `[conversationId, pinnedArtifactId]` (conversation switch), one keyed on
+   * `[refreshSignal]` (a chat turn completing, via App.tsx's
+   * `turnCompleteCount`). Each effect's own `cancelled` closure only guards
+   * against ITS OWN next invocation, not the other effect's in-flight fetch —
+   * and App.tsx renders `<ArtifactCanvas .../>` with no `key` prop (unlike
+   * ChatView, which IS key-remounted per conversation), so this component
+   * persists across a conversation switch instead of unmounting. Reachable
+   * sequence: a turn completes on conversation A (refreshSignal-effect starts
+   * a fetch for A) -> before it resolves, the user switches to conversation B
+   * (conversationId-effect starts and resolves a fetch for B, correctly
+   * showing B) -> the stale A-fetch then resolves and calls
+   * `setArtifact(dataForA)`, silently clobbering B's correct, already-visible
+   * artifact with A's stale one.
+   *
+   * Fix: track the conversationId that's actually still "current" in a ref,
+   * updated synchronously at the top of the conversationId-keyed effect
+   * (which runs before that effect's own fetch is kicked off). Every write
+   * back into state from `load()` — success or failure — checks the id it
+   * was called with against this ref in addition to its own `cancelled` flag,
+   * so a fetch for conversation A landing after the ref has moved on to B can
+   * never win, regardless of which effect started which fetch or the order
+   * they resolve in.
+   */
+  const activeConversationIdRef = useRef<string | null>(conversationId);
+
   const load = useCallback((id: string, mode: "loading" | "updating", artifactId: string | null) => {
     let cancelled = false;
     setStatus(mode);
     fetchArtifact(id, artifactId)
       .then((data) => {
-        if (cancelled) return;
+        if (cancelled || activeConversationIdRef.current !== id) return;
         setArtifact(data);
         setStatus(data ? "populated" : "empty");
       })
       .catch(() => {
-        if (cancelled) return;
+        if (cancelled || activeConversationIdRef.current !== id) return;
         // Honest fallback: don't invent content on a failed fetch, just fall back to
         // whatever we already had (or empty, on a failed initial load).
         setStatus((prev) => (prev === "loading" ? "empty" : prev === "updating" ? "populated" : prev));
@@ -120,6 +148,7 @@ export function ArtifactCanvas({
 
   // Initial mount + conversation switch + pinned-artifact change: reset and fetch fresh.
   useEffect(() => {
+    activeConversationIdRef.current = conversationId;
     if (!conversationId) {
       setArtifact(null);
       setStatus("empty");
