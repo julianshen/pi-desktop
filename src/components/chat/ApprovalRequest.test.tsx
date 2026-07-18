@@ -200,6 +200,83 @@ describe("ApprovalRequest (Task 12, component-level)", () => {
 
     releaseFetch();
   });
+
+  // respond()'s `if (!res.ok)` branch — a server-side rejection of the resolve
+  // call (wrong/rotated X-Resolve-Token, or the interaction already
+  // resolved/expired) must never look like success to the user.
+  test("respond(): a 401 resolve response shows the 401-specific error, is not treated as submitted, and re-enables the button for a retry", async () => {
+    fetchImpl = () => Promise.resolve(new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 }));
+
+    renderStandalone();
+    const approveButton = await waitFor(() => screen.getByText("Approve") as HTMLButtonElement);
+    fireEvent.click(approveButton);
+
+    await waitFor(() => expect(screen.getByText("Could not verify this session — approval was not recorded.")).toBeTruthy());
+    expect(fetchCalls.length).toBe(1);
+    // Not treated as submitted/successful: Approve/Deny remain, re-enabled so
+    // the user has a path forward (e.g. after re-authenticating).
+    await waitFor(() => expect((screen.getByText("Approve") as HTMLButtonElement).disabled).toBe(false));
+    expect((screen.getByText("Deny") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  test("respond(): a non-401 non-ok resolve response (e.g. 500) shows the generic status error, distinct from the 401 copy, and re-enables the button", async () => {
+    fetchImpl = () => Promise.resolve(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+
+    renderStandalone();
+    const approveButton = await waitFor(() => screen.getByText("Approve") as HTMLButtonElement);
+    fireEvent.click(approveButton);
+
+    await waitFor(() => expect(screen.getByText("Approval request failed (status 500) — it was not recorded.")).toBeTruthy());
+    // Distinct from the 401-specific copy above.
+    expect(screen.queryByText(/Could not verify this session/)).toBeNull();
+    expect((screen.getByText("Approve") as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByText("Deny") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // respond()'s `catch (error)` block — a network-level failure of the fetch()
+  // call itself (offline, DNS failure, aborted connection, ...), distinct from
+  // a server response that arrived but was non-ok above.
+  test("respond(): a network exception during fetch() shows the catch-block error and does not leave the button permanently disabled", async () => {
+    fetchImpl = () => Promise.reject(new Error("network down"));
+
+    renderStandalone();
+    const approveButton = await waitFor(() => screen.getByText("Approve") as HTMLButtonElement);
+    fireEvent.click(approveButton);
+
+    await waitFor(() => expect(screen.getByText("Approval request failed — it was not recorded.")).toBeTruthy());
+    expect((screen.getByText("Approve") as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByText("Deny") as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  // respond()'s own comment: the resolve token is re-fetched fresh (via
+  // getResolveToken()) rather than read off the `resolveToken` state var, so a
+  // click landing before the mount effect's setState has committed still gets
+  // the true current token. Simulated with a slow-resolving token invoke():
+  // during that window `resolveToken` state is still `undefined` (not `null`),
+  // so per the AC-12.2 comment above `respond`, Approve/Deny stay enabled
+  // through this transient phase rather than being disabled.
+  test("respond() re-fetches the resolve token fresh, so a click before the mount effect's token state commits still uses the resolved token", async () => {
+    let releaseToken!: (token: string) => void;
+    resolveTokenInvokeImpl = () =>
+      new Promise((resolve) => {
+        releaseToken = resolve;
+      });
+
+    renderStandalone();
+    const approveButton = screen.getByText("Approve") as HTMLButtonElement;
+    expect(approveButton.disabled).toBe(false);
+    fireEvent.click(approveButton);
+
+    // respond() is awaiting its own getResolveToken() call — nothing sent yet.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchCalls.length).toBe(0);
+
+    releaseToken("late-token");
+
+    await waitFor(() => expect(fetchCalls.length).toBe(1));
+    const headers = fetchCalls[0]!.init?.headers as Record<string, string>;
+    expect(headers["X-Resolve-Token"]).toBe("late-token");
+  });
 });
 
 /**
