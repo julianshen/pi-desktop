@@ -39,3 +39,7 @@ server/dist
 # Claude Code runtime state (session locks, machine-local)
 /.claude
 .playwright-mcp/
+
+# Agent planning previews and isolated implementation worktrees
+/.superpowers/
+/.worktrees/
