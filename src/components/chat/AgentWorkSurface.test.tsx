@@ -11,6 +11,24 @@ const stop = mock(async () => {});
 const steer = mock(async (_instruction: string) => {});
 const originalResizeObserver = globalThis.ResizeObserver;
 const originalMutationObserver = globalThis.MutationObserver;
+const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+const originalCancelAnimationFrame = globalThis.cancelAnimationFrame;
+let nextAnimationFrameId = 1;
+let animationFrames = new Map<number, FrameRequestCallback>();
+const requestAnimationFrameMock = mock((callback: FrameRequestCallback) => {
+  const id = nextAnimationFrameId++;
+  animationFrames.set(id, callback);
+  return id;
+});
+const cancelAnimationFrameMock = mock((id: number) => {
+  animationFrames.delete(id);
+});
+
+function flushAnimationFrames() {
+  const pending = [...animationFrames.values()];
+  animationFrames.clear();
+  pending.forEach((callback) => callback(0));
+}
 
 function makeState(status: Status | null = "running", options: { id?: string; plan?: Step[]; events?: ReturnTypeUseActiveRun["events"] } = {}): ReturnTypeUseActiveRun {
   return {
@@ -84,8 +102,14 @@ beforeEach(() => {
   steer.mockClear();
   ResizeObserverMock.instances = [];
   MutationObserverMock.instances = [];
+  nextAnimationFrameId = 1;
+  animationFrames = new Map();
+  requestAnimationFrameMock.mockClear();
+  cancelAnimationFrameMock.mockClear();
   globalThis.ResizeObserver = ResizeObserverMock as unknown as typeof ResizeObserver;
   globalThis.MutationObserver = MutationObserverMock as unknown as typeof MutationObserver;
+  globalThis.requestAnimationFrame = requestAnimationFrameMock;
+  globalThis.cancelAnimationFrame = cancelAnimationFrameMock;
 });
 
 afterEach(() => {
@@ -94,6 +118,10 @@ afterEach(() => {
   else Reflect.deleteProperty(globalThis, "ResizeObserver");
   if (originalMutationObserver) globalThis.MutationObserver = originalMutationObserver;
   else Reflect.deleteProperty(globalThis, "MutationObserver");
+  if (originalRequestAnimationFrame) globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+  else Reflect.deleteProperty(globalThis, "requestAnimationFrame");
+  if (originalCancelAnimationFrame) globalThis.cancelAnimationFrame = originalCancelAnimationFrame;
+  else Reflect.deleteProperty(globalThis, "cancelAnimationFrame");
 });
 
 describe("AgentWorkSurface", () => {
@@ -294,25 +322,34 @@ describe("AgentWorkSurface", () => {
 
     boundaryTop = 350;
     act(() => observer.resize(element));
+    act(() => flushAnimationFrames());
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 250px");
     regionBottom = 700;
     act(() => observer.resize(chatRegion));
+    act(() => flushAnimationFrames());
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 350px");
     unmount();
     expect(observer.disconnect).toHaveBeenCalledTimes(1);
   });
 
-  test("remeasures when trailing UI is inserted and removed without either observed element resizing", async () => {
+  test("observes only while open and batches trailing-UI mutations to one measure per frame", async () => {
     let boundaryRef: RefCallback<HTMLElement | null> | undefined;
     const { unmount } = renderSurface(makeState(), { captureRef: (ref) => { boundaryRef = ref; } });
     const boundary = document.createElement("div");
     const chatRegion = screen.getByTestId("transcript-control").parentElement!;
     let boundaryTop = 500;
+    let boundaryReads = 0;
     chatRegion.getBoundingClientRect = () => ({ width: 0, height: 600, top: 0, right: 0, bottom: 600, left: 0, x: 0, y: 0, toJSON() {} });
-    boundary.getBoundingClientRect = () => ({ width: 0, height: 80, top: boundaryTop, right: 0, bottom: boundaryTop + 80, left: 0, x: 0, y: boundaryTop, toJSON() {} });
+    boundary.getBoundingClientRect = () => {
+      boundaryReads += 1;
+      return { width: 0, height: 80, top: boundaryTop, right: 0, bottom: boundaryTop + 80, left: 0, x: 0, y: boundaryTop, toJSON() {} };
+    };
     act(() => boundaryRef?.(boundary));
+    expect(MutationObserverMock.instances).toHaveLength(0);
+    expect(ResizeObserverMock.instances).toHaveLength(0);
     fireEvent.click(primaryButton());
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 100px");
+    expect(boundaryReads).toBe(1);
 
     const mutationObserver = MutationObserverMock.instances.at(-1)!;
     expect(mutationObserver.observe).toHaveBeenCalledWith(chatRegion, {
@@ -324,16 +361,26 @@ describe("AgentWorkSurface", () => {
     boundaryTop = 440;
     chatRegion.appendChild(trailing);
     mutationObserver.mutate([{ type: "childList", target: chatRegion }]);
+    mutationObserver.mutate([{ type: "characterData", target: trailing }]);
     await act(async () => { await Promise.resolve(); });
+    expect(requestAnimationFrameMock).toHaveBeenCalledTimes(1);
+    expect(boundaryReads).toBe(1);
+    act(() => flushAnimationFrames());
+    expect(boundaryReads).toBe(2);
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 160px");
 
     boundaryTop = 500;
     trailing.remove();
     mutationObserver.mutate([{ type: "childList", target: chatRegion }]);
     await act(async () => { await Promise.resolve(); });
+    act(() => flushAnimationFrames());
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 100px");
 
+    mutationObserver.mutate([{ type: "characterData", target: chatRegion }]);
+    await act(async () => { await Promise.resolve(); });
     unmount();
+    expect(cancelAnimationFrameMock).toHaveBeenCalledTimes(1);
+    expect(animationFrames.size).toBe(0);
     expect(mutationObserver.disconnect).toHaveBeenCalledTimes(1);
   });
 });

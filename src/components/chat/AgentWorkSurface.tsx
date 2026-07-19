@@ -54,27 +54,36 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
 
   useLayoutEffect(() => {
     const chatRegion = chatRegionRef.current;
-    if (!composerBoundary || !chatRegion) return;
+    if (!expanded || !visibleRun || !composerBoundary || !chatRegion) return;
     const measure = () => {
       const regionBottom = chatRegion.getBoundingClientRect().bottom;
       const composerTop = composerBoundary.getBoundingClientRect().top;
       setComposerClearance(Math.max(0, regionBottom - composerTop));
     };
+    let pendingFrame: number | null = null;
+    const scheduleMeasure = () => {
+      if (pendingFrame !== null) return;
+      pendingFrame = requestAnimationFrame(() => {
+        pendingFrame = null;
+        measure();
+      });
+    };
     measure();
-    const resizeObserver = new ResizeObserver(measure);
+    const resizeObserver = new ResizeObserver(scheduleMeasure);
     resizeObserver.observe(composerBoundary);
     resizeObserver.observe(chatRegion);
-    const mutationObserver = new MutationObserver(measure);
+    const mutationObserver = new MutationObserver(scheduleMeasure);
     mutationObserver.observe(chatRegion, {
       childList: true,
       subtree: true,
       characterData: true,
     });
     return () => {
+      if (pendingFrame !== null) cancelAnimationFrame(pendingFrame);
       resizeObserver.disconnect();
       mutationObserver.disconnect();
     };
-  }, [composerBoundary]);
+  }, [composerBoundary, expanded, visibleRun?.id]);
 
   const closeAndRestoreFocus = useCallback(() => {
     setExpanded(false);
