@@ -29,6 +29,7 @@ const STATUS_LABELS = {
 } as const;
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "stopped", "interrupted"]);
+const DRAWER_HEIGHT = "min(520px, max(0px, calc(100% - var(--composer-boundary-height))))";
 
 function safeId(value: string) {
   return value.replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -162,8 +163,9 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
               className="absolute right-0 top-0 z-30 w-[min(420px,100%)] overflow-y-auto border border-border bg-surface shadow-lg"
               style={{
                 ...overlayStyle,
-                height: "min(520px, max(0px, calc(100% - var(--composer-boundary-height))))",
-              }}
+                "--agent-work-drawer-height": DRAWER_HEIGHT,
+                height: "var(--agent-work-drawer-height)",
+              } as CSSProperties}
               aria-label="Agent work details"
             >
               <div className="h-full">

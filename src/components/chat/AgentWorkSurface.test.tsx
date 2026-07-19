@@ -26,14 +26,19 @@ function makeState(status: Status | null = "running", options: { id?: string; pl
   };
 }
 
-function renderSurface(state = makeState(), options: { conversationId?: string; chatClick?: () => void; captureRef?: (ref: RefCallback<HTMLElement | null>) => void } = {}) {
+function renderSurface(state = makeState(), options: { conversationId?: string; chatClick?: () => void; composerClick?: () => void; captureRef?: (ref: RefCallback<HTMLElement | null>) => void } = {}) {
   return render(
     <AgentWorkSurface
       state={state}
       conversationId={options.conversationId ?? "conversation-1"}
       renderChat={(composerBoundaryRef) => {
         options.captureRef?.(composerBoundaryRef);
-        return <button type="button" onClick={options.chatClick} data-testid="transcript-control">Transcript control</button>;
+        return (
+          <>
+            <button type="button" onClick={options.chatClick} data-testid="transcript-control">Transcript control</button>
+            <button type="button" onClick={options.composerClick} data-testid="composer-control">Composer control</button>
+          </>
+        );
       }}
     />,
   );
@@ -143,7 +148,8 @@ describe("AgentWorkSurface", () => {
 
   test("is initially collapsed and expands, toggles, and closes from backdrop with focus restoration", () => {
     const chatClick = mock(() => {});
-    renderSurface(makeState(), { chatClick });
+    const composerClick = mock(() => {});
+    renderSurface(makeState(), { chatClick, composerClick });
     const primary = primaryButton();
     expect(primary.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByLabelText("Agent work details")).toBeNull();
@@ -153,6 +159,7 @@ describe("AgentWorkSurface", () => {
     const backdrop = screen.getByLabelText("Close Agent work details");
     fireEvent.click(backdrop);
     expect(chatClick).not.toHaveBeenCalled();
+    expect(composerClick).not.toHaveBeenCalled();
     expect(screen.queryByLabelText("Agent work details")).toBeNull();
     expect(document.activeElement).toBe(primary);
     fireEvent.click(primary);
@@ -222,7 +229,11 @@ describe("AgentWorkSurface", () => {
     fireEvent.click(primaryButton());
     const drawer = screen.getByLabelText("Agent work details");
     const backdrop = screen.getByLabelText("Close Agent work details");
+    expect(drawer.className).toContain("w-[min(420px,100%)]");
+    expect(drawer.className).toContain("overflow-y-auto");
     expect((drawer.getAttribute("style") ?? "")).toContain("--composer-boundary-height: 160px");
+    expect(drawer.style.height).toBe("var(--agent-work-drawer-height)");
+    expect(drawer.style.getPropertyValue("--agent-work-drawer-height")).toBe("min(520px, max(0px, calc(100% - var(--composer-boundary-height))))");
     expect((backdrop.getAttribute("style") ?? "")).toContain("bottom: var(--composer-boundary-height)");
 
     const element = document.createElement("div");
