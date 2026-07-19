@@ -103,7 +103,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
             ? "border-danger bg-danger-bg text-danger"
             : visibleRun.status === "stopped" || visibleRun.status === "interrupted"
               ? "border-divider bg-surface text-muted"
-              : "border-divider bg-surface text-text";
+              : "border-divider bg-surface text-accent";
         return (
           <div className={`flex h-8 shrink-0 border ${rowVariant}`}>
             <span key={`${visibleRun.id}-${visibleRun.status}`} className="sr-only" aria-live="polite" aria-atomic="true">
@@ -133,7 +133,8 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
                 type="button"
                 className="flex w-8 shrink-0 items-center justify-center border-l border-current/20"
                 aria-label="Dismiss Agent work result"
-                onClick={() => {
+                onClick={(event) => {
+                  event.stopPropagation();
                   setExpanded(false);
                   setDismissedRunId(visibleRun.id);
                 }}

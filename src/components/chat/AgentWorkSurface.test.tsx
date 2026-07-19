@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { RefCallback } from "react";
 import { AgentWorkSurface } from "./AgentWorkSurface.js";
@@ -9,6 +9,7 @@ type Step = ReturnTypeUseActiveRun["plan"][number];
 
 const stop = mock(async () => {});
 const steer = mock(async (_instruction: string) => {});
+const originalResizeObserver = globalThis.ResizeObserver;
 
 function makeState(status: Status | null = "running", options: { id?: string; plan?: Step[]; events?: ReturnTypeUseActiveRun["events"] } = {}): ReturnTypeUseActiveRun {
   return {
@@ -70,7 +71,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  document.body.innerHTML = "";
+  cleanup();
+  if (originalResizeObserver) globalThis.ResizeObserver = originalResizeObserver;
+  else Reflect.deleteProperty(globalThis, "ResizeObserver");
 });
 
 describe("AgentWorkSurface", () => {
@@ -128,22 +131,42 @@ describe("AgentWorkSurface", () => {
     expect(screen.getByText("First pending")).toBeTruthy();
   });
 
-  test("uses the required icons, token variants, and motion-safe running dot", () => {
-    const { rerender } = render(<AgentWorkSurface state={makeState("running")} conversationId="c" renderChat={() => <div />} />);
-    const runningDot = screen.getByTestId("agent-work-running-dot");
-    expect(runningDot.className).toContain("bg-accent");
-    expect(runningDot.className).toContain("motion-safe:animate-pulse");
-    expect(runningDot.className).toContain("motion-reduce:animate-none");
+  test.each([
+    ["queued", "border-divider bg-surface text-accent", null, true],
+    ["running", "border-divider bg-surface text-accent", null, true],
+    ["completed", "border-success bg-success-bg text-success", "lucide-circle-check", false],
+    ["failed", "border-danger bg-danger-bg text-danger", "lucide-circle-alert", false],
+    ["stopped", "border-divider bg-surface text-muted", "lucide-circle-stop", false],
+    ["interrupted", "border-divider bg-surface text-muted", "lucide-circle-stop", false],
+  ] as const)("uses the required %s token and icon treatment", (status, tokens, iconClass, hasRunningDot) => {
+    render(<AgentWorkSurface state={makeState(status)} conversationId="c" renderChat={() => <div />} />);
+    expect(primaryButton().parentElement?.className).toContain(tokens);
+    const icon = screen.queryByTestId("agent-work-status-icon");
+    if (iconClass) expect(icon?.getAttribute("class")).toContain(iconClass);
+    else expect(icon).toBeNull();
+    const runningDot = screen.queryByTestId("agent-work-running-dot");
+    expect(Boolean(runningDot)).toBe(hasRunningDot);
+    if (runningDot) {
+      expect(runningDot.className).toContain("bg-accent");
+      expect(runningDot.className).toContain("motion-safe:animate-pulse");
+      expect(runningDot.className).toContain("motion-reduce:animate-none");
+    }
+  });
 
-    rerender(<AgentWorkSurface state={makeState("completed")} conversationId="c" renderChat={() => <div />} />);
-    expect(screen.getByTestId("agent-work-status-icon").getAttribute("class")).toContain("lucide-circle-check");
-    expect(primaryButton().parentElement?.className).toContain("border-success bg-success-bg text-success");
-    rerender(<AgentWorkSurface state={makeState("failed")} conversationId="c" renderChat={() => <div />} />);
-    expect(screen.getByTestId("agent-work-status-icon").getAttribute("class")).toContain("lucide-circle-alert");
-    expect(primaryButton().parentElement?.className).toContain("border-danger bg-danger-bg text-danger");
-    rerender(<AgentWorkSurface state={makeState("stopped")} conversationId="c" renderChat={() => <div />} />);
-    expect(screen.getByTestId("agent-work-status-icon").getAttribute("class")).toContain("lucide-circle-stop");
-    expect(primaryButton().parentElement?.className).toContain("border-divider bg-surface text-muted");
+  test.each(["completed", "failed", "stopped", "interrupted"] as const)("exposes dismiss for terminal %s runs without bubbling", (status) => {
+    const outerClick = mock(() => {});
+    render(
+      <div onClick={outerClick}>
+        <AgentWorkSurface state={makeState(status)} conversationId="c" renderChat={() => <div />} />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Agent work result" }));
+    expect(outerClick).not.toHaveBeenCalled();
+  });
+
+  test.each(["queued", "running"] as const)("omits dismiss for active %s runs", (status) => {
+    render(<AgentWorkSurface state={makeState(status)} conversationId="c" renderChat={() => <div />} />);
+    expect(screen.queryByRole("button", { name: "Dismiss Agent work result" })).toBeNull();
   });
 
   test("is initially collapsed and expands, toggles, and closes from backdrop with focus restoration", () => {
