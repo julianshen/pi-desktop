@@ -39,7 +39,8 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
   const [expanded, setExpanded] = useState(false);
   const [dismissedRunId, setDismissedRunId] = useState<string | null>(null);
   const [composerBoundary, setComposerBoundary] = useState<HTMLElement | null>(null);
-  const [composerBoundaryHeight, setComposerBoundaryHeight] = useState(160);
+  const [composerClearance, setComposerClearance] = useState(160);
+  const chatRegionRef = useRef<HTMLDivElement>(null);
   const primaryButtonRef = useRef<HTMLButtonElement>(null);
   const run = state.run;
   const visibleRun = run && dismissedRunId !== run.id ? run : null;
@@ -52,11 +53,17 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
   }, [conversationId, run?.id]);
 
   useLayoutEffect(() => {
-    if (!composerBoundary) return;
-    const measure = () => setComposerBoundaryHeight(composerBoundary.getBoundingClientRect().height);
+    const chatRegion = chatRegionRef.current;
+    if (!composerBoundary || !chatRegion) return;
+    const measure = () => {
+      const regionBottom = chatRegion.getBoundingClientRect().bottom;
+      const composerTop = composerBoundary.getBoundingClientRect().top;
+      setComposerClearance(Math.max(0, regionBottom - composerTop));
+    };
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(composerBoundary);
+    observer.observe(chatRegion);
     return () => observer.disconnect();
   }, [composerBoundary]);
 
@@ -88,7 +95,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
     ? `agent-work-details-${safeId(conversationId)}-${safeId(visibleRun.id)}`
     : undefined;
   const overlayStyle = {
-    "--composer-boundary-height": `${composerBoundaryHeight}px`,
+    "--composer-boundary-height": `${composerClearance}px`,
   } as CSSProperties;
 
   return (
@@ -145,7 +152,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
           </div>
         );
       })()}
-      <div className="relative min-h-0 flex-1">
+      <div ref={chatRegionRef} className="relative flex min-h-0 flex-1">
         {renderChat(composerBoundaryRef)}
         {visibleRun && expanded && (
           <>

@@ -82,7 +82,7 @@ describe("AgentWorkSurface", () => {
     expect(screen.getByTestId("transcript-control")).toBeTruthy();
     expect(screen.queryByText("Agent work")).toBeNull();
     expect(container.firstElementChild?.className).toContain("flex min-h-0 flex-1 flex-col");
-    expect(screen.getByTestId("transcript-control").parentElement?.className).toContain("relative min-h-0 flex-1");
+    expect(screen.getByTestId("transcript-control").parentElement?.className).toContain("relative flex min-h-0 flex-1");
   });
 
   test.each([
@@ -246,7 +246,7 @@ describe("AgentWorkSurface", () => {
     expect(stop).toHaveBeenCalledTimes(1);
   });
 
-  test("uses fallback composer height, measures an attached boundary, observes resize, and disconnects", () => {
+  test("uses fallback clearance, reserves footer plus trailing UI, observes both boundaries, and disconnects", () => {
     let boundaryRef: RefCallback<HTMLElement | null> | undefined;
     const { unmount } = renderSurface(makeState(), { captureRef: (ref) => { boundaryRef = ref; } });
     fireEvent.click(primaryButton());
@@ -260,14 +260,24 @@ describe("AgentWorkSurface", () => {
     expect((backdrop.getAttribute("style") ?? "")).toContain("bottom: var(--composer-boundary-height)");
 
     const element = document.createElement("div");
-    let height = 88;
-    element.getBoundingClientRect = () => ({ width: 0, height, top: 0, right: 0, bottom: height, left: 0, x: 0, y: 0, toJSON() {} });
+    const chatRegion = screen.getByTestId("transcript-control").parentElement!;
+    let boundaryTop = 400;
+    let regionBottom = 600;
+    element.getBoundingClientRect = () => ({ width: 0, height: 88, top: boundaryTop, right: 0, bottom: boundaryTop + 88, left: 0, x: 0, y: boundaryTop, toJSON() {} });
+    chatRegion.getBoundingClientRect = () => ({ width: 0, height: regionBottom, top: 0, right: 0, bottom: regionBottom, left: 0, x: 0, y: 0, toJSON() {} });
     act(() => boundaryRef?.(element));
-    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 88px");
-    height = 156;
-    act(() => ResizeObserverMock.instances.at(-1)?.resize(element));
-    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 156px");
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 200px");
     const observer = ResizeObserverMock.instances.at(-1)!;
+    expect(observer.observe).toHaveBeenCalledTimes(2);
+    expect(observer.observe).toHaveBeenCalledWith(element);
+    expect(observer.observe).toHaveBeenCalledWith(chatRegion);
+
+    boundaryTop = 350;
+    act(() => observer.resize(element));
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 250px");
+    regionBottom = 700;
+    act(() => observer.resize(chatRegion));
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 350px");
     unmount();
     expect(observer.disconnect).toHaveBeenCalledTimes(1);
   });
