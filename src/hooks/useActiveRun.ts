@@ -15,6 +15,7 @@ export function useActiveRun(conversationId: string) {
   const [error, setError] = useState<string | null>(null);
   const cursorRef = useRef(0);
   const restoredRunIdsRef = useRef(new Set<string>());
+  const scopedRun = run?.conversationId === conversationId ? run : null;
 
   const mergeEvents = useCallback((incoming: RunEventView[]) => {
     setEvents((current) => {
@@ -29,6 +30,7 @@ export function useActiveRun(conversationId: string) {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let activeRunId: string | null = null;
     cursorRef.current = 0;
     setEvents([]);
     setRun(null);
@@ -42,7 +44,14 @@ export function useActiveRun(conversationId: string) {
         const list = await response.json() as ActiveRunView[];
         if (cancelled) return;
         const currentRun = list[0] ?? null;
+        const nextRunId = currentRun?.id ?? null;
+        if (nextRunId !== activeRunId) {
+          activeRunId = nextRunId;
+          cursorRef.current = 0;
+          setEvents([]);
+        }
         setRun(currentRun);
+        setError(null);
         attemptedRun = currentRun;
         if (currentRun) {
           const [runResponse, eventsResponse] = await Promise.all([
@@ -80,24 +89,25 @@ export function useActiveRun(conversationId: string) {
   }, [conversationId, mergeEvents]);
 
   const stop = useCallback(async () => {
-    if (!run) return;
-    const response = await fetch(`${API_BASE}/api/runs/${run.id}/stop`, { method: "POST" });
+    if (!scopedRun) return;
+    const response = await fetch(`${API_BASE}/api/runs/${scopedRun.id}/stop`, { method: "POST" });
     if (!response.ok) throw new Error(`Could not stop run (${response.status})`);
     setRun(await response.json() as ActiveRunView);
-  }, [run]);
+  }, [scopedRun]);
 
   const steer = useCallback(async (instruction: string) => {
-    if (!run) return;
-    const response = await fetch(`${API_BASE}/api/runs/${run.id}/steer`, {
+    if (!scopedRun) return;
+    const response = await fetch(`${API_BASE}/api/runs/${scopedRun.id}/steer`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ instruction }),
     });
     if (!response.ok) throw new Error(`Could not steer run (${response.status})`);
-  }, [run]);
+  }, [scopedRun]);
 
   const plan = useMemo(() => {
+    if (!scopedRun) return [];
     const latest = [...events].reverse().find((event) => event.type === "plan_updated")?.data as { steps?: Array<{ id: string; text: string; status: PlanStepView["status"] }> } | undefined;
-    return latest?.steps?.map((step, position) => ({ id: step.id, position, title: step.text, status: step.status })) ?? run?.plan ?? [];
-  }, [events, run]);
+    return latest?.steps?.map((step, position) => ({ id: step.id, position, title: step.text, status: step.status })) ?? scopedRun?.plan ?? [];
+  }, [events, scopedRun]);
 
-  return { run, events, plan, error, stop, steer };
+  return { run: scopedRun, events: scopedRun ? events : [], plan, error, stop, steer };
 }
