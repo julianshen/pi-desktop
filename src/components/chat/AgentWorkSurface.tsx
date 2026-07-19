@@ -42,6 +42,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
   const [composerClearance, setComposerClearance] = useState(160);
   const chatRegionRef = useRef<HTMLDivElement>(null);
   const primaryButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerRef = useRef<HTMLElement>(null);
   const run = state.run;
   const visibleRun = run && dismissedRunId !== run.id ? run : null;
   const composerBoundaryRef = useCallback<RefCallback<HTMLElement | null>>((element) => {
@@ -92,6 +93,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
 
   useEffect(() => {
     if (!expanded) return;
+    drawerRef.current?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") closeAndRestoreFocus();
     };
@@ -112,6 +114,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
   const drawerId = visibleRun
     ? `agent-work-details-${safeId(conversationId)}-${safeId(visibleRun.id)}`
     : undefined;
+  const accessibleNameBase = drawerId ? `${drawerId}-summary` : undefined;
   const overlayStyle = {
     "--composer-boundary-height": `${composerClearance}px`,
   } as CSSProperties;
@@ -122,6 +125,13 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
         const statusLabel = STATUS_LABELS[visibleRun.status];
         const running = visibleRun.status === "queued" || visibleRun.status === "running";
         const terminal = TERMINAL_STATUSES.has(visibleRun.status);
+        const labelledBy = [
+          `${accessibleNameBase}-label`,
+          `${accessibleNameBase}-status`,
+          currentStep ? `${accessibleNameBase}-step` : null,
+          sortedPlan.length > 0 ? `${accessibleNameBase}-progress` : null,
+          `${accessibleNameBase}-intent`,
+        ].filter(Boolean).join(" ");
         const rowVariant = visibleRun.status === "completed"
           ? "border-success bg-success-bg text-success"
           : visibleRun.status === "failed"
@@ -138,7 +148,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
               ref={primaryButtonRef}
               type="button"
               className="flex min-w-0 flex-1 items-center gap-ds-2 px-ds-3 text-left font-body text-[12px]"
-              aria-label={`Agent work details: ${statusLabel}`}
+              aria-labelledby={labelledBy}
               aria-expanded={expanded}
               aria-controls={drawerId}
               onClick={() => setExpanded((open) => !open)}
@@ -147,11 +157,12 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
               {visibleRun.status === "completed" && <CircleCheckIcon data-testid="agent-work-status-icon" size={14} />}
               {visibleRun.status === "failed" && <CircleAlertIcon data-testid="agent-work-status-icon" size={14} />}
               {(visibleRun.status === "stopped" || visibleRun.status === "interrupted") && <CircleStopIcon data-testid="agent-work-status-icon" size={14} />}
-              <span className="font-heading uppercase tracking-[0.08em]">Agent work</span>
-              <span>{statusLabel}</span>
-              {currentStep && <span className="hidden min-[620px]:inline min-w-0 truncate">{currentStep.title}</span>}
-              {sortedPlan.length > 0 && <span className="ml-auto shrink-0">{completed}/{sortedPlan.length}</span>}
+              <span id={`${accessibleNameBase}-label`} className="font-heading uppercase tracking-[0.08em]">Agent work</span>
+              <span id={`${accessibleNameBase}-status`}>{statusLabel}</span>
+              {currentStep && <span id={`${accessibleNameBase}-step`} className="hidden min-[620px]:inline min-w-0 truncate">{currentStep.title}</span>}
+              {sortedPlan.length > 0 && <span id={`${accessibleNameBase}-progress`} className="ml-auto shrink-0">{completed}/{sortedPlan.length}</span>}
               <ChevronDownIcon size={14} className={`shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`} />
+              <span id={`${accessibleNameBase}-intent`} className="sr-only">{expanded ? "Collapse details" : "Expand details"}</span>
             </button>
             {terminal && (
               <button
@@ -160,6 +171,9 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
                 aria-label="Dismiss Agent work result"
                 onClick={(event) => {
                   event.stopPropagation();
+                  composerBoundary?.querySelector<HTMLElement>(
+                    'textarea[aria-label="Message"], input[aria-label="Message"], [contenteditable="true"][aria-label="Message"]',
+                  )?.focus();
                   setExpanded(false);
                   setDismissedRunId(visibleRun.id);
                 }}
@@ -176,6 +190,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
           <>
             <button
               type="button"
+              tabIndex={-1}
               className="absolute inset-x-0 top-0 z-20 cursor-default bg-transparent"
               style={{ ...overlayStyle, bottom: "var(--composer-boundary-height)" }}
               aria-label="Close Agent work details"
@@ -185,7 +200,9 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
               }}
             />
             <aside
+              ref={drawerRef}
               id={drawerId}
+              tabIndex={-1}
               className="absolute right-0 top-0 z-30 w-[min(420px,100%)] overflow-y-auto border border-border bg-surface shadow-lg"
               style={{
                 ...overlayStyle,

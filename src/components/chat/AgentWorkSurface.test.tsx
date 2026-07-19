@@ -140,6 +140,21 @@ describe("AgentWorkSurface", () => {
     renderSurface(makeState(status));
     expect(screen.getByText(label)).toBeTruthy();
     expect(screen.queryByText(/\d+\/\d+/)).toBeNull();
+    expect(screen.getByRole("button", { name: `Agent work ${label} Expand details` })).toBeTruthy();
+  });
+
+  test("accessible name includes current step, progress, and changing expand intent", () => {
+    renderSurface(makeState("running", { plan: [
+      { id: "done", position: 1, title: "Finished setup", status: "completed" },
+      { id: "active", position: 2, title: "Writing report", status: "in_progress" },
+    ] }));
+    const expand = screen.getByRole("button", {
+      name: "Agent work Running Writing report 1/2 Expand details",
+    });
+    fireEvent.click(expand);
+    expect(screen.getByRole("button", {
+      name: "Agent work Running Writing report 1/2 Collapse details",
+    })).toBeTruthy();
   });
 
   test("sorts by position and selects current step by priority while showing completed progress", () => {
@@ -226,8 +241,11 @@ describe("AgentWorkSurface", () => {
     expect(screen.queryByLabelText("Agent work details")).toBeNull();
     fireEvent.click(primary);
     expect(primary.getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByLabelText("Agent work details")).toBeTruthy();
+    const drawer = screen.getByLabelText("Agent work details");
+    expect(drawer.getAttribute("tabindex")).toBe("-1");
+    expect(document.activeElement).toBe(drawer);
     const backdrop = screen.getByLabelText("Close Agent work details");
+    expect(backdrop.getAttribute("tabindex")).toBe("-1");
     fireEvent.click(backdrop);
     expect(chatClick).not.toHaveBeenCalled();
     expect(composerClick).not.toHaveBeenCalled();
@@ -260,6 +278,23 @@ describe("AgentWorkSurface", () => {
     rerender(<AgentWorkSurface state={makeState("completed", { id: "run-2" })} conversationId="c" renderChat={() => <div />} />);
     expect(screen.getByText("Completed")).toBeTruthy();
     expect(primaryButton().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  test("dismissing a terminal result moves focus to the stable composer message input", () => {
+    render(
+      <AgentWorkSurface
+        state={makeState("completed")}
+        conversationId="c"
+        renderChat={(composerBoundaryRef) => (
+          <div ref={composerBoundaryRef}>
+            <textarea aria-label="Message" />
+          </div>
+        )}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Agent work result" }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Message" }));
+    expect(screen.queryByText("Completed")).toBeNull();
   });
 
   test("conversation and run changes collapse an open drawer", () => {
