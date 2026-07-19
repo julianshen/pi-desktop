@@ -111,10 +111,11 @@ describe("useConversations", () => {
   });
 
   test("AC-9.5: refetch() picks up a server-side title change (e.g. auto-derived after a turn) without remounting", async () => {
-    let fetchCount = 0;
-    global.fetch = mock(() => {
-      fetchCount += 1;
-      const title = fetchCount === 1 ? "New conversation" : "Sprint planning kickoff";
+    let conversationFetchCount = 0;
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      conversationFetchCount += 1;
+      const title = conversationFetchCount === 1 ? "New conversation" : "Sprint planning kickoff";
       return Promise.resolve(jsonResponse([makeMeta({ id: "conv-1", title })]));
     }) as unknown as typeof fetch;
 
@@ -126,10 +127,56 @@ describe("useConversations", () => {
       await result.current.refetch();
     });
 
-    expect(fetchCount).toBe(2);
+    expect(conversationFetchCount).toBe(2);
     expect(result.current.conversations[0]?.title).toBe("Sprint planning kickoff");
     // refetch() must not flip loading back to true — it's meant to be silent,
     // not to re-trigger the Sidebar's ConversationListLoading spinner state.
     expect(result.current.loading).toBe(false);
+  });
+
+  test("AC-3.2: update and remove mutate shared state without a reload", async () => {
+    const first = makeMeta({ id: "first", title: "First" });
+    const second = makeMeta({ id: "second", title: "Second" });
+    global.fetch = mock((url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") return Promise.resolve(jsonResponse({ ...first, title: "Renamed", pinnedAt: "2026-07-01T01:00:00.000Z" }));
+      if (init?.method === "DELETE") return Promise.resolve(new Response(null, { status: 204 }));
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse([first, second]));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => { await result.current.update("first", { title: "Renamed", pinned: true }); });
+    expect(result.current.conversations.find((item) => item.id === "first")?.title).toBe("Renamed");
+
+    act(() => result.current.setActiveId("first"));
+    await act(async () => { await result.current.remove("first"); });
+    expect(result.current.conversations.map((item) => item.id)).toEqual(["second"]);
+    expect(result.current.activeId).toBe("second");
+  });
+
+  test("AC-3.3: a stale slow search response cannot replace a newer result", async () => {
+    let resolveOld!: (response: Response) => void;
+    let resolveNew!: (response: Response) => void;
+    global.fetch = mock((url: string) => {
+      if (url.includes("q=old")) return new Promise<Response>((resolve) => { resolveOld = resolve; });
+      if (url.includes("q=new")) return new Promise<Response>((resolve) => { resolveNew = resolve; });
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse([makeMeta({ id: "base", title: "Base" })]));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useConversations());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.setSearchQuery("old"));
+    await waitFor(() => expect(resolveOld).toBeFunction());
+    act(() => result.current.setSearchQuery("new"));
+    await waitFor(() => expect(resolveNew).toBeFunction());
+
+    resolveNew(jsonResponse([makeMeta({ id: "new", title: "New result" })]));
+    await waitFor(() => expect(result.current.filtered[0]?.id).toBe("new"));
+    resolveOld(jsonResponse([makeMeta({ id: "old", title: "Old result" })]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(result.current.filtered[0]?.id).toBe("new");
   });
 });

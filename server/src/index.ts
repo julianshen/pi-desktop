@@ -9,8 +9,6 @@ import { handleAiSdkRun, type AgentSessionEventSource } from "./ai-sdk/adapter.j
 import { startScheduler } from "./scheduler/index.js";
 import { settingsRouter } from "./settings/routes.js";
 import {
-  listConversations,
-  createConversation,
   getConversationMeta,
   touchConversation,
   setLiveSessionModel,
@@ -18,7 +16,14 @@ import {
   getLastTurnError,
   conversationCwd,
   getOrCreateSession,
+  getWorkspaceStore,
 } from "./agent/conversations.js";
+import { ConversationWorkspace } from "./chat-workspace/conversations.js";
+import { createChatWorkspaceRouter } from "./chat-workspace/routes.js";
+import { AttachmentWorkspace } from "./chat-workspace/attachments.js";
+import { BranchWorkspace, type BranchMessage, type BranchSession } from "./chat-workspace/branches.js";
+import { journalRunStream, RunManager } from "./chat-workspace/runs.js";
+import { setActivePlanRun } from "./agent/plan-tools.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
 import {
@@ -170,6 +175,36 @@ function extractLatestUserTextFromUIMessages(messages: UIMessage[]): string {
   return "";
 }
 
+function withTextAttachments(
+  userText: string,
+  references: Array<{ name: string; text: string }>,
+): string {
+  if (references.length === 0) return userText;
+  const blocks = references.map(({ name, text }) => {
+    const safeName = name.replace(/[<>"'&]/g, "_");
+    return `\n\n--- Attached local file: ${safeName} ---\n${text}\n--- End attached file: ${safeName} ---`;
+  });
+  return `${userText}${blocks.join("")}`;
+}
+
+function branchMessageToHistory(message: BranchMessage) {
+  if (message.role === "user") {
+    const content = typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.filter((part): part is { type: "text"; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text").map((part) => part.text).join("")
+        : "";
+    return { id: message.id, role: "user" as const, content };
+  }
+  if (message.role === "assistant") {
+    const content = Array.isArray(message.content)
+      ? message.content.filter((part): part is { type: "text"; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text").map((part) => part.text).join("")
+      : typeof message.content === "string" ? message.content : "";
+    return { id: message.id, role: "assistant" as const, content };
+  }
+  return { id: message.id, role: "tool" as const, content: JSON.stringify(message.content) };
+}
+
 /**
  * Builds the Express app without binding a port, so tests (index.test.ts) can
  * app.listen(0) it on an ephemeral port and hit it with real HTTP requests, instead
@@ -188,31 +223,35 @@ export function createApp(options?: CreateAppOptions): Express {
     res.json({ status: "ok" });
   });
 
-  // Task 4 (AC-4.1/AC-4.2): list all conversations. listConversations() already
-  // sorts by updatedAt desc internally (agent/conversations.ts) — verified there
-  // rather than re-sorted here, so this route just forwards its result as the API
-  // contract.
-  app.get("/api/conversations", (_req, res) => {
-    res.json(listConversations());
-  });
-
-  // Task 4 (AC-4.2): create a conversation, optionally titled.
-  app.post("/api/conversations", express.json(), (req, res) => {
-    const body = req.body as { title?: unknown } | undefined;
-    const title = typeof body?.title === "string" ? body.title : undefined;
-    const meta = createConversation(title);
-    res.status(201).json(meta);
-  });
-
-  // Task 4 (AC-4.3): 404, not a silent 200 null/empty, for an unknown id.
-  app.get("/api/conversations/:id", (req, res) => {
-    const meta = getConversationMeta(req.params.id);
-    if (!meta) {
-      res.status(404).end();
-      return;
-    }
-    res.json(meta);
-  });
+  // Agent Chat Experience Tasks 1–2: transactional conversation workspace and
+  // organization/lifecycle routes. Mount under /api so the router's resource
+  // paths stay reusable in isolated HTTP contract tests.
+  const workspaceStore = getWorkspaceStore();
+  const attachmentWorkspace = new AttachmentWorkspace(workspaceStore, env.dataDir);
+  const branchWorkspace = new BranchWorkspace(workspaceStore);
+  const runManager = new RunManager(workspaceStore);
+  const branchSession = async (conversationId: string): Promise<BranchSession> => {
+    const session = await getOrCreateSession(conversationId);
+    const manager = session.sessionManager;
+    return {
+      getLeafId: () => manager.getLeafId(),
+      getEntry: (id) => manager.getEntry(id),
+      getBranch: (id) => manager.getBranch(id),
+      branch: (id) => manager.branch(id),
+      resetLeaf: () => manager.resetLeaf(),
+      navigateTree: (id) => session.navigateTree(id),
+    };
+  };
+  app.use("/api", createChatWorkspaceRouter(
+    new ConversationWorkspace(workspaceStore, env.dataDir),
+    {
+      attachments: attachmentWorkspace,
+      branches: branchWorkspace,
+      branchSession,
+      runs: runManager,
+      hasActiveRun: (id) => runManager.hasActiveConversationRun(id),
+    },
+  ));
 
   // Task 6 (AC-6.1): list available models. listAvailableModels() forwards to
   // getAgentDeps()'s real modelRegistry when options.modelRegistry is unset (the
@@ -287,6 +326,17 @@ export function createApp(options?: CreateAppOptions): Express {
   // (a client error, no stack trace leaked), everything else is an unexpected
   // 500 logged via console.error first.
   app.get("/api/conversations/:id/messages", (req, res) => {
+    if (typeof req.query.branchId === "string") {
+      branchSession(req.params.id)
+        .then((session) => branchWorkspace.messages(req.params.id, req.query.branchId as string, session))
+        .then((messages) => res.json(messages.map(branchMessageToHistory)))
+        .catch((error: unknown) => {
+          res.status(error instanceof Error && error.message === "Branch not found" ? 404 : 400).json({
+            error: { code: "NOT_FOUND", message: error instanceof Error ? error.message : "Branch lookup failed", retryable: false },
+          });
+        });
+      return;
+    }
     getConversationMessages(req.params.id)
       .then((messages) => res.json(messages))
       .catch((error: unknown) => {
@@ -515,10 +565,18 @@ export function createApp(options?: CreateAppOptions): Express {
   // same 400-no-stack-trace-leaked / 500-logged-first split.
   app.post("/api/conversations/:id/chat", express.json({ limit: "10mb" }), (req, res) => {
     getOrCreateSession(req.params.id)
-      .then((session) => {
-        const body = req.body as { messages?: UIMessage[] } | undefined;
+      .then(async (session) => {
+        const body = req.body as { messages?: UIMessage[]; attachmentIds?: unknown } | undefined;
         const messages = Array.isArray(body?.messages) ? body.messages : [];
-        const userText = extractLatestUserTextFromUIMessages(messages);
+        const attachmentIds = body?.attachmentIds === undefined ? [] : body.attachmentIds;
+        if (!Array.isArray(attachmentIds) || attachmentIds.some((id) => typeof id !== "string")) {
+          res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "attachmentIds must be an array of strings", retryable: false } });
+          return;
+        }
+        const conversation = workspaceStore.getConversation(req.params.id);
+        const activeBranchId = conversation?.activeBranchId;
+        const materialized = await attachmentWorkspace.materialize(req.params.id, attachmentIds as string[], activeBranchId);
+        const userText = withTextAttachments(extractLatestUserTextFromUIMessages(messages), materialized.textReferences);
         // ai-sdk/adapter.ts's own doc comment claims a real AgentSession "structurally
         // satisfies AgentSessionEventSource ... with no adapter shape changes" needed
         // to wire it in here -- true at the RUNTIME level (the adapter's switch only
@@ -535,10 +593,37 @@ export function createApp(options?: CreateAppOptions): Express {
         // wiring (this file, Task 5's actual scope) is the right place for this cast,
         // not adapter.ts (out of scope here, and its own module doc already documents
         // the intended duck-typed contract in detail).
-        const stream = handleAiSdkRun(session as unknown as AgentSessionEventSource, userText, req.params.id);
+        const rawStream = handleAiSdkRun(
+          session as unknown as AgentSessionEventSource,
+          userText,
+          req.params.id,
+          materialized.images.length > 0 ? { images: materialized.images } : undefined,
+        );
+        const run = runManager.start({
+          conversationId: req.params.id,
+          branchId: activeBranchId,
+          model: conversation?.modelId,
+          abort: () => session.abort(),
+          steer: (instruction) => session.prompt(instruction, { streamingBehavior: "steer" }),
+        });
+        setActivePlanRun(req.params.id, { manager: runManager, runId: run.id });
+        res.setHeader("X-Pi-Run-Id", run.id);
+        const stream = journalRunStream(runManager, run.id, rawStream, () => {
+          setActivePlanRun(req.params.id, undefined);
+          if (activeBranchId) branchWorkspace.commitLeaf(req.params.id, activeBranchId, session.sessionManager.getLeafId() ?? undefined);
+        });
         pipeUIMessageStreamToResponse({ response: res, stream });
       })
       .catch((error: unknown) => {
+        if (error instanceof Error && "code" in error) {
+          const code = (error as { code?: string }).code;
+          if (code === "NOT_FOUND" || code === "ATTACHMENT_NOT_READY" || code === "TOO_MANY_ATTACHMENTS") {
+            res.status(code === "NOT_FOUND" ? 404 : 400).json({
+              error: { code: code === "NOT_FOUND" ? "NOT_FOUND" : "VALIDATION_ERROR", message: error.message, retryable: false },
+            });
+            return;
+          }
+        }
         if (error instanceof Error && error.message.startsWith("Invalid conversation id")) {
           res.status(400).end();
           return;

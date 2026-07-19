@@ -1,6 +1,7 @@
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import { AssistantChatTransport, useChatRuntime } from "@assistant-ui/react-ai-sdk";
 import "./styles/design-system.css";
+import "katex/dist/katex.min.css";
 import { TitleBar } from "./components/TitleBar";
 import { IconRail } from "./components/IconRail";
 import { Sidebar } from "./components/Sidebar";
@@ -19,6 +20,9 @@ import { useConversations } from "./state/useConversations";
 import { API_BASE } from "./state/apiBase.js";
 import { renderUrlHeadless } from "./lib/headlessRender.js";
 import { getResolveToken } from "./lib/resolveToken.js";
+import { prepareAttachmentRequestBody } from "./state/attachmentDrafts.js";
+import { useActiveRun } from "./hooks/useActiveRun.js";
+import { RunInspector } from "./components/chat/RunInspector.js";
 
 /**
  * Task 10 (SPEC.md's "Headless render bridge" section). Public shape returned
@@ -188,7 +192,12 @@ export function usePendingRenderInteractionWatcher(conversationId: string): void
  */
 export function useAssistantChatRuntime(conversationId: string) {
   const transport = useMemo(
-    () => new AssistantChatTransport({ api: `${API_BASE}/api/conversations/${conversationId}/chat` }),
+    () => new AssistantChatTransport({
+      api: `${API_BASE}/api/conversations/${conversationId}/chat`,
+      prepareSendMessagesRequest: (options) => ({
+        body: prepareAttachmentRequestBody(conversationId, options),
+      }),
+    }),
     [conversationId],
   );
   return useChatRuntime({ transport });
@@ -217,6 +226,7 @@ function App() {
   // conversation is selected or created, so ArtifactCanvas's pre-existing
   // `conversationId={state.activeConv}` wiring keeps working unmodified.
   const conversations = useConversations();
+  const activeRun = useActiveRun(state.activeConv);
 
   // Task 13 follow-up (now resolved): ArtifactCanvas's `refreshSignal` fires when
   // ChatView's isLoading transitions true -> false, i.e. once per completed chat turn.
@@ -274,7 +284,7 @@ function App() {
             conversations={conversations}
           />
 
-          <div style={{ flex: 1, display: "flex", minWidth: 0 }}>
+          <div style={{ flex: 1, display: "flex", minWidth: 0, position: "relative" }}>
             <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
               <MainHeader state={state} actions={actions} conversations={conversations} />
 
@@ -317,6 +327,19 @@ function App() {
               {state.view === "skills" && <SkillsLibraryView />}
               {state.view === "settings" && <SettingsView section={state.settingsSection} />}
             </div>
+
+            {state.view === "chat" && (
+              <aside className="hidden w-[320px] shrink-0 border-l border-divider min-[1180px]:block">
+                <RunInspector state={activeRun} />
+              </aside>
+            )}
+
+            {state.view === "chat" && (
+              <details className="absolute bottom-ds-3 right-ds-3 z-20 w-[min(360px,calc(100%-24px))] border border-border bg-surface shadow-lg min-[1180px]:hidden">
+                <summary className="cursor-pointer px-ds-3 py-ds-2 font-heading text-[12px] uppercase tracking-wide text-accent">Agent work</summary>
+                <div className="h-[min(520px,70vh)]"><RunInspector state={activeRun} /></div>
+              </details>
+            )}
 
             {showCanvas && (
               <ArtifactCanvas

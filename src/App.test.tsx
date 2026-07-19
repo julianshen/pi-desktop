@@ -63,20 +63,32 @@ mock.module("./styles/design-system.css", () => ({}));
  */
 interface ChatRuntimeCall {
   api: string;
+  prepareSendMessagesRequest?: (options: {
+    id: string;
+    messages: unknown[];
+    trigger: "submit-message" | "regenerate-message";
+    messageId: string | undefined;
+    body: Record<string, unknown> | undefined;
+  }) => PromiseLike<{ body: object }> | { body: object };
 }
 const useChatRuntimeCalls: ChatRuntimeCall[] = [];
 const mockAssistantRuntime = { __mockAssistantRuntime: true } as unknown as AssistantRuntime;
 
 class MockAssistantChatTransport {
   readonly api: string;
-  constructor(options: { api: string }) {
+  readonly prepareSendMessagesRequest?: ChatRuntimeCall["prepareSendMessagesRequest"];
+  constructor(options: { api: string; prepareSendMessagesRequest?: ChatRuntimeCall["prepareSendMessagesRequest"] }) {
     this.api = options.api;
+    this.prepareSendMessagesRequest = options.prepareSendMessagesRequest;
   }
 }
 
 mock.module("@assistant-ui/react-ai-sdk", () => ({
   useChatRuntime: (options: { transport: MockAssistantChatTransport }) => {
-    useChatRuntimeCalls.push({ api: options.transport.api });
+    useChatRuntimeCalls.push({
+      api: options.transport.api,
+      prepareSendMessagesRequest: options.transport.prepareSendMessagesRequest,
+    });
     return mockAssistantRuntime;
   },
   AssistantChatTransport: MockAssistantChatTransport,
@@ -104,6 +116,7 @@ const { usePendingRenderInteractionWatcher, useAssistantChatRuntime } = await im
 // here just gets the same cached module instance, exposing its test-only
 // cache-reset helper (see resolveToken.ts's own doc comment for why this exists).
 const { __resetResolveTokenCacheForTests } = await import("./lib/resolveToken.js");
+const { __replaceAttachmentDraftForTests, __resetAttachmentDraftsForTests } = await import("./state/attachmentDrafts.js");
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -127,11 +140,13 @@ beforeEach(() => {
   resolveTokenInvokeImpl = () => Promise.resolve("test-resolve-token");
   delete import.meta.env.VITE_RESOLVE_TOKEN;
   __resetResolveTokenCacheForTests();
+  __resetAttachmentDraftsForTests();
 });
 
 afterEach(() => {
   global.fetch = originalFetch;
   __resetResolveTokenCacheForTests();
+  __resetAttachmentDraftsForTests();
   cleanup();
 });
 
@@ -396,7 +411,9 @@ describe("useAssistantChatRuntime (Task 6)", () => {
   test("AC-6.1: wires useChatRuntime to Task 5's per-conversation chat route (POST /api/conversations/:id/chat)", () => {
     renderHook(() => useAssistantChatRuntime("default"));
 
-    expect(useChatRuntimeCalls).toEqual([{ api: "http://127.0.0.1:4319/api/conversations/default/chat" }]);
+    expect(useChatRuntimeCalls).toHaveLength(1);
+    expect(useChatRuntimeCalls[0]?.api).toBe("http://127.0.0.1:4319/api/conversations/default/chat");
+    expect(useChatRuntimeCalls[0]?.prepareSendMessagesRequest).toBeDefined();
   });
 
   test("AC-6.1 (grep fallback): App.tsx no longer has an `import ... from \"@copilotkit/...\"` statement anywhere", async () => {
@@ -446,5 +463,53 @@ describe("useAssistantChatRuntime (Task 6)", () => {
     expect(useChatRuntimeCalls[0].api).toBe(useChatRuntimeCalls[2].api);
     expect(useChatRuntimeCalls[0].api).not.toBe(useChatRuntimeCalls[1].api);
     expect(result.current).toBe(mockAssistantRuntime);
+  });
+
+  test("AC-6.3: after one of two staged items is removed, chat JSON contains only the remaining opaque ID and no path", async () => {
+    __replaceAttachmentDraftForTests("conv-A", [
+      { id: "opaque-keep", name: "keep.md", mediaType: "text/markdown", byteSize: 4, state: "ready", disclosure: "local_only" },
+      { id: "opaque-remove", name: "remove.png", mediaType: "image/png", byteSize: 8, state: "ready", disclosure: "local_only" },
+    ]);
+    const { removeAttachmentDraft } = await import("./state/attachmentDrafts.js");
+    const fetchBeforeRemove = global.fetch;
+    global.fetch = mock(() => Promise.resolve(new Response(null, { status: 204 }))) as unknown as typeof fetch;
+    await removeAttachmentDraft("conv-A", "opaque-remove");
+    global.fetch = fetchBeforeRemove;
+
+    renderHook(() => useAssistantChatRuntime("conv-A"));
+    const prepare = useChatRuntimeCalls[0]?.prepareSendMessagesRequest;
+    expect(prepare).toBeDefined();
+    const request = await prepare!({
+      id: "thread",
+      messages: [{ id: "message", role: "user", parts: [{ type: "text", text: "Review" }] }],
+      trigger: "submit-message",
+      messageId: "message",
+      body: { system: "existing" },
+    });
+
+    expect(request.body).toMatchObject({ attachmentIds: ["opaque-keep"] });
+    const json = JSON.stringify(request.body);
+    expect(json).not.toContain("opaque-remove");
+    expect(json).not.toMatch(/[/\\](Users|tmp|home)[/\\]/);
+  });
+
+  test("AC-8.2: attachment drafts are isolated when the active branch changes", async () => {
+    const { setActiveAttachmentBranch } = await import("./state/attachmentDrafts.js");
+    setActiveAttachmentBranch("conv-A", "branch-a");
+    __replaceAttachmentDraftForTests("conv-A", [
+      { id: "attachment-a", name: "a.md", mediaType: "text/markdown", byteSize: 1, state: "ready", disclosure: "local_only" },
+    ]);
+    setActiveAttachmentBranch("conv-A", "branch-b");
+    __replaceAttachmentDraftForTests("conv-A", [
+      { id: "attachment-b", name: "b.md", mediaType: "text/markdown", byteSize: 1, state: "ready", disclosure: "local_only" },
+    ]);
+
+    renderHook(() => useAssistantChatRuntime("conv-A"));
+    const prepare = useChatRuntimeCalls[0]!.prepareSendMessagesRequest!;
+    const bodyB = (await prepare({ id: "t", messages: [], trigger: "regenerate-message", messageId: undefined, body: {} })).body;
+    expect(bodyB).toMatchObject({ attachmentIds: ["attachment-b"] });
+    setActiveAttachmentBranch("conv-A", "branch-a");
+    const bodyA = (await prepare({ id: "t", messages: [], trigger: "regenerate-message", messageId: undefined, body: {} })).body;
+    expect(bodyA).toMatchObject({ attachmentIds: ["attachment-a"] });
   });
 });

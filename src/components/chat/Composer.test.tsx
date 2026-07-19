@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { compile } from "tailwindcss";
 import { AssistantRuntimeProvider, useLocalRuntime, type ChatModelAdapter } from "@assistant-ui/react";
 import type { ReactNode } from "react";
 import { Composer } from "./Composer.js";
+import { ConversationIdContext } from "../../lib/conversationIdContext.js";
+import { __replaceAttachmentDraftForTests, __resetAttachmentDraftsForTests } from "../../state/attachmentDrafts.js";
 
 /**
  * Task 7 (assistant-ui-migration/TASKS.md, AC-7.1). Same two-part convention
@@ -33,6 +35,7 @@ function TestHarness({ children }: { children: ReactNode }) {
 }
 
 afterEach(() => {
+  __resetAttachmentDraftsForTests();
   cleanup();
 });
 
@@ -79,6 +82,34 @@ describe("Composer (Task 7, AC-7.1)", () => {
     // (CLAUDE.md), proving Composer used the real component, not a bare div.
     expect(blueprint?.querySelectorAll(".corner").length).toBe(4);
     expect(blueprint?.className).toContain("bg-surface");
+  });
+
+  test("AC-6.2: rejected or missing items block submit with filename-specific recovery", () => {
+    __replaceAttachmentDraftForTests("conv-1", [{
+      id: "opaque-bad",
+      name: "missing-notes.md",
+      mediaType: "text/markdown",
+      byteSize: 12,
+      state: "missing",
+      disclosure: "local_only",
+      error: "The staged copy is missing",
+    }]);
+
+    render(
+      <TestHarness>
+        <ConversationIdContext.Provider value="conv-1">
+          <Composer />
+        </ConversationIdContext.Provider>
+      </TestHarness>,
+    );
+
+    const input = screen.getByLabelText("Message input");
+    input.focus();
+    fireEvent.change(input, { target: { value: "Summarize this" } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(screen.getByRole("alert").textContent).toContain("missing-notes.md");
+    expect(screen.getByRole("button", { name: "Choose files again" })).toBeTruthy();
   });
 });
 

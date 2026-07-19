@@ -10,7 +10,11 @@ import {
   type ChatModelRunResult,
   type ThreadRuntime,
 } from "@assistant-ui/react";
-import { ChatView } from "./ChatView.js";
+import { ChatView, parseGeneratedFileResult } from "./ChatView.js";
+
+test("downloadable generated-file tool results restore from their typed JSON envelope", () => {
+  expect(parseGeneratedFileResult(JSON.stringify({ generatedFile: { id: "file", runId: "run", name: "report.csv", mediaType: "text/csv", byteSize: 12, state: "available" } }))).toEqual({ id: "file", runId: "run", name: "report.csv", mediaType: "text/csv", byteSize: 12, state: "available" });
+});
 
 /**
  * Test-environment-only fix, unrelated to ChatView.tsx's own behavior: both

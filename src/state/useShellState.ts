@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 export type ViewKey = "chat" | "artifacts" | "scheduled" | "coding" | "mcp" | "skills" | "settings";
-export type SettingsSection = "providers" | "models";
+export type SettingsSection = "providers" | "models" | "search";
 export type CanvasTab = "code" | "preview";
 
 const DEFAULT_FILTER: Partial<Record<ViewKey, string>> = {

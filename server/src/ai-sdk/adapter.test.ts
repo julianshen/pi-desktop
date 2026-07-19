@@ -125,6 +125,20 @@ describe("handleAiSdkRun", () => {
     expect(outputAvailable.output).toEqual({ ok: true });
   });
 
+  test("AC-13.3: normalized search evidence emits typed source-url chunks", async () => {
+    const session = makeStubSession([
+      { type: "tool_execution_start", toolCallId: "search", toolName: "web_search", args: { query: "x" } },
+      { type: "tool_execution_end", toolCallId: "search", result: { details: { citations: [
+        { id: "citation-1", title: "Evidence", url: "https://example.com/evidence", source: "Brave Search" },
+      ] } } },
+      { type: "agent_end" },
+    ]);
+    const chunks = await collectChunks(handleAiSdkRun(session, "search", "conv-1"));
+    expect(chunks.find((chunk: any) => chunk.type === "source-url")).toMatchObject({
+      sourceId: "citation-1", title: "Evidence", url: "https://example.com/evidence",
+    });
+  });
+
   // AC-3.3: agent_end writes a finish part and the stream closes cleanly -- no
   // hanging writer, no unclosed text/tool parts, and nothing written after finish.
   test("AC-3.3: agent_end writes a finish part and the stream closes cleanly", async () => {

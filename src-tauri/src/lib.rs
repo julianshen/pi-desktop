@@ -8,6 +8,12 @@ use tauri_plugin_shell::process::CommandChild;
 use tauri_plugin_shell::ShellExt;
 
 mod web_fetch;
+mod generated_files;
+
+// `bundle.resources: ["resources/server/**/*"]` preserves the leading
+// `resources/` directory inside the application resource root. Keep this in one
+// reviewed constant so packaged startup cannot silently drift from tauri.conf.
+const PACKAGED_SERVER_ENTRY: &str = "resources/server/src/index.ts";
 
 struct SidecarState(Mutex<Option<CommandChild>>);
 
@@ -96,6 +102,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
         .manage(ResolveTokenState(resolve_token))
@@ -140,7 +147,7 @@ pub fn run() {
                 // `bun build --compile`'s single-file embedding.
                 let entry_point = app
                     .path()
-                    .resolve("server/src/index.ts", tauri::path::BaseDirectory::Resource)?;
+                    .resolve(PACKAGED_SERVER_ENTRY, tauri::path::BaseDirectory::Resource)?;
                 let sidecar = app
                     .shell()
                     .sidecar("pi-desktop-server")?
@@ -195,6 +202,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            generated_files::save_generated_file,
             web_fetch::render_url_headless,
             get_resolve_token,
             window_close,

@@ -17,7 +17,7 @@
  * Radix collapsible/dialog primitives (and their own CSS keyframes) that
  * `design-system.css` doesn't define and this task has no mandate to add.
  */
-import { useRef, type FC } from "react";
+import { useContext, useRef, useState, type FC } from "react";
 import {
   ErrorPrimitive,
   MessagePrimitive,
@@ -28,7 +28,15 @@ import {
 } from "@assistant-ui/react";
 import { StreamdownTextPrimitive } from "@assistant-ui/react-streamdown";
 import { code as streamdownCodePlugin } from "@streamdown/code";
+import { math as streamdownMathPlugin } from "@streamdown/math";
+import { createMermaidPlugin } from "@streamdown/mermaid";
 import { ApprovalRequest } from "./ApprovalRequest";
+import { BranchActionsContext } from "../../lib/branchActionsContext.js";
+import { GitBranchPlusIcon, XIcon } from "lucide-react";
+import { CitationList } from "./CitationList.js";
+import type { SourceMessagePartComponent } from "@assistant-ui/react";
+
+const streamdownMermaidPlugin = createMermaidPlugin({ config: { securityLevel: "strict", htmlLabels: false } });
 
 /**
  * Task 9 (assistant-ui-migration/TASKS.md, AC-9.1/AC-9.2/AC-9.3): real
@@ -110,7 +118,7 @@ const MessageText: TextMessagePartComponent = () => {
   return (
     <StreamdownTextPrimitive
       key={generationRef.current}
-      plugins={{ code: streamdownCodePlugin }}
+      plugins={{ code: streamdownCodePlugin, math: streamdownMathPlugin, mermaid: streamdownMermaidPlugin }}
       // Pinned to one light theme for both of Streamdown's light/dark shiki
       // slots — `design-system.css` has no dark-mode tokens anywhere else in
       // this app, so intentionally not using Streamdown's own
@@ -181,6 +189,10 @@ const MessageErrorBanner: FC = () => (
   </MessagePrimitive.Error>
 );
 
+const SourcePart: SourceMessagePartComponent = (part) => part.sourceType === "url"
+  ? <CitationList citations={[{ id: part.id, title: part.title ?? part.url, url: part.url, source: "Web" }]} />
+  : null;
+
 /**
  * A single chat message — assistant messages render flush-left as plain text
  * on the thread's own background; user messages render as a right-aligned
@@ -190,7 +202,32 @@ const MessageErrorBanner: FC = () => (
  */
 export const Message: FC = () => {
   const role = useAuiState((s) => s.message.role);
+  const messageId = useAuiState((s) => s.message.id);
+  const messageText = useAuiState((s) => s.message.content
+    .filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+    .map((part) => part.text)
+    .join("\n\n"));
   const isUser = role === "user";
+  const branchActions = useContext(BranchActionsContext);
+  const [editingBranch, setEditingBranch] = useState(false);
+  const [replacement, setReplacement] = useState("");
+  const [branchError, setBranchError] = useState<string | null>(null);
+
+  const beginBranch = () => {
+    setReplacement(messageText);
+    setBranchError(null);
+    setEditingBranch(true);
+  };
+
+  const confirmBranch = async () => {
+    if (!branchActions || !replacement.trim()) return;
+    try {
+      await branchActions.createBranch(messageId, replacement.trim());
+      setEditingBranch(false);
+    } catch (error) {
+      setBranchError(error instanceof Error ? error.message : "Could not create branch");
+    }
+  };
 
   return (
     <MessagePrimitive.Root
@@ -211,10 +248,27 @@ export const Message: FC = () => {
         <MessagePrimitive.Parts
           components={{
             Text: MessageText,
+            Source: SourcePart,
             tools: { Fallback: ToolFallback },
           }}
         />
       </div>
+      {isUser && branchActions && !editingBranch && (
+        <button type="button" className="text-[11px] text-text/55 hover:text-accent" onClick={beginBranch}>
+          <GitBranchPlusIcon className="inline" size={12} /> Create branch
+        </button>
+      )}
+      {isUser && branchActions && editingBranch && (
+        <div className="blueprint flex w-full min-w-80 flex-col gap-ds-2 bg-surface p-ds-2 text-text">
+          <label className="font-heading text-[11px] uppercase tracking-wide">Replacement message</label>
+          <textarea aria-label="Replacement message" className="input min-h-20 resize-y" value={replacement} onChange={(event) => setReplacement(event.target.value)} />
+          {branchError && <div role="alert" className="text-[12px] text-danger">{branchError}</div>}
+          <div className="flex justify-end gap-ds-1">
+            <button type="button" className="btn btn-secondary btn-icon" aria-label="Cancel branch" onClick={() => setEditingBranch(false)}><XIcon size={13} /></button>
+            <button type="button" className="btn btn-primary" onClick={() => void confirmBranch()}>Create branch</button>
+          </div>
+        </div>
+      )}
       <MessageErrorBanner />
     </MessagePrimitive.Root>
   );

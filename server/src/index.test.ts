@@ -81,6 +81,21 @@ describe("GET /api/conversations", () => {
   });
 });
 
+describe("search settings", () => {
+  test("AC-13.1: Brave-first settings are configurable without ever returning the key", async () => {
+    const patch = await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true, provider: "brave", apiKey: "brave-secret-value", maxResults: 4 }),
+    });
+    expect(patch.status).toBe(200);
+    const updated = await patch.json() as Record<string, unknown>;
+    expect(updated).toEqual({ enabled: true, provider: "brave", keyPresent: true, maxResults: 4 });
+    expect(JSON.stringify(updated)).not.toContain("brave-secret-value");
+    const restored = await (await fetch(`${baseUrl}/api/settings/search`)).json() as Record<string, unknown>;
+    expect(restored).toEqual(updated);
+  });
+});
+
 describe("POST /api/conversations", () => {
   // AC-4.2 [R]: Given a POST /api/conversations with { "title": "Sprint planning" },
   // when it succeeds, then the response is 201 with a ConversationMeta whose title
@@ -748,6 +763,80 @@ describe("POST /api/conversations/:id/chat", () => {
     promptSpyA.mockRestore();
     subscribeSpyB.mockRestore();
     promptSpyB.mockRestore();
+  });
+
+  test("attachment IDs materialize only the explicitly referenced staged copy into pi input", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "attachment materialization" }),
+      })
+    ).json()) as ConversationMeta;
+    const originals = path.join(tmpRoot, "attachment-materialization-originals");
+    fs.mkdirSync(originals, { recursive: true });
+    const selectedPath = path.join(originals, "selected.md");
+    const unselectedPath = path.join(originals, "not-selected.md");
+    fs.writeFileSync(selectedPath, "SELECTED_ATTACHMENT_CONTENT");
+    fs.writeFileSync(unselectedPath, "UNSELECTED_SECRET_CONTENT");
+
+    const stage = async (localPath: string) => (await (
+      await fetch(`${baseUrl}/api/conversations/${conversation.id}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ localPath }),
+      })
+    ).json()) as { id: string };
+    const selected = await stage(selectedPath);
+    await stage(unselectedPath);
+
+    const session = await getOrCreateSession(conversation.id);
+    const { promptSpy } = stubSessionTurn(session, "attachment received");
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "Review it" }] }],
+        attachmentIds: [selected.id],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    const [prompt, options] = promptSpy.mock.calls[0]!;
+    expect(prompt).toContain("Review it");
+    expect(prompt).toContain("SELECTED_ATTACHMENT_CONTENT");
+    expect(prompt).not.toContain("UNSELECTED_SECRET_CONTENT");
+    expect(prompt).not.toContain(originals);
+    expect(options).toBeUndefined();
+    promptSpy.mockRestore();
+  });
+
+  test("referenced images reach pi as validated image options and never as local paths", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "image input" }),
+    })).json()) as ConversationMeta;
+    const imagePath = path.join(tmpRoot, "validated-image.png");
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    fs.writeFileSync(imagePath, bytes);
+    const staged = await (await fetch(`${baseUrl}/api/conversations/${conversation.id}/attachments`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ localPath: imagePath }),
+    })).json() as { id: string };
+    const session = await getOrCreateSession(conversation.id);
+    const { promptSpy } = stubSessionTurn(session, "image received");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ id: "u", role: "user", parts: [{ type: "text", text: "Inspect" }] }], attachmentIds: [staged.id] }),
+    });
+    await response.text();
+    const [prompt, options] = promptSpy.mock.calls[0]!;
+    expect(prompt).toBe("Inspect");
+    expect(options).toEqual({ images: [{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }] });
+    expect(JSON.stringify(options)).not.toContain(imagePath);
+    promptSpy.mockRestore();
   });
 
   // AC-5.2 [R]: Given a malformed conversation id (path-traversal-style, matching

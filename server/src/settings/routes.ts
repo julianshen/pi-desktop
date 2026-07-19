@@ -2,6 +2,7 @@ import express, { type Request, type Response, type Router } from "express";
 import type { AuthStorage, ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { getAgentDeps } from "../agent/deps.js";
 import { getOrCreateSession, setLiveSessionModel } from "../agent/conversations.js";
+import { publicSearchSettings, updateSearchSettings } from "../search/settings.js";
 
 /**
  * Hardcoded copy of the SDK's built-in provider id -> display name map.
@@ -70,6 +71,20 @@ interface ModelOption {
 }
 
 export const settingsRouter: Router = express.Router();
+
+settingsRouter.get("/search", (_req, res) => res.json(publicSearchSettings()));
+settingsRouter.patch("/search", (req, res) => {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  if (body.provider !== undefined && body.provider !== "brave") return res.status(422).json({ error: "Unsupported search provider." });
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") return res.status(422).json({ error: "enabled must be boolean." });
+  if (body.maxResults !== undefined && (!Number.isInteger(body.maxResults) || (body.maxResults as number) < 1 || (body.maxResults as number) > 10)) return res.status(422).json({ error: "maxResults must be between 1 and 10." });
+  if (body.apiKey !== undefined && typeof body.apiKey !== "string") return res.status(422).json({ error: "apiKey must be a string." });
+  res.json(updateSearchSettings({
+    enabled: body.enabled as boolean | undefined, provider: body.provider as "brave" | undefined,
+    apiKey: typeof body.apiKey === "string" ? body.apiKey.trim() : undefined,
+    maxResults: body.maxResults as number | undefined,
+  }));
+});
 
 /**
  * Wraps an async route handler so its rejection path is defined exactly once.

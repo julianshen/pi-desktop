@@ -11,11 +11,35 @@ import { Blueprint } from "../components/Blueprint";
 import { FileIcon } from "../components/icons";
 import { API_BASE } from "../state/apiBase.js";
 import { ConversationIdContext } from "../lib/conversationIdContext.js";
+import { BranchActionsContext } from "../lib/branchActionsContext.js";
+import { BranchPicker, type BranchView } from "../components/chat/BranchPicker.js";
+import { BranchIdContext } from "../lib/branchIdContext.js";
+import { setActiveAttachmentBranch } from "../state/attachmentDrafts.js";
+import { countBucket, trackDesktopEvent } from "../lib/analytics.js";
+import { GeneratedFile, type GeneratedFileView } from "../components/chat/GeneratedFile.js";
+import { saveGeneratedFile } from "../lib/nativeFiles.js";
 
 const ERROR_DISPLAY_MAX_LENGTH = 300;
 
 /** Matches server/src/artifacts/tools.ts's defineTool({ name: "publish_artifact", ... }). */
 const PUBLISH_ARTIFACT_TOOL_NAME = "publish_artifact";
+const PUBLISH_GENERATED_FILE_TOOL_NAME = "publish_generated_file";
+
+export function parseGeneratedFileResult(result: unknown): (GeneratedFileView & { runId: string }) | undefined {
+  if (typeof result === "string") {
+    try { return parseGeneratedFileResult(JSON.parse(result) as unknown); } catch { return undefined; }
+  }
+  if (!result || typeof result !== "object") return undefined;
+  const record = result as Record<string, unknown>;
+  if (record.details) return parseGeneratedFileResult(record.details);
+  if (record.generatedFile) return parseGeneratedFileResult(record.generatedFile);
+  if (Array.isArray(record.content)) {
+    const text = (record.content as Array<{ type?: string; text?: string }>).find((item) => item.type === "text")?.text;
+    return parseGeneratedFileResult(text);
+  }
+  if (typeof record.id !== "string" || typeof record.runId !== "string" || typeof record.name !== "string" || typeof record.mediaType !== "string" || typeof record.byteSize !== "number") return undefined;
+  return { id: record.id, runId: record.runId, name: record.name, mediaType: record.mediaType, byteSize: record.byteSize, state: record.state === "missing" ? "missing" : "available" };
+}
 
 /**
  * Provider error messages come through as whatever raw string the provider's own
@@ -138,6 +162,21 @@ function toThreadMessageLikeHistory(history: AGUIHistoryEntry[]): ThreadMessageL
           argsText: call.function.arguments,
           result: resultTextByToolCallId.get(call.id),
         });
+        const rawResult = resultTextByToolCallId.get(call.id);
+        if (rawResult) {
+          try {
+            const parsed = JSON.parse(rawResult) as { citations?: Array<{ id: string; title?: string; url: string; source?: string }> };
+            for (const citation of parsed.citations ?? []) {
+              if (typeof citation.id !== "string" || typeof citation.url !== "string") continue;
+              (parts as Array<{ type: "source"; sourceType: "url"; id: string; url: string; title?: string; providerMetadata?: Record<string, Record<string, string>> }>).push({
+                type: "source", sourceType: "url", id: citation.id, url: citation.url, title: citation.title,
+                providerMetadata: citation.source ? { search: { source: citation.source } } : undefined,
+              });
+            }
+          } catch {
+            // Non-search tool results are not citation envelopes.
+          }
+        }
       }
       if (parts.length === 0) continue;
       seeded.push({ id: entry.id, role: "assistant", content: parts });
@@ -220,32 +259,59 @@ export function ChatView({
   // entirely — it's a fresh `Chat` instance with no stale `status`/`error` to
   // begin with, not a reused one that needs clearing.
   const assistantRuntime = useAssistantRuntime();
+  const [branches, setBranches] = useState<BranchView[]>([]);
+  const [activeBranchId, setActiveBranchId] = useState<string>();
+  const branchRequestTokenRef = useRef(0);
+
+  async function replaceTranscript(branchId?: string): Promise<number> {
+    const token = ++branchRequestTokenRef.current;
+    await assistantRuntime.threads.switchToNewThread();
+    const suffix = branchId ? `?branchId=${encodeURIComponent(branchId)}` : "";
+    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages${suffix}`);
+    if (!res.ok) throw new Error(`GET conversations/:id/messages failed: ${res.status}`);
+    const history: unknown = await res.json();
+    if (token !== branchRequestTokenRef.current || !Array.isArray(history)) return 0;
+    assistantRuntime.thread.reset(toThreadMessageLikeHistory(history as AGUIHistoryEntry[]));
+    return history.length;
+  }
 
   useEffect(() => {
     let cancelled = false;
 
     async function seedConversation() {
-      await assistantRuntime.threads.switchToNewThread();
-      if (cancelled) return;
-
       try {
-        const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages`);
-        if (!res.ok) throw new Error(`GET conversations/:id/messages failed: ${res.status}`);
-        const history: unknown = await res.json();
-        if (cancelled || !Array.isArray(history) || history.length === 0) return;
-        // `assistantRuntime.thread` (== `.threads.main`) dynamically resolves to
-        // whichever thread is CURRENT — confirmed via
-        // node_modules/@assistant-ui/core/dist/runtime/api/assistant-runtime.d.ts
-        // (`readonly thread: ThreadRuntime`, a stable class-field wrapper, not a
-        // snapshot) — so this correctly targets the just-created fresh thread
-        // above, not whatever was current before this effect ran.
-        assistantRuntime.thread.reset(toThreadMessageLikeHistory(history as AGUIHistoryEntry[]));
+        let branchId: string | undefined;
+        try {
+          const [branchRes, conversationRes] = await Promise.all([
+            fetch(`${API_BASE}/api/conversations/${conversationId}/branches`),
+            fetch(`${API_BASE}/api/conversations/${conversationId}`),
+          ]);
+          if (branchRes.ok) {
+            const branchList = await branchRes.json() as BranchView[];
+            if (!cancelled) setBranches(branchList);
+            if (conversationRes.ok) {
+              const conversation = await conversationRes.json() as { activeBranchId?: string };
+              branchId = conversation.activeBranchId ?? branchList[0]?.id;
+            } else {
+              branchId = branchList[0]?.id;
+            }
+          }
+        } catch {
+          // Compatibility fallback for a server that predates branch endpoints:
+          // the ordinary transcript route remains usable during rolling upgrades.
+        }
+        if (cancelled) return;
+        setActiveBranchId(branchId);
+        setActiveAttachmentBranch(conversationId, branchId);
+        const messageCount = await replaceTranscript(branchId);
+        if (!cancelled) trackDesktopEvent({ name: "conversation_restored", properties: { outcome: "success", had_active_run: false, message_count_bucket: countBucket(messageCount) } });
       } catch (error: unknown) {
         // Honest fallback (matches ArtifactCanvas.tsx's convention): a failed history
         // fetch leaves the transcript exactly as switchToNewThread() left it (empty)
         // rather than inventing content — the next turn still works correctly
         // regardless, since the server's pi session has the real history either way.
         console.error("[ChatView] failed to load conversation history", error);
+        if (!cancelled) trackDesktopEvent({ name: "conversation_restored", properties: { outcome: "failed", had_active_run: false, message_count_bucket: "0" } });
       }
     }
 
@@ -262,6 +328,37 @@ export function ChatView({
     // guarantees "once per mount").
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
+
+  const branchActions = useMemo(() => ({
+    createBranch: async (sourceMessageId: string, replacementContent: string) => {
+      const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/branches`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceMessageId, replacementContent }),
+      });
+      if (!res.ok) throw new Error(`Could not create branch (${res.status})`);
+      const branch = await res.json() as BranchView;
+      setBranches((current) => [...current.filter((item) => item.id !== branch.id), branch]);
+      setActiveBranchId(branch.id);
+      setActiveAttachmentBranch(conversationId, branch.id);
+      await replaceTranscript(branch.id);
+    },
+  // assistantRuntime is stable for this keyed ChatView lifetime.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [conversationId]);
+
+  const selectBranch = async (branchId: string) => {
+    const token = ++branchRequestTokenRef.current;
+    setActiveBranchId(branchId);
+    setActiveAttachmentBranch(conversationId, branchId);
+    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ activeBranchId: branchId }),
+    });
+    if (!res.ok || token !== branchRequestTokenRef.current) return;
+    await replaceTranscript(branchId);
+  };
 
   // Task 8 (item 2 — error banner). Bug fix originally found via live usage: a
   // failed turn — real OpenRouter 402 "insufficient credits" — was completely
@@ -367,6 +464,15 @@ export function ChatView({
   );
   useAssistantToolUI({ toolName: PUBLISH_ARTIFACT_TOOL_NAME, render: publishArtifactToolUI });
 
+  const generatedFileToolUI = useMemo<ToolCallMessagePartComponent<Record<string, never>, unknown>>(
+    () => function GeneratedFileToolUI({ result }) {
+      const file = parseGeneratedFileResult(result);
+      if (!file) return <div className="text-xs text-muted">Generated file metadata is unavailable.</div>;
+      return <GeneratedFile file={file} onSave={async () => (await saveGeneratedFile({ conversationId, runId: file.runId, fileId: file.id, mediaType: file.mediaType, byteSize: file.byteSize })).status} />;
+    }, [conversationId],
+  );
+  useAssistantToolUI({ toolName: PUBLISH_GENERATED_FILE_TOOL_NAME, render: generatedFileToolUI });
+
   // Task 8 (item 3): the old web_fetch approval chip — its own local "waiting for
   // approval" state, a poll of the interaction-resolution endpoint, and
   // Approve/Deny buttons posting a decision back — is deliberately NOT ported
@@ -383,7 +489,16 @@ export function ChatView({
     <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
       <div style={{ flex: 1, minHeight: 0 }}>
         <ConversationIdContext.Provider value={conversationId}>
-          <Thread />
+          <BranchActionsContext.Provider value={branchActions}>
+            <BranchIdContext.Provider value={activeBranchId}>
+            <div className="flex h-full flex-col">
+              <div className="flex justify-end border-b border-divider px-ds-4 py-ds-1">
+                <BranchPicker branches={branches} activeBranchId={activeBranchId} onSelect={(id) => void selectBranch(id)} />
+              </div>
+              <div className="min-h-0 flex-1"><Thread /></div>
+            </div>
+            </BranchIdContext.Provider>
+          </BranchActionsContext.Provider>
         </ConversationIdContext.Provider>
       </div>
 

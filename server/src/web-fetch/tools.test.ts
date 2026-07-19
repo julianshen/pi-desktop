@@ -684,7 +684,7 @@ describe("web_fetch tool — REVIEW.md remediation", () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       fetchCalls.push({ url: String(input) });
       throw new DOMException("The operation was aborted.", "AbortError");
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     const result = await expectNotToThrow(
       webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx),

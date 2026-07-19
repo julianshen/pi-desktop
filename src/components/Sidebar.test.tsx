@@ -138,6 +138,39 @@ describe("Sidebar", () => {
       expect(screen.queryByText("Design review")).toBeNull();
     });
   });
+
+  test("AC-3.1: renders persisted project/folder hierarchy with accessible selected state", async () => {
+    const conversation = makeMeta({ id: "conv-1", title: "Agent plan", projectId: "project-1", folderId: "folder-1", pinnedAt: "2026-07-01T00:00:00.000Z" });
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/projects")) return Promise.resolve(jsonResponse([{ id: "project-1", name: "Launch", createdAt: "", updatedAt: "" }]));
+      if (url.endsWith("/folders")) return Promise.resolve(jsonResponse([{ id: "folder-1", name: "Research", projectId: "project-1", position: 0, createdAt: "", updatedAt: "" }]));
+      return Promise.resolve(jsonResponse([conversation]));
+    }) as unknown as typeof fetch;
+
+    const { SidebarWithHook } = await importSidebarHarness();
+    render(<SidebarWithHook {...baseProps()} />);
+
+    await waitFor(() => expect(screen.getByText("Launch")).toBeTruthy());
+    expect(screen.getByText("Research")).toBeTruthy();
+    expect(screen.getByRole("treeitem", { name: /Agent plan/ }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByText("Pinned")).toBeTruthy();
+  });
+
+  test("AC-3.2: pin action updates the row through shared hook state", async () => {
+    const conversation = makeMeta({ id: "conv-1", title: "Agent plan" });
+    global.fetch = mock((url: string, init?: RequestInit) => {
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      if (init?.method === "PATCH") return Promise.resolve(jsonResponse({ ...conversation, pinnedAt: "2026-07-01T00:00:00.000Z" }));
+      return Promise.resolve(jsonResponse([conversation]));
+    }) as unknown as typeof fetch;
+
+    const { SidebarWithHook } = await importSidebarHarness();
+    render(<SidebarWithHook {...baseProps()} />);
+    await waitFor(() => expect(screen.getByText("Agent plan")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Agent plan" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pin Agent plan" }));
+    await waitFor(() => expect(screen.getByText("Pinned")).toBeTruthy());
+  });
 });
 
 /**

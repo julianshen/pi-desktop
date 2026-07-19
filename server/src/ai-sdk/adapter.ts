@@ -45,7 +45,10 @@ export type PiSessionEvent =
 export interface AgentSessionEventSource {
   readonly isStreaming?: boolean;
   subscribe(listener: (event: PiSessionEvent) => void): () => void;
-  prompt(text: string, opts?: { streamingBehavior: "steer" }): Promise<void>;
+  prompt(text: string, opts?: {
+    streamingBehavior?: "steer";
+    images?: Array<{ type: "image"; data: string; mimeType: string }>;
+  }): Promise<void>;
 }
 
 function toErrorText(error: unknown): string {
@@ -86,7 +89,12 @@ function toErrorText(error: unknown): string {
  * `createUIMessageStream` body). Wrapping a value that's already synchronous in a
  * `Promise` would only add a needless microtask hop for Task 5's caller.
  */
-export function handleAiSdkRun(session: AgentSessionEventSource, userText: string, conversationId: string) {
+export function handleAiSdkRun(
+  session: AgentSessionEventSource,
+  userText: string,
+  conversationId: string,
+  promptOptions?: { images?: Array<{ type: "image"; data: string; mimeType: string }> },
+) {
   return createUIMessageStream<UIMessage>({
     execute: async ({ writer }) => {
       let currentTextId: string | undefined;
@@ -292,6 +300,21 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
               toolCallId: event.toolCallId,
               output: event.result ?? null,
             });
+            const citations = (event.result as { details?: { citations?: unknown } } | undefined)?.details?.citations;
+            if (Array.isArray(citations)) {
+              for (const citation of citations) {
+                if (!citation || typeof citation !== "object") continue;
+                const value = citation as { id?: unknown; url?: unknown; title?: unknown; source?: unknown };
+                if (typeof value.id !== "string" || typeof value.url !== "string") continue;
+                writer.write({
+                  type: "source-url",
+                  sourceId: value.id,
+                  url: value.url,
+                  title: typeof value.title === "string" ? value.title : undefined,
+                  providerMetadata: typeof value.source === "string" ? { search: { source: value.source } } : undefined,
+                });
+              }
+            }
             break;
           }
           case "agent_end": {
@@ -303,7 +326,11 @@ export function handleAiSdkRun(session: AgentSessionEventSource, userText: strin
       });
 
       try {
-        await session.prompt(userText, session.isStreaming ? { streamingBehavior: "steer" } : undefined);
+        const options = {
+          ...promptOptions,
+          ...(session.isStreaming ? { streamingBehavior: "steer" as const } : {}),
+        };
+        await session.prompt(userText, Object.keys(options).length > 0 ? options : undefined);
       } catch (error) {
         // Mirrors `agui/adapter.ts`'s outer catch: a rejected `prompt()` call (as
         // opposed to a message_end-carried `stopReason: "error"`, handled above) must

@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, mock, test } from "bun:test";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { compile } from "tailwindcss";
 import {
   AssistantRuntimeProvider,
@@ -12,6 +12,7 @@ import {
 import { ThreadPrimitive } from "@assistant-ui/react";
 import type { ReactNode } from "react";
 import { Message } from "./Message.js";
+import { BranchActionsContext } from "../../lib/branchActionsContext.js";
 
 /**
  * Task 7 (assistant-ui-migration/TASKS.md, AC-7.1). Same two-part convention
@@ -124,9 +125,37 @@ describe("Message (Task 7, AC-7.1)", () => {
     expect(fallback).toBeTruthy();
     expect(fallback?.className).toContain("bg-surface");
   });
+
+  test("AC-8.1: Create branch submits a replacement while leaving the original message rendered", async () => {
+    const createBranch = mock(() => Promise.resolve());
+    render(
+      <TestHarness initialMessages={[{ id: "user-source", role: "user", content: "Original prompt" }]}>
+        <BranchActionsContext.Provider value={{ createBranch }}>
+          <ThreadPrimitive.Messages>{() => <Message />}</ThreadPrimitive.Messages>
+        </BranchActionsContext.Provider>
+      </TestHarness>,
+    );
+    await waitFor(() => expect(screen.getByText("Original prompt")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Create branch" }));
+    fireEvent.change(screen.getByLabelText("Replacement message"), { target: { value: "Replacement prompt" } });
+    fireEvent.click(screen.getAllByRole("button", { name: "Create branch" }).at(-1)!);
+
+    await waitFor(() => expect(createBranch).toHaveBeenCalledWith("user-source", "Replacement prompt"));
+    expect(screen.getByText("Original prompt")).toBeTruthy();
+  });
 });
 
 describe("Message markdown rendering (Task 9, AC-9.1/AC-9.2/AC-9.3)", () => {
+  test("AC-14.1: rich math/table content renders while executable HTML is removed", async () => {
+    const markdown = "| A | B |\n|---|---|\n| 1 | 2 |\n\n$$x^2 + y^2$$\n\n<script>window.__unsafe = true</script>";
+    const { container } = renderMessages([{ role: "assistant", content: markdown }]);
+    await waitFor(() => expect(container.querySelector("table")).toBeTruthy());
+    await waitFor(() => expect(container.querySelector(".katex")).toBeTruthy());
+    expect(container.querySelector("script")).toBeNull();
+    expect(container.textContent).not.toContain("window.__unsafe");
+  });
+
   test("AC-9.1: a heading, a list, bold text, and a fenced code block with a language tag render as real formatted HTML, with the code block syntax-highlighted", async () => {
     const markdown = [
       "# Heading",
