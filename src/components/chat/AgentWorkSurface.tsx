@@ -61,10 +61,19 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
       setComposerClearance(Math.max(0, regionBottom - composerTop));
     };
     measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(composerBoundary);
-    observer.observe(chatRegion);
-    return () => observer.disconnect();
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(composerBoundary);
+    resizeObserver.observe(chatRegion);
+    const mutationObserver = new MutationObserver(measure);
+    mutationObserver.observe(chatRegion, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return () => {
+      resizeObserver.disconnect();
+      mutationObserver.disconnect();
+    };
   }, [composerBoundary]);
 
   const closeAndRestoreFocus = useCallback(() => {

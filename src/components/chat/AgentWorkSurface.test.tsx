@@ -10,6 +10,7 @@ type Step = ReturnTypeUseActiveRun["plan"][number];
 const stop = mock(async () => {});
 const steer = mock(async (_instruction: string) => {});
 const originalResizeObserver = globalThis.ResizeObserver;
+const originalMutationObserver = globalThis.MutationObserver;
 
 function makeState(status: Status | null = "running", options: { id?: string; plan?: Step[]; events?: ReturnTypeUseActiveRun["events"] } = {}): ReturnTypeUseActiveRun {
   return {
@@ -63,17 +64,36 @@ class ResizeObserverMock {
   }
 }
 
+class MutationObserverMock {
+  static instances: MutationObserverMock[] = [];
+  callback: MutationCallback;
+  observe = mock((_target: Node, _options?: MutationObserverInit) => {});
+  disconnect = mock(() => {});
+  takeRecords = mock((): MutationRecord[] => []);
+  constructor(callback: MutationCallback) {
+    this.callback = callback;
+    MutationObserverMock.instances.push(this);
+  }
+  mutate(records: Array<Pick<MutationRecord, "type" | "target">>) {
+    queueMicrotask(() => this.callback(records as unknown as MutationRecord[], this as unknown as MutationObserver));
+  }
+}
+
 beforeEach(() => {
   stop.mockClear();
   steer.mockClear();
   ResizeObserverMock.instances = [];
+  MutationObserverMock.instances = [];
   globalThis.ResizeObserver = ResizeObserverMock as unknown as typeof ResizeObserver;
+  globalThis.MutationObserver = MutationObserverMock as unknown as typeof MutationObserver;
 });
 
 afterEach(() => {
   cleanup();
   if (originalResizeObserver) globalThis.ResizeObserver = originalResizeObserver;
   else Reflect.deleteProperty(globalThis, "ResizeObserver");
+  if (originalMutationObserver) globalThis.MutationObserver = originalMutationObserver;
+  else Reflect.deleteProperty(globalThis, "MutationObserver");
 });
 
 describe("AgentWorkSurface", () => {
@@ -280,5 +300,40 @@ describe("AgentWorkSurface", () => {
     expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 350px");
     unmount();
     expect(observer.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  test("remeasures when trailing UI is inserted and removed without either observed element resizing", async () => {
+    let boundaryRef: RefCallback<HTMLElement | null> | undefined;
+    const { unmount } = renderSurface(makeState(), { captureRef: (ref) => { boundaryRef = ref; } });
+    const boundary = document.createElement("div");
+    const chatRegion = screen.getByTestId("transcript-control").parentElement!;
+    let boundaryTop = 500;
+    chatRegion.getBoundingClientRect = () => ({ width: 0, height: 600, top: 0, right: 0, bottom: 600, left: 0, x: 0, y: 0, toJSON() {} });
+    boundary.getBoundingClientRect = () => ({ width: 0, height: 80, top: boundaryTop, right: 0, bottom: boundaryTop + 80, left: 0, x: 0, y: boundaryTop, toJSON() {} });
+    act(() => boundaryRef?.(boundary));
+    fireEvent.click(primaryButton());
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 100px");
+
+    const mutationObserver = MutationObserverMock.instances.at(-1)!;
+    expect(mutationObserver.observe).toHaveBeenCalledWith(chatRegion, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    const trailing = document.createElement("div");
+    boundaryTop = 440;
+    chatRegion.appendChild(trailing);
+    mutationObserver.mutate([{ type: "childList", target: chatRegion }]);
+    await act(async () => { await Promise.resolve(); });
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 160px");
+
+    boundaryTop = 500;
+    trailing.remove();
+    mutationObserver.mutate([{ type: "childList", target: chatRegion }]);
+    await act(async () => { await Promise.resolve(); });
+    expect((screen.getByLabelText("Agent work details").getAttribute("style") ?? "")).toContain("--composer-boundary-height: 100px");
+
+    unmount();
+    expect(mutationObserver.disconnect).toHaveBeenCalledTimes(1);
   });
 });
