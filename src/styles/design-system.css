@@ -96,6 +96,8 @@
 
   --color-danger: var(--color-danger);
   --color-danger-bg: var(--color-danger-bg);
+  --color-success: var(--color-success);
+  --color-success-bg: var(--color-success-bg);
 
   /* --font-heading-weight is a font-weight value, not a font stack — it
      doesn't fit Tailwind's `--font-*` (font-family) namespace and there's no
@@ -153,6 +155,8 @@
 
   --color-danger: #b4463f;
   --color-danger-bg: #fbeceb;
+  --color-success: #527864;
+  --color-success-bg: #f4f8f5;
 
   --font-heading: "Barlow Condensed", system-ui, sans-serif;
   --font-heading-weight: 600;

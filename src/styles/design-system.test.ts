@@ -78,6 +78,15 @@ describe("design-system.css Tailwind v4 @theme mapping (AC-1.1)", () => {
     expect(generated).toMatch(/\.text-accent\s*{\s*color:\s*var\(--color-accent\);?\s*}/);
   });
 
+  test("success utilities resolve through the design system success tokens", async () => {
+    const { css, generated } = await compileDesignSystemCss(["text-success", "bg-success-bg", "border-success"]);
+    expect(generated).toMatch(/\.text-success\s*{\s*color:\s*var\(--color-success\);?\s*}/);
+    expect(generated).toMatch(/\.bg-success-bg\s*{\s*background-color:\s*var\(--color-success-bg\);?\s*}/);
+    expect(generated).toMatch(/\.border-success\s*{\s*border-color:\s*var\(--color-success\);?\s*}/);
+    expect(readRootTokenValue(css, "--color-success")).toBe("#527864");
+    expect(readRootTokenValue(css, "--color-success-bg")).toBe("#f4f8f5");
+  });
+
   test("bg-neutral-100/300 resolve through this app's own neutrals, not Tailwind's default gray-ish neutral-* palette", async () => {
     const { css, generated } = await compileDesignSystemCss(["bg-neutral-100", "bg-neutral-300"]);
 
