@@ -172,7 +172,7 @@ export function AgentWorkSurface({ state, conversationId, renderChat }: AgentWor
                 onClick={(event) => {
                   event.stopPropagation();
                   composerBoundary?.querySelector<HTMLElement>(
-                    'textarea[aria-label="Message"], input[aria-label="Message"], [contenteditable="true"][aria-label="Message"]',
+                    'textarea[aria-label="Message input"], input[aria-label="Message input"], [contenteditable="true"][aria-label="Message input"]',
                   )?.focus();
                   setExpanded(false);
                   setDismissedRunId(visibleRun.id);

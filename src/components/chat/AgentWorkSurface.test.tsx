@@ -287,13 +287,13 @@ describe("AgentWorkSurface", () => {
         conversationId="c"
         renderChat={(composerBoundaryRef) => (
           <div ref={composerBoundaryRef}>
-            <textarea aria-label="Message" />
+            <textarea aria-label="Message input" />
           </div>
         )}
       />,
     );
     fireEvent.click(screen.getByRole("button", { name: "Dismiss Agent work result" }));
-    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Message" }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: "Message input" }));
     expect(screen.queryByText("Completed")).toBeNull();
   });
 
