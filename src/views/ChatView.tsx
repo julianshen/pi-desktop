@@ -263,20 +263,22 @@ export function ChatView({
   const [activeBranchId, setActiveBranchId] = useState<string>();
   const branchRequestTokenRef = useRef(0);
 
-  async function replaceTranscript(branchId?: string): Promise<number> {
+  async function replaceTranscript(branchId?: string, signal?: AbortSignal): Promise<number> {
     const token = ++branchRequestTokenRef.current;
     await assistantRuntime.threads.switchToNewThread();
+    if (signal?.aborted) return 0;
     const suffix = branchId ? `?branchId=${encodeURIComponent(branchId)}` : "";
-    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages${suffix}`);
+    const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages${suffix}`, { signal });
     if (!res.ok) throw new Error(`GET conversations/:id/messages failed: ${res.status}`);
     const history: unknown = await res.json();
-    if (token !== branchRequestTokenRef.current || !Array.isArray(history)) return 0;
+    if (signal?.aborted || token !== branchRequestTokenRef.current || !Array.isArray(history)) return 0;
     assistantRuntime.thread.reset(toThreadMessageLikeHistory(history as AGUIHistoryEntry[]));
     return history.length;
   }
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
 
     async function seedConversation() {
       try {
@@ -303,15 +305,17 @@ export function ChatView({
         if (cancelled) return;
         setActiveBranchId(branchId);
         setActiveAttachmentBranch(conversationId, branchId);
-        const messageCount = await replaceTranscript(branchId);
+        const messageCount = await replaceTranscript(branchId, controller.signal);
         if (!cancelled) trackDesktopEvent({ name: "conversation_restored", properties: { outcome: "success", had_active_run: false, message_count_bucket: countBucket(messageCount) } });
       } catch (error: unknown) {
         // Honest fallback (matches ArtifactCanvas.tsx's convention): a failed history
         // fetch leaves the transcript exactly as switchToNewThread() left it (empty)
         // rather than inventing content — the next turn still works correctly
         // regardless, since the server's pi session has the real history either way.
-        console.error("[ChatView] failed to load conversation history", error);
-        if (!cancelled) trackDesktopEvent({ name: "conversation_restored", properties: { outcome: "failed", had_active_run: false, message_count_bucket: "0" } });
+        if (!cancelled) {
+          console.error("[ChatView] failed to load conversation history", error);
+          trackDesktopEvent({ name: "conversation_restored", properties: { outcome: "failed", had_active_run: false, message_count_bucket: "0" } });
+        }
       }
     }
 
@@ -319,6 +323,7 @@ export function ChatView({
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
     // `assistantRuntime` deliberately excluded: it's the same stable object for
     // this ChatView instance's whole lifetime (App.tsx's own doc comment on

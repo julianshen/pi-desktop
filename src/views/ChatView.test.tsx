@@ -387,6 +387,35 @@ describe("ChatView (Task 8) — item 4: onTurnComplete/onOpenArtifact prop contr
 // Assistant UI runtime -- re-confirmed in Task 15, no new test needed since this
 // one already covers the exact behavior AC-15.1 requires.
 describe("ChatView (Task 8) — item 5: cross-conversation isolation", () => {
+  test("a late history response from an unmounted conversation cannot replace the active conversation", async () => {
+    let resolveConversationA!: (response: Response) => void;
+    const conversationAHistory = new Promise<Response>((resolve) => { resolveConversationA = resolve; });
+    let requestedConversationA = false;
+    originalFetch = global.fetch;
+    global.fetch = mock((url: string) => {
+      if (url.includes("/last-error")) return Promise.resolve(jsonResponse({ message: null }));
+      if (url.includes("/conversations/conv-A/messages")) {
+        requestedConversationA = true;
+        return conversationAHistory;
+      }
+      if (url.includes("/conversations/conv-B/messages")) {
+        return Promise.resolve(jsonResponse([{ id: "history-0", role: "user", content: "Message from conversation B" }]));
+      }
+      return Promise.resolve(jsonResponse([]));
+    }) as unknown as typeof fetch;
+
+    const { rerender } = render(<IsolationHarness conversationId="conv-A" />);
+    await waitFor(() => expect(requestedConversationA).toBe(true));
+    rerender(<IsolationHarness conversationId="conv-B" />);
+    await waitFor(() => expect(screen.getByText("Message from conversation B")).toBeTruthy());
+
+    resolveConversationA(jsonResponse([{ id: "history-0", role: "user", content: "Late message from conversation A" }]));
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.queryByText("Late message from conversation A")).toBeNull();
+    expect(screen.getByText("Message from conversation B")).toBeTruthy();
+  });
+
   test("switching conversationId clears the previous conversation's messages and seeds the new one's real history", async () => {
     const calls: FetchCall[] = [];
     originalFetch = global.fetch;
