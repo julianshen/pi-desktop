@@ -118,6 +118,16 @@ const { usePendingRenderInteractionWatcher, useAssistantChatRuntime } = await im
 const { __resetResolveTokenCacheForTests } = await import("./lib/resolveToken.js");
 const { __replaceAttachmentDraftForTests, __resetAttachmentDraftsForTests } = await import("./state/attachmentDrafts.js");
 
+test("chat integrates the Agent Work header surface without the legacy inspector placements", async () => {
+  const appSource = await Bun.file(new URL("./App.tsx", import.meta.url)).text();
+
+  expect(appSource).toContain("AgentWorkSurface");
+  expect(appSource).toContain("renderChat");
+  expect(appSource).not.toContain("min-[1180px]:block");
+  expect(appSource).not.toContain("<details");
+  expect(appSource).not.toContain("bottom-ds-3 right-ds-3");
+});
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,

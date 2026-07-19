@@ -22,7 +22,7 @@ import { renderUrlHeadless } from "./lib/headlessRender.js";
 import { getResolveToken } from "./lib/resolveToken.js";
 import { prepareAttachmentRequestBody } from "./state/attachmentDrafts.js";
 import { useActiveRun } from "./hooks/useActiveRun.js";
-import { RunInspector } from "./components/chat/RunInspector.js";
+import { AgentWorkSurface } from "./components/chat/AgentWorkSurface.js";
 
 /**
  * Task 10 (SPEC.md's "Headless render bridge" section). Public shape returned
@@ -304,12 +304,19 @@ function App() {
                   it still usefully resets ChatView's own local UI state (draft text, scroll position)
                   and effect ref bookkeeping per conversation switch. */}
               {state.view === "chat" && (
-                <ChatView
-                  key={state.activeConv}
-                  model={state.model}
+                <AgentWorkSurface
+                  state={activeRun}
                   conversationId={state.activeConv}
-                  onTurnComplete={handleTurnComplete}
-                  onOpenArtifact={actions.openArtifact}
+                  renderChat={(composerBoundaryRef) => (
+                    <ChatView
+                      key={state.activeConv}
+                      model={state.model}
+                      conversationId={state.activeConv}
+                      composerBoundaryRef={composerBoundaryRef}
+                      onTurnComplete={handleTurnComplete}
+                      onOpenArtifact={actions.openArtifact}
+                    />
+                  )}
                 />
               )}
               {state.view === "artifacts" && <ArtifactStoreView />}
@@ -327,19 +334,6 @@ function App() {
               {state.view === "skills" && <SkillsLibraryView />}
               {state.view === "settings" && <SettingsView section={state.settingsSection} />}
             </div>
-
-            {state.view === "chat" && (
-              <aside className="hidden w-[320px] shrink-0 border-l border-divider min-[1180px]:block">
-                <RunInspector state={activeRun} />
-              </aside>
-            )}
-
-            {state.view === "chat" && (
-              <details className="absolute bottom-ds-3 right-ds-3 z-20 w-[min(360px,calc(100%-24px))] border border-border bg-surface shadow-lg min-[1180px]:hidden">
-                <summary className="cursor-pointer px-ds-3 py-ds-2 font-heading text-[12px] uppercase tracking-wide text-accent">Agent work</summary>
-                <div className="h-[min(520px,70vh)]"><RunInspector state={activeRun} /></div>
-              </details>
-            )}
 
             {showCanvas && (
               <ArtifactCanvas
