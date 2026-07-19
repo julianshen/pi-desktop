@@ -32,18 +32,17 @@ export function useActiveRun(conversationId: string) {
     cursorRef.current = 0;
     setEvents([]);
     setRun(null);
+    setError(null);
 
     async function poll() {
       let attemptedRun: ActiveRunView | null = null;
       try {
-        let currentRun = run;
-        if (!currentRun) {
-          const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/runs`);
-          if (!response.ok) throw new Error(`Could not load runs (${response.status})`);
-          const list = await response.json() as ActiveRunView[];
-          currentRun = list[0] ?? null;
-          if (!cancelled) setRun(currentRun);
-        }
+        const response = await fetch(`${API_BASE}/api/conversations/${conversationId}/runs`);
+        if (!response.ok) throw new Error(`Could not load runs (${response.status})`);
+        const list = await response.json() as ActiveRunView[];
+        if (cancelled) return;
+        const currentRun = list[0] ?? null;
+        setRun(currentRun);
         attemptedRun = currentRun;
         if (currentRun) {
           const [runResponse, eventsResponse] = await Promise.all([
@@ -55,9 +54,9 @@ export function useActiveRun(conversationId: string) {
           const nextEvents = await eventsResponse.json() as RunEventView[];
           if (!cancelled) {
             setRun(refreshed); mergeEvents(nextEvents); setError(null);
-            if ((currentRun.status === "queued" || currentRun.status === "running") && !restoredRunIdsRef.current.has(currentRun.id)) {
-              restoredRunIdsRef.current.add(currentRun.id);
-              trackDesktopEvent({ name: "agent_run_restored", properties: { outcome: "success", prior_status: currentRun.status, replayed_event_count_bucket: countBucket(nextEvents.length) } });
+            if (attemptedRun && (attemptedRun.status === "queued" || attemptedRun.status === "running") && !restoredRunIdsRef.current.has(attemptedRun.id)) {
+              restoredRunIdsRef.current.add(attemptedRun.id);
+              trackDesktopEvent({ name: "agent_run_restored", properties: { outcome: "success", prior_status: attemptedRun.status, replayed_event_count_bucket: countBucket(nextEvents.length) } });
             }
           }
         }

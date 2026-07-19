@@ -7,6 +7,49 @@ const originalFetch = global.fetch;
 afterEach(() => { global.fetch = originalFetch; setDesktopAnalyticsSink(); cleanup(); });
 
 describe("useActiveRun", () => {
+  test("switching to a conversation with no runs clears the previous run and ignores its late responses", async () => {
+    const calls: string[] = [];
+    let resolveRunDetail!: (response: Response) => void;
+    let resolveRunEvents!: (response: Response) => void;
+    const runDetail = new Promise<Response>((resolve) => { resolveRunDetail = resolve; });
+    const runEvents = new Promise<Response>((resolve) => { resolveRunEvents = resolve; });
+
+    global.fetch = mock((url: string) => {
+      calls.push(url);
+      if (url.endsWith("/api/conversations/conv-a/runs")) {
+        return Promise.resolve(new Response(JSON.stringify([
+          { id: "run-a", conversationId: "conv-a", status: "completed", createdAt: "now" },
+        ])));
+      }
+      if (url.endsWith("/api/conversations/conv-b/runs")) {
+        return Promise.resolve(new Response(JSON.stringify([])));
+      }
+      if (url.endsWith("/api/runs/run-a")) return runDetail;
+      if (url.includes("/api/runs/run-a/events")) return runEvents;
+      return Promise.reject(new Error(`unexpected ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { result, rerender } = renderHook(
+      ({ conversationId }: { conversationId: string }) => useActiveRun(conversationId),
+      { initialProps: { conversationId: "conv-a" } },
+    );
+    await waitFor(() => expect(result.current.run?.id).toBe("run-a"));
+    const callsBeforeSwitch = calls.length;
+
+    rerender({ conversationId: "conv-b" });
+    await waitFor(() => expect(calls).toContain("http://127.0.0.1:4319/api/conversations/conv-b/runs"));
+    await waitFor(() => expect(result.current.run).toBeNull());
+    expect(calls.slice(callsBeforeSwitch).filter((url) => url.includes("/api/runs/run-a"))).toEqual([]);
+
+    resolveRunDetail(new Response(JSON.stringify({ id: "run-a", conversationId: "conv-a", status: "completed", createdAt: "now" })));
+    resolveRunEvents(new Response(JSON.stringify([
+      { id: "late-a", runId: "run-a", cursor: 1, type: "progress", data: {}, createdAt: "now" },
+    ])));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(result.current.run).toBeNull();
+    expect(result.current.events).toEqual([]);
+  });
+
   test("AC-12.2: replay after cursor deduplicates repeated events and preserves order", async () => {
     let eventPoll = 0;
     global.fetch = mock((url: string) => {
