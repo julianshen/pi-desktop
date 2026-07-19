@@ -186,6 +186,75 @@ function toThreadMessageLikeHistory(history: AGUIHistoryEntry[]): ThreadMessageL
   return seeded;
 }
 
+/**
+ * `useChatRuntime()` is backed by the AI SDK external store. Its generic
+ * `thread.reset(ThreadMessageLike[])` path cannot seed messages created outside
+ * that store: the adapter deliberately writes only messages carrying its hidden
+ * external-message binding, so freshly-created ThreadMessageLike entries are
+ * flattened to an empty array. Import the same history through the runtime's
+ * documented external-state path instead, in the AI SDK v6 UIMessage repository
+ * shape. Stable server ids are retained because branch creation addresses the
+ * source message by id.
+ */
+export function toAISDKExternalState(history: AGUIHistoryEntry[]) {
+  const resultTextByToolCallId = new Map<string, string>();
+  for (const entry of history) {
+    if (entry.role === "tool" && entry.toolCallId && typeof entry.content === "string") {
+      resultTextByToolCallId.set(entry.toolCallId, entry.content);
+    }
+  }
+
+  const messages: Array<{
+    parentId: string | null;
+    message: { id: string; role: "user" | "assistant"; parts: Array<Record<string, unknown>> };
+  }> = [];
+
+  for (const entry of history) {
+    let message: (typeof messages)[number]["message"] | undefined;
+    if (entry.role === "user") {
+      message = { id: entry.id, role: "user", parts: [{ type: "text", text: entry.content ?? "" }] };
+    } else if (entry.role === "assistant") {
+      const parts: Array<Record<string, unknown>> = [];
+      if (entry.content) parts.push({ type: "text", text: entry.content });
+      for (const call of entry.toolCalls ?? []) {
+        let input: Record<string, unknown> = {};
+        try { input = JSON.parse(call.function.arguments) as Record<string, unknown>; } catch { /* keep empty input */ }
+        const output = resultTextByToolCallId.get(call.id);
+        parts.push({
+          type: "dynamic-tool",
+          toolName: call.function.name,
+          toolCallId: call.id,
+          input,
+          state: output === undefined ? "input-available" : "output-available",
+          ...(output !== undefined && { output }),
+        });
+        if (output !== undefined) {
+          try {
+            const parsed = JSON.parse(output) as { citations?: Array<{ id: string; title?: string; url: string; source?: string }> };
+            for (const citation of parsed.citations ?? []) {
+              if (typeof citation.id !== "string" || typeof citation.url !== "string") continue;
+              parts.push({
+                type: "source-url",
+                sourceId: citation.id,
+                url: citation.url,
+                ...(citation.title && { title: citation.title }),
+                ...(citation.source && { providerMetadata: { search: { source: citation.source } } }),
+              });
+            }
+          } catch {
+            // Ordinary tool results are not citation envelopes.
+          }
+        }
+      }
+      if (parts.length > 0) message = { id: entry.id, role: "assistant", parts };
+    }
+    if (!message) continue;
+    messages.push({ parentId: messages.at(-1)?.message.id ?? null, message });
+  }
+
+  return { messages, headId: messages.at(-1)?.message.id ?? null };
+}
+
 /** Args shape publish_artifact's tool call carries (server/src/artifacts/tools.ts's defineTool parameters). */
 interface PublishArtifactArgs {
   id?: string;
@@ -272,7 +341,17 @@ export function ChatView({
     if (!res.ok) throw new Error(`GET conversations/:id/messages failed: ${res.status}`);
     const history: unknown = await res.json();
     if (signal?.aborted || token !== branchRequestTokenRef.current || !Array.isArray(history)) return 0;
-    assistantRuntime.thread.reset(toThreadMessageLikeHistory(history as AGUIHistoryEntry[]));
+    const aguiHistory = history as AGUIHistoryEntry[];
+    try {
+      assistantRuntime.thread.importExternalState(toAISDKExternalState(aguiHistory));
+    } catch (error) {
+      // useLocalRuntime(), used by the component tests and embedders, has no
+      // external-state adapter. Preserve support for it through the ordinary
+      // ThreadMessageLike reset path; the production AI SDK runtime takes the
+      // branch above.
+      if (!(error instanceof Error) || !error.message.includes("does not support importing external states")) throw error;
+      assistantRuntime.thread.reset(toThreadMessageLikeHistory(aguiHistory));
+    }
     return history.length;
   }
 

@@ -10,10 +10,23 @@ import {
   type ChatModelRunResult,
   type ThreadRuntime,
 } from "@assistant-ui/react";
-import { ChatView, parseGeneratedFileResult } from "./ChatView.js";
+import { ChatView, parseGeneratedFileResult, toAISDKExternalState } from "./ChatView.js";
 
 test("downloadable generated-file tool results restore from their typed JSON envelope", () => {
   expect(parseGeneratedFileResult(JSON.stringify({ generatedFile: { id: "file", runId: "run", name: "report.csv", mediaType: "text/csv", byteSize: 12, state: "available" } }))).toEqual({ id: "file", runId: "run", name: "report.csv", mediaType: "text/csv", byteSize: 12, state: "available" });
+});
+
+test("persisted AG-UI history is converted to the AI SDK external-state repository with stable ids and parent links", () => {
+  expect(toAISDKExternalState([
+    { id: "user-1", role: "user", content: "hello" },
+    { id: "assistant-1", role: "assistant", content: "hi there" },
+  ])).toEqual({
+    messages: [
+      { parentId: null, message: { id: "user-1", role: "user", parts: [{ type: "text", text: "hello" }] } },
+      { parentId: "user-1", message: { id: "assistant-1", role: "assistant", parts: [{ type: "text", text: "hi there" }] } },
+    ],
+    headId: "assistant-1",
+  });
 });
 
 /**
