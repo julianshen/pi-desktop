@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type RefCallback } from "react";
 import {
   useAssistantRuntime,
   useAssistantToolUI,
@@ -267,6 +267,7 @@ export function ChatView({
   conversationId,
   onTurnComplete,
   onOpenArtifact,
+  composerBoundaryRef,
 }: {
   model: string;
   conversationId: string;
@@ -287,6 +288,7 @@ export function ChatView({
    * `actions.openArtifact`). Same contract as the pre-migration ChatView.
    */
   onOpenArtifact?: (artifactId: string) => void;
+  composerBoundaryRef?: RefCallback<HTMLDivElement>;
 }) {
   // Task 8 (TASKS.md, AC-8.1 / cross-conversation isolation, item 1 & 5 of the
   // preserved-behavior list): the runtime App.tsx builds via useAssistantChatRuntime()
@@ -579,7 +581,7 @@ export function ChatView({
               <div className="flex justify-end border-b border-divider px-ds-4 py-ds-1">
                 <BranchPicker branches={branches} activeBranchId={activeBranchId} onSelect={(id) => void selectBranch(id)} />
               </div>
-              <div className="min-h-0 flex-1"><Thread /></div>
+              <div className="min-h-0 flex-1"><Thread composerBoundaryRef={composerBoundaryRef} /></div>
             </div>
             </BranchIdContext.Provider>
           </BranchActionsContext.Provider>

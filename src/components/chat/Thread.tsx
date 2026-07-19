@@ -9,7 +9,7 @@
  * Not wired into `ChatView.tsx` here — that's Task 8's job (TASKS.md
  * explicitly scopes this task to the building blocks only).
  */
-import type { FC } from "react";
+import type { FC, RefCallback } from "react";
 import { AuiIf, ThreadPrimitive } from "@assistant-ui/react";
 import { Composer } from "./Composer";
 import { Message } from "./Message";
@@ -21,7 +21,11 @@ const ThreadWelcome: FC = () => (
   </div>
 );
 
-export const Thread: FC = () => {
+export interface ThreadProps {
+  composerBoundaryRef?: RefCallback<HTMLDivElement>;
+}
+
+export const Thread: FC<ThreadProps> = ({ composerBoundaryRef }) => {
   return (
     <ThreadPrimitive.Root className="flex h-full flex-col bg-bg font-body text-text">
       <ThreadPrimitive.Viewport className="flex flex-1 flex-col gap-ds-4 overflow-y-auto px-ds-6 py-ds-4">
@@ -31,7 +35,7 @@ export const Thread: FC = () => {
         <div className="flex flex-1 flex-col gap-ds-4">
           <ThreadPrimitive.Messages>{() => <Message />}</ThreadPrimitive.Messages>
         </div>
-        <ThreadPrimitive.ViewportFooter className="sticky bottom-0 pt-ds-2">
+        <ThreadPrimitive.ViewportFooter ref={composerBoundaryRef} className="sticky bottom-0 pt-ds-2">
           <Composer />
         </ThreadPrimitive.ViewportFooter>
       </ThreadPrimitive.Viewport>

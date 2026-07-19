@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import type { MutableRefObject } from "react";
+import type { MutableRefObject, RefCallback } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import {
   AssistantRuntimeProvider,
@@ -133,6 +133,7 @@ function Harness({
   runtimeRef,
   onTurnComplete,
   onOpenArtifact,
+  composerBoundaryRef,
 }: {
   conversationId?: string;
   model?: string;
@@ -140,12 +141,13 @@ function Harness({
   runtimeRef?: MutableRefObject<ThreadRuntime | null>;
   onTurnComplete?: () => void;
   onOpenArtifact?: (artifactId: string) => void;
+  composerBoundaryRef?: RefCallback<HTMLDivElement>;
 }) {
   const runtime = useLocalRuntime(adapter, {});
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       {runtimeRef && <RuntimeCapture runtimeRef={runtimeRef} />}
-      <ChatView model={model} conversationId={conversationId} onTurnComplete={onTurnComplete} onOpenArtifact={onOpenArtifact} />
+      <ChatView model={model} conversationId={conversationId} onTurnComplete={onTurnComplete} onOpenArtifact={onOpenArtifact} composerBoundaryRef={composerBoundaryRef} />
     </AssistantRuntimeProvider>
   );
 }
@@ -196,6 +198,18 @@ function mockFetch(handlers: { messages?: unknown; lastError?: { message: string
 }
 
 describe("ChatView (Task 8) — AC-8.1: history replay on load", () => {
+  test("forwards the composer footer boundary containing the real message input", async () => {
+    mockFetch({ messages: [] });
+    let boundary: HTMLDivElement | null = null;
+
+    render(<Harness conversationId="new-conv" composerBoundaryRef={(node) => { boundary = node; }} />);
+
+    await waitFor(() => expect(screen.getByText("How can I help you today?")).toBeTruthy());
+    const textbox = screen.getByRole("textbox", { name: "Message input" });
+    expect(boundary).not.toBeNull();
+    expect(boundary!.contains(textbox)).toBe(true);
+  });
+
   test("the 'default' conversation's real prior messages render via Task 7's components, not the empty-thread greeting", async () => {
     mockFetch({
       messages: [

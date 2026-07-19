@@ -68,6 +68,20 @@ afterEach(() => {
 });
 
 describe("Thread (Task 7, AC-7.1)", () => {
+  test("exposes the composer footer boundary containing the message input", () => {
+    let boundary: HTMLDivElement | null = null;
+
+    render(
+      <TestHarness>
+        <Thread composerBoundaryRef={(node) => { boundary = node; }} />
+      </TestHarness>,
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "Message input" });
+    expect(boundary).not.toBeNull();
+    expect(boundary!.contains(textbox)).toBe(true);
+  });
+
   test("renders the mapped-token welcome state (bg-bg/text-text/font-heading) when the thread has no messages", () => {
     const { container } = render(
       <TestHarness>
