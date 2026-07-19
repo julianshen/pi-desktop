@@ -51,7 +51,7 @@ export function useActiveRun(conversationId: string) {
           setEvents([]);
         }
         setRun(currentRun);
-        setError(null);
+        if (!currentRun) setError(null);
         attemptedRun = currentRun;
         if (currentRun) {
           const [runResponse, eventsResponse] = await Promise.all([

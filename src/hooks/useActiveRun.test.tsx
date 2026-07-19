@@ -136,6 +136,41 @@ describe("useActiveRun", () => {
     expect(result.current.run).toBeNull();
   });
 
+  test("a healthy run list does not clear a progress-refresh error while the next detail refresh is in flight", async () => {
+    let detailPoll = 0;
+    let eventPoll = 0;
+    let resolveDetail!: (response: Response) => void;
+    let resolveEvents!: (response: Response) => void;
+    const deferredDetail = new Promise<Response>((resolve) => { resolveDetail = resolve; });
+    const deferredEvents = new Promise<Response>((resolve) => { resolveEvents = resolve; });
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/api/conversations/conv/runs")) {
+        return Promise.resolve(new Response(JSON.stringify([
+          { id: "run-1", conversationId: "conv", status: "completed", createdAt: "now" },
+        ])));
+      }
+      if (url.endsWith("/api/runs/run-1")) {
+        detailPoll += 1;
+        return detailPoll === 1 ? Promise.resolve(new Response("failed", { status: 500 })) : deferredDetail;
+      }
+      if (url.includes("/api/runs/run-1/events")) {
+        eventPoll += 1;
+        return eventPoll === 1 ? Promise.resolve(new Response("failed", { status: 500 })) : deferredEvents;
+      }
+      return Promise.reject(new Error(`unexpected ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useActiveRun("conv"));
+    await waitFor(() => expect(result.current.error).toBe("Could not refresh run progress"));
+    await waitFor(() => expect(detailPoll).toBe(2), { timeout: 2000 });
+    expect(eventPoll).toBe(2);
+    expect(result.current.error).toBe("Could not refresh run progress");
+
+    resolveDetail(new Response(JSON.stringify({ id: "run-1", conversationId: "conv", status: "completed", createdAt: "now" })));
+    resolveEvents(new Response(JSON.stringify([])));
+    await waitFor(() => expect(result.current.error).toBeNull());
+  });
+
   test("AC-12.2: replay after cursor deduplicates repeated events and preserves order", async () => {
     let eventPoll = 0;
     global.fetch = mock((url: string) => {
