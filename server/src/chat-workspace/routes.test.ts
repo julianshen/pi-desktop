@@ -21,6 +21,9 @@ beforeAll(async () => {
   attachmentWorkspace = new AttachmentWorkspace(store, root);
   const app = express();
   app.use("/api", createChatWorkspaceRouter(new ConversationWorkspace(store, root), { attachments: attachmentWorkspace }));
+  app.post("/api/conversations/:id/chat", express.json({ limit: "10mb" }), (req, res) => {
+    res.json({ textLength: req.body?.messages?.[0]?.parts?.[0]?.text?.length });
+  });
   await new Promise<void>((resolve) => { server = app.listen(0, "127.0.0.1", () => resolve()); });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Expected TCP listener");
@@ -34,6 +37,18 @@ afterAll(async () => {
 });
 
 describe("chat workspace routes", () => {
+  test("chat requests bypass the workspace router 1 MiB parser and use their own limit", async () => {
+    const text = "x".repeat(1024 * 1024 + 1);
+    const response = await fetch(`${baseUrl}/conversations/conversation/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", parts: [{ type: "text", text }] }] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ textLength: text.length });
+  });
+
   test("AC-2.1: organization, lifecycle, and filtered list use stable JSON contracts", async () => {
     const project = await (await fetch(`${baseUrl}/projects`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "Launch" }),

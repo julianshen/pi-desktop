@@ -94,6 +94,40 @@ describe("search settings", () => {
     const restored = await (await fetch(`${baseUrl}/api/settings/search`)).json() as Record<string, unknown>;
     expect(restored).toEqual(updated);
   });
+
+  test("env-provided Brave keys remain env-only when updating non-secret settings", async () => {
+    const settingsFile = path.join(process.env.PI_DESKTOP_AGENT_DIR!, "search-settings.json");
+    fs.rmSync(settingsFile, { force: true });
+    process.env.BRAVE_SEARCH_API_KEY = "env-only-brave-secret";
+    try {
+      const { updateSearchSettings } = await import("./search/settings.js");
+      expect(updateSearchSettings({ enabled: true, maxResults: 6 })).toEqual({
+        enabled: true, provider: "brave", keyPresent: true, maxResults: 6,
+      });
+      const persisted = fs.readFileSync(settingsFile, "utf8");
+      expect(persisted).not.toContain("env-only-brave-secret");
+      expect(JSON.parse(persisted)).not.toHaveProperty("apiKey");
+    } finally {
+      delete process.env.BRAVE_SEARCH_API_KEY;
+    }
+  });
+
+  test("updating non-secret settings preserves an existing stored Brave key", async () => {
+    await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ apiKey: "stored-brave-secret" }),
+    });
+    await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ maxResults: 7 }),
+    });
+
+    const settingsFile = path.join(process.env.PI_DESKTOP_AGENT_DIR!, "search-settings.json");
+    expect(JSON.parse(fs.readFileSync(settingsFile, "utf8"))).toMatchObject({
+      apiKey: "stored-brave-secret",
+      maxResults: 7,
+    });
+  });
 });
 
 describe("POST /api/conversations", () => {
@@ -794,6 +828,51 @@ describe("POST /api/conversations/:id/chat", () => {
     }
     expect(updated.title).toBe("Plan a resilient agent");
     expect(new Date(updated.updatedAt).getTime()).toBeGreaterThanOrEqual(new Date(conversation.updatedAt).getTime());
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
+  test("the next branch run materializes the edited user message before prompting", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Edited branch materialization" }),
+      })
+    ).json()) as ConversationMeta;
+    const session = await getOrCreateSession(conversation.id);
+    const sourceMessageId = session.sessionManager.appendMessage({
+      role: "user",
+      content: "original branch prompt",
+      timestamp: Date.now(),
+    });
+    const branchResponse = await fetch(`${baseUrl}/api/conversations/${conversation.id}/branches`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceMessageId, replacementContent: "edited branch prompt" }),
+    });
+    expect(branchResponse.status).toBe(201);
+    const { subscribeSpy, promptSpy } = stubSessionTurn(session, "branch reply");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "next", role: "user", parts: [{ type: "text", text: "continue from the edit" }] }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    const editedEntries = session.sessionManager.getEntries().filter((entry) =>
+      entry.type === "message"
+      && entry.message.role === "user"
+      && entry.message.content === "edited branch prompt"
+    );
+    expect(editedEntries).toHaveLength(1);
+    expect(promptSpy).toHaveBeenCalledWith("continue from the edit", undefined);
 
     subscribeSpy.mockRestore();
     promptSpy.mockRestore();

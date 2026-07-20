@@ -15,6 +15,7 @@ export interface BranchSession {
   branch(fromId: string): void;
   resetLeaf(): void;
   navigateTree?(targetId: string): Promise<{ cancelled: boolean }>;
+  appendMessage(message: { role: "user"; content: string; timestamp: number }): string;
 }
 
 const mutexes = new Map<string, Promise<void>>();
@@ -132,6 +133,29 @@ export class BranchWorkspace {
       else session.resetLeaf();
       this.store.updateConversation(conversationId, { activeBranchId: branchId, updatedAt: now });
       return target;
+    });
+  }
+
+  async materializePendingReplacement(
+    conversationId: string,
+    branchId: string,
+    session: Pick<BranchSession, "appendMessage" | "getLeafId">,
+  ): Promise<string | undefined> {
+    return exclusive(conversationId, () => {
+      const branch = this.store.getBranch(conversationId, branchId);
+      if (!branch) throw new Error("Branch not found");
+      if (!branch.replacementContent) return undefined;
+      const entryId = session.appendMessage({
+        role: "user",
+        content: branch.replacementContent,
+        timestamp: Date.now(),
+      });
+      this.store.updateBranch(conversationId, branchId, {
+        leafEntryId: session.getLeafId() ?? entryId,
+        replacementContent: undefined,
+        updatedAt: new Date().toISOString(),
+      });
+      return entryId;
     });
   }
 

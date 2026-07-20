@@ -241,6 +241,7 @@ export function createApp(options?: CreateAppOptions): Express {
       branch: (id) => manager.branch(id),
       resetLeaf: () => manager.resetLeaf(),
       navigateTree: (id) => session.navigateTree(id),
+      appendMessage: (message) => manager.appendMessage(message),
     };
   };
   app.use("/api", createChatWorkspaceRouter(
@@ -577,6 +578,9 @@ export function createApp(options?: CreateAppOptions): Express {
         const conversation = workspaceStore.getConversation(req.params.id);
         const activeBranchId = conversation?.activeBranchId;
         const materialized = await attachmentWorkspace.materialize(req.params.id, attachmentIds as string[], activeBranchId);
+        if (activeBranchId) {
+          await branchWorkspace.materializePendingReplacement(req.params.id, activeBranchId, session.sessionManager);
+        }
         const messageText = extractLatestUserTextFromUIMessages(messages);
         const userText = withTextAttachments(messageText, materialized.textReferences);
         // ai-sdk/adapter.ts's own doc comment claims a real AgentSession "structurally

@@ -79,6 +79,7 @@ describe("BranchWorkspace", () => {
         manager.branch(id);
         return { cancelled: false };
       },
+      appendMessage: (message: { role: "user"; content: string; timestamp: number }) => manager.appendMessage(message),
     };
 
     const child = await branches.create("conversation", { sourceMessageId: second, replacementContent: "edited middle" }, session);
@@ -86,6 +87,30 @@ describe("BranchWorkspace", () => {
     expect(navigated).toEqual([firstAnswer]);
     expect(child.baseEntryId).toBe(firstAnswer);
     expect(manager.getLeafId()).toBe(firstAnswer);
+    store.close();
+  });
+
+  test("materializes a pending edited message exactly once before the next run", async () => {
+    const { store, manager, branches, second } = setup();
+    const child = await branches.create("conversation", {
+      sourceMessageId: second,
+      replacementContent: "edited middle",
+    }, manager);
+
+    const entryId = await branches.materializePendingReplacement("conversation", child.id, manager);
+    expect(entryId).toBeTruthy();
+    expect(manager.getEntry(entryId!)).toMatchObject({
+      type: "message",
+      message: { role: "user", content: "edited middle" },
+    });
+    expect(store.getBranch("conversation", child.id)).toMatchObject({
+      leafEntryId: entryId,
+      replacementContent: undefined,
+    });
+
+    const entryCount = manager.getEntries().length;
+    expect(await branches.materializePendingReplacement("conversation", child.id, manager)).toBeUndefined();
+    expect(manager.getEntries()).toHaveLength(entryCount);
     store.close();
   });
 });

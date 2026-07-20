@@ -1,4 +1,4 @@
-import express, { type Request, type Response, type Router } from "express";
+import express, { type NextFunction, type Request, type Response, type Router } from "express";
 import { ConversationWorkspace, type ConversationPatch } from "./conversations.js";
 import { AttachmentError, AttachmentWorkspace } from "./attachments.js";
 import type { AttachmentRecord } from "./store.js";
@@ -100,7 +100,12 @@ export function createChatWorkspaceRouter(
   } = {},
 ): Router {
   const router = express.Router();
-  router.use(express.json({ limit: "1mb" }));
+  const workspaceJson = express.json({ limit: "1mb" });
+  router.use((req: Request, res: Response, next: NextFunction) => {
+    const isChatRequest = req.method === "POST" && /^\/conversations\/[^/]+\/chat\/?$/.test(req.path);
+    if (isChatRequest) return next();
+    workspaceJson(req, res, next);
+  });
 
   router.get("/conversations", handle((req, res) => {
     const status = req.query.status;
