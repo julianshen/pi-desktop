@@ -16,7 +16,8 @@
     "sidecar:build": "npm run sidecar -w server",
     "lint": "tsc --noEmit && npm run lint -w server",
     "typecheck": "tsc --noEmit && npm run typecheck -w server",
-    "test": "bun test ./src"
+    "test": "bun test ./src",
+    "test:e2e": "bun test ./test"
   },
   "dependencies": {
     "@assistant-ui/react": "^0.14.26",
