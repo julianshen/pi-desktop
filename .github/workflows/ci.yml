@@ -87,13 +87,15 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # Tauri validates externalBin paths during cargo's build script. The
-      # packaged sidecar is platform-specific and is only built for releases;
-      # an empty CI-only file is sufficient for Rust unit tests and checks.
-      - name: Prepare Linux sidecar placeholder
+      # Tauri validates packaged resource paths during cargo's build script.
+      # The sidecar and server resources are only assembled for releases;
+      # empty CI-only files are sufficient for Rust unit tests and checks.
+      - name: Prepare packaged resource placeholders
         run: |
           mkdir -p src-tauri/binaries
+          mkdir -p src-tauri/resources/server
           touch src-tauri/binaries/pi-desktop-server-x86_64-unknown-linux-gnu
+          touch src-tauri/resources/server/index.ts
 
       - name: Test Rust shell
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
