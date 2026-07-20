@@ -19,12 +19,19 @@ export interface GeneratedFileMetadata {
 }
 
 function resolveWorkspaceFile(cwd: string, requested: string): string {
-  const root = path.resolve(cwd);
-  const source = path.resolve(root, requested);
-  if (source !== root && !source.startsWith(`${root}${path.sep}`)) throw new Error("Generated file must be inside the conversation workspace");
-  const stat = fs.lstatSync(source);
+  const lexicalRoot = path.resolve(cwd);
+  const lexicalSource = path.resolve(lexicalRoot, requested);
+  if (lexicalSource !== lexicalRoot && !lexicalSource.startsWith(`${lexicalRoot}${path.sep}`)) {
+    throw new Error("Generated file must be inside the conversation workspace");
+  }
+  const stat = fs.lstatSync(lexicalSource);
   if (stat.isSymbolicLink() || !stat.isFile()) throw new Error("Generated file must be a regular non-symlink file");
   if (stat.size > MAX_GENERATED_FILE_BYTES) throw new Error("Generated file exceeds the 100 MiB limit");
+  const root = fs.realpathSync(lexicalRoot);
+  const source = fs.realpathSync(lexicalSource);
+  if (source !== root && !source.startsWith(`${root}${path.sep}`)) {
+    throw new Error("Generated file must be inside the conversation workspace");
+  }
   return source;
 }
 

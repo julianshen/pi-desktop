@@ -16,3 +16,21 @@ test("generated files are copied into run-scoped app storage and return IDs with
   expect(JSON.stringify(result)).not.toContain(cwd);
   store.close();
 });
+
+test("generated files cannot escape through a symlinked workspace directory", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-generated-tool-symlink-")); roots.push(root);
+  const dataDir = path.join(root, "data");
+  const store = new ChatWorkspaceStore({ dataDir }); const now = new Date().toISOString();
+  store.createConversation({ id: "conversation", title: "Files", createdAt: now, updatedAt: now });
+  const manager = new RunManager(store); const run = manager.start({ conversationId: "conversation" });
+  setActivePlanRun("conversation", { manager, runId: run.id });
+  const cwd = path.join(root, "cwd"); const outside = path.join(root, "outside");
+  fs.mkdirSync(cwd); fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, "secret.txt"), "private");
+  fs.symlinkSync(outside, path.join(cwd, "out"), "dir");
+  const tool = createGeneratedFileTools("conversation", cwd, dataDir)[0]!;
+
+  await expect(tool.execute("call", { path: "out/secret.txt" }, undefined, undefined, {} as never))
+    .rejects.toThrow("inside the conversation workspace");
+  expect(fs.existsSync(path.join(dataDir, "generated-files", "conversation", run.id))).toBe(false);
+  store.close();
+});
