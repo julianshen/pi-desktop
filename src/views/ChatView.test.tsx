@@ -313,16 +313,27 @@ describe("ChatView (Task 8) — AC-8.3: assistant responses stream in visibly", 
   test("a streaming response renders growing partial text through Task 7's Message component, not all at once", async () => {
     mockFetch({ messages: [] });
 
+    let releaseFinalChunk: (() => void) | undefined;
+    const controlledStreamingModel: ChatModelAdapter = {
+      run: async function* () {
+        yield { content: [{ type: "text", text: "Hel" }] };
+        await new Promise<void>((resolve) => { releaseFinalChunk = resolve; });
+        yield { content: [{ type: "text", text: "Hello world" }] };
+      },
+    };
+
     const runtimeRef: MutableRefObject<ThreadRuntime | null> = { current: null };
-    render(<Harness conversationId="default" adapter={streamingModel} runtimeRef={runtimeRef} />);
+    render(<Harness conversationId="default" adapter={controlledStreamingModel} runtimeRef={runtimeRef} />);
     await waitFor(() => expect(runtimeRef.current).not.toBeNull());
 
     runtimeRef.current!.append("hi");
 
     // First a smaller intermediate chunk is visible...
     await waitFor(() => expect(screen.getByText("Hel")).toBeTruthy());
+    expect(releaseFinalChunk).toBeDefined();
     // ...before the final, complete text ever appears — proving the message
     // rendered incrementally rather than materializing complete in one paint.
+    releaseFinalChunk!();
     await waitFor(() => expect(screen.getByText("Hello world")).toBeTruthy());
   });
 });
