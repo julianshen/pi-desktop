@@ -66,6 +66,12 @@ function makeConversationsResult(overrides: Partial<UseConversationsResult> = {}
     activeId: null,
     setActiveId: () => {},
     create: () => Promise.reject(new Error("create() not implemented in this test fixture")),
+    update: () => Promise.reject(new Error("update() not implemented in this test fixture")),
+    remove: () => Promise.reject(new Error("remove() not implemented in this test fixture")),
+    projects: [],
+    folders: [],
+    createProject: () => Promise.reject(new Error("createProject() not implemented in this test fixture")),
+    createFolder: () => Promise.reject(new Error("createFolder() not implemented in this test fixture")),
     searchQuery: "",
     setSearchQuery: () => {},
     filtered: list,
@@ -256,6 +262,102 @@ describe("MainHeader", () => {
     await waitFor(() => expect(screen.getByLabelText("Model picker").textContent).toContain("Claude Sonnet 5"));
 
     expect(setModelCalls).toEqual(["Claude Sonnet 5"]);
+  });
+
+  // Bug fix (live smoke-test): switching models via the header picker persisted
+  // server-side and updated the composer footer correctly, but the HEADER
+  // BUTTON ITSELF kept showing the old model name until a full reload. Root
+  // cause: `conversations` (the shared `useConversations()` list, passed down
+  // as a prop) was never told about a successful switch — nothing called
+  // `conversations.refetch()` — so the effect that re-derives `selectedModelId`
+  // from `activeConversation?.modelId` (which re-runs whenever `switching`
+  // flips back to `false`, one of its own deps) read the still-stale modelId
+  // and clobbered the correct optimistic selection back to the old model.
+  //
+  // AC-11.2 above already asserts the label shows the new model at SOME point
+  // after switching, but `waitFor` stops polling the instant that's first
+  // true — it can't catch a revert that happens moments later. This test uses
+  // a stateful harness (mirroring how App.tsx really re-renders MainHeader
+  // with a fresh `conversations` prop once `refetch()` resolves) with a
+  // deliberately delayed GET /api/conversations, so it can assert the label
+  // stays correct THROUGH the window between "switch succeeds" and "refetch
+  // resolves" — the exact window the bug lived in.
+  test("BUG: header button label stays on the newly selected model and never reverts to the old one before the refetch resolves", async () => {
+    const models = [
+      { id: "model-a", label: "Model A", provider: "anthropic" },
+      { id: "model-b", label: "Model B", provider: "anthropic" },
+    ];
+    let convModelId = "model-a";
+    // GET /api/conversations (what a real `refetch()` hits) is held pending
+    // until the test explicitly resolves it below, so the "refetch is in
+    // flight but hasn't resolved yet" window is directly observable. Built
+    // directly in this scope (not inside the `mock()` callback) to match the
+    // existing `resolveFetch!` pattern above this test — hoisting a
+    // reassignment out of a doubly-nested closure like that also sidesteps a
+    // TS control-flow-narrowing quirk that otherwise types the resolver as
+    // `never` at its call site.
+    let resolveConversationsFetch!: () => void;
+    const pendingConversationsFetch = new Promise<Response>((resolve) => {
+      resolveConversationsFetch = () =>
+        resolve(jsonResponse([makeMeta({ id: "conv-1", title: "Sprint planning", modelId: convModelId })]));
+    });
+
+    global.fetch = mock((url: string, init?: RequestInit) => {
+      if (init?.method === "PATCH") {
+        convModelId = "model-b";
+        return Promise.resolve(jsonResponse({ id: "conv-1", modelId: "model-b" }));
+      }
+      if (url.includes("/api/settings/default-model")) {
+        return Promise.resolve(jsonResponse({ provider: null, model: null }));
+      }
+      if (url.includes("/api/models")) {
+        return Promise.resolve(jsonResponse(models));
+      }
+      return pendingConversationsFetch;
+    }) as unknown as typeof fetch;
+
+    function StatefulHarness() {
+      const [conversations, setConversations] = useState<ConversationMeta[]>([
+        makeMeta({ id: "conv-1", title: "Sprint planning", modelId: "model-a" }),
+      ]);
+      const refetch = async () => {
+        const res = await fetch("/api/conversations");
+        const data = (await res.json()) as ConversationMeta[];
+        setConversations(data);
+      };
+      return (
+        <Harness
+          conversations={makeConversationsResult({ conversations, refetch })}
+          activeConv="conv-1"
+        />
+      );
+    }
+
+    render(<StatefulHarness />);
+
+    await waitFor(() => expect(screen.getByText("Model A")).toBeTruthy());
+
+    fireEvent.click(screen.getByLabelText("Model picker"));
+    await waitFor(() => expect(screen.getByText("Model B")).toBeTruthy());
+    fireEvent.click(screen.getByText("Model B"));
+
+    // Optimistic update lands as soon as the PATCH resolves.
+    await waitFor(() => expect(screen.getByLabelText("Model picker").textContent).toContain("Model B"));
+
+    // The refetch triggered by the switch is still pending at this point
+    // (`resolveConversationsFetch` hasn't been called) — `conversations`
+    // still reports the stale "model-a". Give any effects a chance to
+    // re-run off `switching` flipping to `false` and confirm the label does
+    // NOT get clobbered back to the old model in this window.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.getByLabelText("Model picker").textContent).toContain("Model B");
+    expect(screen.getByLabelText("Model picker").textContent).not.toContain("Model A");
+
+    // Now let the refetch resolve with the now-fresh conversation and confirm
+    // the label still agrees.
+    resolveConversationsFetch();
+    await waitFor(() => expect(screen.getByLabelText("Model picker").textContent).toContain("Model B"));
+    expect(screen.getByLabelText("Model picker").textContent).not.toContain("Model A");
   });
 
   test('AC-11.3: breadcrumb and title reflect the active conversation\'s real title, never the hardcoded "July investor update"', async () => {

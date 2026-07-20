@@ -1,8 +1,9 @@
-import { useState, type CSSProperties } from "react";
+import { useState } from "react";
 import { PlusIcon, SearchIcon } from "./icons";
 import { filterConfig } from "../data/mockData";
 import type { SettingsSection, ViewKey } from "../state/useShellState";
-import type { ConversationMeta, UseConversationsResult } from "../state/useConversations";
+import type { UseConversationsResult } from "../state/useConversations";
+import { ConversationTree } from "./ConversationTree.js";
 
 const SIDEBAR_TITLES: Record<ViewKey, string> = {
   chat: "Conversations",
@@ -17,33 +18,8 @@ const SIDEBAR_TITLES: Record<ViewKey, string> = {
 const SETTINGS_NAV: { key: SettingsSection; label: string }[] = [
   { key: "providers", label: "Providers" },
   { key: "models", label: "Model defaults" },
+  { key: "search", label: "Web search" },
 ];
-
-function convStyle(active: boolean): CSSProperties {
-  return {
-    width: "100%",
-    textAlign: "left",
-    display: "flex",
-    alignItems: "center",
-    gap: 8,
-    padding: "8px 8px",
-    margin: "1px 0",
-    border: `1px solid ${active ? "var(--color-divider)" : "transparent"}`,
-    background: active ? "var(--color-accent-100)" : "transparent",
-    color: "var(--color-text)",
-    cursor: "pointer",
-  };
-}
-
-function convDot(active: boolean): CSSProperties {
-  return {
-    width: 6,
-    height: 6,
-    borderRadius: "50%",
-    flex: "none",
-    background: active ? "var(--color-accent)" : "color-mix(in srgb, var(--color-text) 22%, transparent)",
-  };
-}
 
 function Spinner({ size = 18 }: { size?: number }) {
   return (
@@ -166,32 +142,6 @@ function ConversationListNoMatches({ query }: { query: string }) {
   );
 }
 
-function isSameLocalDay(a: Date, b: Date): boolean {
-  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-}
-
-/**
- * Task 10: simple recency-bucket grouping ("Today"/"Earlier" by `updatedAt`'s
- * local calendar day) — TASKS.md's Open Questions explicitly defers a richer
- * scheme (yesterday/last 7 days/older) to a post-launch refinement, and this is
- * the minimal scheme that satisfies DESIGN.md's `ConversationGroup` shape
- * (label + items) without inventing UI states nobody asked for yet. Assumes
- * `list` already arrives sorted `updatedAt` desc (per Task 4's API contract), so
- * within each bucket items stay in that order.
- */
-function groupByRecency(list: ConversationMeta[]): { label: string; items: ConversationMeta[] }[] {
-  const now = new Date();
-  const today: ConversationMeta[] = [];
-  const earlier: ConversationMeta[] = [];
-  for (const c of list) {
-    (isSameLocalDay(new Date(c.updatedAt), now) ? today : earlier).push(c);
-  }
-  const groups: { label: string; items: ConversationMeta[] }[] = [];
-  if (today.length) groups.push({ label: "Today", items: today });
-  if (earlier.length) groups.push({ label: "Earlier", items: earlier });
-  return groups;
-}
-
 export function Sidebar({
   view,
   activeConv,
@@ -222,6 +172,7 @@ export function Sidebar({
 
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
 
   // AC-10.3: "+" creates a new conversation and it becomes active. `create()`'s
   // Promise rejects on failure (network error/non-2xx) without touching the
@@ -324,6 +275,24 @@ export function Sidebar({
                 }}
               />
             </div>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 6, marginTop: 6 }}>
+              <button
+                aria-pressed={showArchived}
+                onClick={() => setShowArchived((value) => !value)}
+                style={{ border: 0, background: "transparent", color: "var(--color-text-muted)", fontSize: 11, cursor: "pointer" }}
+              >
+                {showArchived ? "Show active" : "Show archived"}
+              </button>
+              <button
+                onClick={() => {
+                  const name = window.prompt("Project name");
+                  if (name?.trim()) void conversations.createProject(name.trim());
+                }}
+                style={{ border: 0, background: "transparent", color: "var(--color-accent-700)", fontSize: 11, cursor: "pointer" }}
+              >
+                + Project
+              </button>
+            </div>
           </div>
           <div style={{ flex: 1, overflowY: "auto", padding: "0 10px 14px" }}>
             {conversations.loading ? (
@@ -333,41 +302,14 @@ export function Sidebar({
             ) : conversations.filtered.length === 0 ? (
               <ConversationListNoMatches query={conversations.searchQuery} />
             ) : (
-              groupByRecency(conversations.filtered).map((group) => (
-                <div key={group.label}>
-                  <div
-                    style={{
-                      fontSize: 10,
-                      letterSpacing: "0.1em",
-                      textTransform: "uppercase",
-                      color: "color-mix(in srgb, var(--color-text) 45%, transparent)",
-                      padding: "12px 6px 6px",
-                    }}
-                  >
-                    {group.label}
-                  </div>
-                  {group.items.map((c) => {
-                    const active = c.id === activeConv;
-                    return (
-                      <button key={c.id} onClick={() => onSelectConv(c.id)} style={convStyle(active)}>
-                        <span style={convDot(active)} />
-                        <span
-                          style={{
-                            minWidth: 0,
-                            flex: 1,
-                            fontSize: 13,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {c.title}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ))
+              <ConversationTree
+                items={conversations.filtered.filter((conversation) => showArchived ? Boolean(conversation.archivedAt) : !conversation.archivedAt)}
+                projects={conversations.projects}
+                folders={conversations.folders}
+                activeId={activeConv}
+                workspace={conversations}
+                onSelect={onSelectConv}
+              />
             )}
             {createError && (
               <div style={{ fontSize: 11, color: "#b4463f", padding: "8px 6px" }}>{createError}</div>

@@ -16,14 +16,12 @@ import { resolveModelById } from "./models.js";
 import { createArtifactTools } from "../artifacts/tools.js";
 import { create as createPendingInteraction } from "../web-fetch/pending-interactions.js";
 import { createWebFetchTools } from "../web-fetch/tools.js";
+import { createPlanTools } from "./plan-tools.js";
+import { createSearchTools } from "../search/tools.js";
+import { createGeneratedFileTools } from "../chat-workspace/generated-files.js";
+import { ChatWorkspaceStore, type ConversationRecord } from "../chat-workspace/store.js";
 
-export interface ConversationMeta {
-  id: string;
-  title: string;
-  createdAt: string;
-  updatedAt: string;
-  modelId?: string;
-}
+export interface ConversationMeta extends ConversationRecord {}
 
 const sessionPromises = new Map<string, Promise<AgentSession>>();
 
@@ -152,24 +150,23 @@ function buildConfirmUIContext(conversationId: string): ExtensionUIContext {
   };
 }
 
-function registryPath(): string {
-  return path.join(env.dataDir, "conversations", "index.json");
-}
+let workspaceStore: ChatWorkspaceStore | undefined;
 
-function readRegistry(): ConversationMeta[] {
-  const file = registryPath();
-  if (!fs.existsSync(file)) return [];
-  return JSON.parse(fs.readFileSync(file, "utf8")) as ConversationMeta[];
-}
-
-function writeRegistry(entries: ConversationMeta[]): void {
-  const file = registryPath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(entries, null, 2));
+export function getWorkspaceStore(): ChatWorkspaceStore {
+  if (workspaceStore && !fs.existsSync(workspaceStore.databasePath)) {
+    try {
+      workspaceStore.close();
+    } catch {
+      // The containing directory may have been removed while SQLite was open.
+    }
+    workspaceStore = undefined;
+  }
+  workspaceStore ??= new ChatWorkspaceStore({ dataDir: env.dataDir });
+  return workspaceStore;
 }
 
 export function listConversations(): ConversationMeta[] {
-  return readRegistry().sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return getWorkspaceStore().listConversations();
 }
 
 export function createConversation(title?: string): ConversationMeta {
@@ -183,24 +180,25 @@ export function createConversation(title?: string): ConversationMeta {
 
   fs.mkdirSync(conversationCwd(meta.id), { recursive: true });
 
-  const entries = readRegistry();
-  entries.push(meta);
-  writeRegistry(entries);
-
-  return meta;
+  return getWorkspaceStore().createConversation(meta);
 }
 
 export function getConversationMeta(id: string): ConversationMeta | undefined {
-  return readRegistry().find((entry) => entry.id === id);
+  return getWorkspaceStore().getConversation(id);
 }
 
 export function touchConversation(id: string, patch?: Partial<Pick<ConversationMeta, "title" | "modelId">>): void {
-  const entries = readRegistry();
-  const index = entries.findIndex((entry) => entry.id === id);
-  if (index === -1) return;
+  getWorkspaceStore().updateConversation(id, { ...patch, updatedAt: new Date().toISOString() });
+}
 
-  entries[index] = { ...entries[index], ...patch, updatedAt: new Date().toISOString() };
-  writeRegistry(entries);
+export function touchConversationAfterTurn(id: string, userText: string): void {
+  const conversation = getConversationMeta(id);
+  if (!conversation) return;
+  const normalized = userText.replace(/\s+/g, " ").trim();
+  const title = conversation.title === "New conversation" && normalized
+    ? normalized.slice(0, 60)
+    : undefined;
+  touchConversation(id, title ? { title } : undefined);
 }
 
 /**
@@ -244,12 +242,13 @@ export function conversationCwd(id: string): string {
  * createConversation(). Idempotent: a no-op once the entry exists.
  */
 function ensureDefaultConversation(): void {
-  const entries = readRegistry();
-  if (entries.some((entry) => entry.id === "default")) return;
-
   const now = new Date().toISOString();
-  entries.push({ id: "default", title: "New conversation", createdAt: now, updatedAt: now });
-  writeRegistry(entries);
+  getWorkspaceStore().ensureConversation({
+    id: "default",
+    title: "New conversation",
+    createdAt: now,
+    updatedAt: now,
+  });
 }
 
 /**
@@ -359,7 +358,7 @@ async function createSession(id: string): Promise<AgentSession> {
     model,
     authStorage,
     modelRegistry,
-    customTools: [...customTools, ...createArtifactTools(id), ...createWebFetchTools(id, "interactive")],
+    customTools: [...customTools, ...createArtifactTools(id), ...createWebFetchTools(id, "interactive"), ...createPlanTools(id), ...createSearchTools(id), ...createGeneratedFileTools(id, cwd)],
     sessionManager: SessionManager.continueRecent(cwd),
   });
 

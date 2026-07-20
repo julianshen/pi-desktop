@@ -17,8 +17,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
  * assignment through either name is immediately visible through the other), so this
  * needs no extra test tooling beyond plain assignment/`delete`, unlike a real Vite
  * build's static replacement. There is no existing precedent in this repo for
- * exercising a Vite env var's *fallback* branch specifically (App.tsx/serverOrigin.ts
- * only ever read `VITE_COPILOTKIT_RUNTIME_URL` with a hardcoded `??` default, never
+ * exercising a Vite env var's *fallback* branch specifically (apiBase.ts/serverOrigin.ts
+ * only ever read `VITE_SERVER_BASE_URL` with a hardcoded `??` default, never
  * under test) — this file establishes that convention.
  */
 let invokeImpl: (cmd: string, args?: unknown) => Promise<unknown> = () =>

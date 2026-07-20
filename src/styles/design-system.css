@@ -6,6 +6,115 @@
  */
 @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;700&family=Barlow+Condensed:wght@400;600&display=swap');
 
+/*
+ * Task 1 (assistant-ui-migration): Tailwind v4's CSS-first config. `@import`
+ * statements must precede all non-@import/@layer rules in a stylesheet, so
+ * this has to sit right after the Google Fonts import and before `:root`.
+ * A later task (markdown-rendering via @assistant-ui/react-streamdown, once
+ * `streamdown`/`@streamdown/code` are installed) adds `@source` directives
+ * here for Streamdown's own class names — not this task's job, since those
+ * packages aren't installed yet and the paths can't be verified.
+ */
+@import "tailwindcss";
+
+/*
+ * Task 10 (assistant-ui-migration): `@source` directives so Tailwind scans
+ * Streamdown's own compiled output for the utility classes its control
+ * buttons/carets/code-block chrome use — without these, Tailwind's v4
+ * automatic content detection never sees `streamdown`'s dist files (they're
+ * inside `node_modules`, excluded by default) and those classes are purged.
+ * Paths are relative to this file's location (`src/styles/`), matching this
+ * project's real `node_modules` location two levels up.
+ */
+@source "../../node_modules/streamdown/dist/*.js";
+@source "../../node_modules/@streamdown/code/dist/*.js";
+@source "../../node_modules/@streamdown/math/dist/*.js";
+@source "../../node_modules/@streamdown/mermaid/dist/*.js";
+
+/*
+ * Tailwind v4 theme-variable mapping — NOT a second token set. Every entry
+ * below is `@theme inline`, which per Tailwind's own docs
+ * (https://tailwindcss.com/docs/theme#referencing-other-variables) tells
+ * Tailwind to substitute the referenced `var(...)` directly into generated
+ * utility CSS instead of emitting its own duplicate `:root` custom property.
+ * That means `bg-accent`/`text-accent`/etc. resolve through this exact same
+ * `var(--color-accent)` reference the hand-rolled CSS below already uses —
+ * one source of truth, not two. (Verified against the installed
+ * tailwindcss@4.3.2 package's own `theme.css`/docs, not assumed from memory.)
+ *
+ * Spacing is the one deliberate exception to "reuse the same name": Tailwind
+ * v4's numeric utilities (`p-4`, `gap-6`, ...) are generated dynamically from
+ * a single `--spacing` multiplier, but an explicit `--spacing-<N>` key for a
+ * matching number silently intercepts just that one utility while leaving
+ * neighboring numbers on the default scale (verified empirically by
+ * compiling `--spacing-1`/`--spacing-4` overrides with the installed
+ * `tailwindcss` package's own `compile()` API — `p-1`/`p-4` used the
+ * override, `p-5`/`p-7` did not). This design system's spacing scale
+ * (3.4px increments, only steps 1/2/3/4/6/8 defined) doesn't line up with
+ * Tailwind's 4px-multiple default scale, so reusing bare numbers here would
+ * make some numeric utilities behave inconsistently with others. Using a
+ * `-ds-` (design-system) suffix instead (`p-ds-4`, `gap-ds-6`, ...) avoids
+ * that collision entirely while still resolving through the same tokens.
+ */
+@theme inline {
+  --color-bg: var(--color-bg);
+  --color-surface: var(--color-surface);
+  --color-text: var(--color-text);
+  --color-accent: var(--color-accent);
+  --color-accent-2: var(--color-accent-2);
+  --color-divider: var(--color-divider);
+
+  --color-neutral-100: var(--color-neutral-100);
+  --color-neutral-200: var(--color-neutral-200);
+  --color-neutral-300: var(--color-neutral-300);
+  --color-neutral-400: var(--color-neutral-400);
+  --color-neutral-500: var(--color-neutral-500);
+  --color-neutral-600: var(--color-neutral-600);
+  --color-neutral-700: var(--color-neutral-700);
+  --color-neutral-800: var(--color-neutral-800);
+  --color-neutral-900: var(--color-neutral-900);
+
+  --color-accent-100: var(--color-accent-100);
+  --color-accent-200: var(--color-accent-200);
+  --color-accent-300: var(--color-accent-300);
+  --color-accent-400: var(--color-accent-400);
+  --color-accent-500: var(--color-accent-500);
+  --color-accent-600: var(--color-accent-600);
+  --color-accent-700: var(--color-accent-700);
+  --color-accent-800: var(--color-accent-800);
+  --color-accent-900: var(--color-accent-900);
+
+  --color-accent-2-100: var(--color-accent-2-100);
+  --color-accent-2-200: var(--color-accent-2-200);
+  --color-accent-2-300: var(--color-accent-2-300);
+  --color-accent-2-400: var(--color-accent-2-400);
+  --color-accent-2-500: var(--color-accent-2-500);
+  --color-accent-2-600: var(--color-accent-2-600);
+  --color-accent-2-700: var(--color-accent-2-700);
+  --color-accent-2-800: var(--color-accent-2-800);
+  --color-accent-2-900: var(--color-accent-2-900);
+
+  --color-danger: var(--color-danger);
+  --color-danger-bg: var(--color-danger-bg);
+  --color-success: var(--color-success);
+  --color-success-bg: var(--color-success-bg);
+
+  /* --font-heading-weight is a font-weight value, not a font stack — it
+     doesn't fit Tailwind's `--font-*` (font-family) namespace and there's no
+     matching `--font-weight-*` name for it, so it's intentionally left out
+     of this mapping. Existing `var(--font-heading-weight)` usage elsewhere
+     in this file is untouched. */
+  --font-heading: var(--font-heading);
+  --font-body: var(--font-body);
+
+  --spacing-ds-1: var(--space-1);
+  --spacing-ds-2: var(--space-2);
+  --spacing-ds-3: var(--space-3);
+  --spacing-ds-4: var(--space-4);
+  --spacing-ds-6: var(--space-6);
+  --spacing-ds-8: var(--space-8);
+}
+
 :root {
   --color-bg: #f2f2f3;
   --color-surface: #e9e9ea;
@@ -46,6 +155,8 @@
 
   --color-danger: #b4463f;
   --color-danger-bg: #fbeceb;
+  --color-success: #527864;
+  --color-success-bg: #f4f8f5;
 
   --font-heading: "Barlow Condensed", system-ui, sans-serif;
   --font-heading-weight: 600;

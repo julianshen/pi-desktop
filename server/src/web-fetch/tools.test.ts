@@ -173,6 +173,11 @@ describe("web_fetch tool", () => {
   // immediately with an explicit "not permitted in a background run" result
   // and NEVER creates a pending interaction. US-05: an unattended scheduled
   // run must never hang waiting on an approval nobody will give.
+  //
+  // assistant-ui-migration/AC-13.2: also the re-verification that this
+  // hard-block is completely unaffected by the AI-SDK migration (Task 13,
+  // re-run unmodified -- scheduled sessions never touch the new chat route
+  // at all, so this exact test already proves AC-13.2 without any change).
   test("AC-6.4 [R]: scheduled session hard-blocks a private URL immediately, with no pending interaction ever created", async () => {
     const conversationId = randomUUID();
     const [webFetch] = createWebFetchTools(conversationId, "scheduled");
@@ -679,7 +684,7 @@ describe("web_fetch tool — REVIEW.md remediation", () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       fetchCalls.push({ url: String(input) });
       throw new DOMException("The operation was aborted.", "AbortError");
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
 
     const result = await expectNotToThrow(
       webFetch.execute("call-1", { url: PUBLIC_URL }, undefined, undefined, ctx),

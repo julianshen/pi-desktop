@@ -15,7 +15,8 @@
         "label": "main",
         "title": "pi desktop",
         "width": 1000,
-        "height": 720
+        "height": 720,
+        "decorations": false
       }
     ],
     "security": {

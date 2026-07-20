@@ -5,7 +5,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { PassThrough } from "node:stream";
 import type { Server } from "node:http";
-import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import type { ModelRegistry, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ConversationMeta } from "./agent/conversations.js";
 
@@ -78,6 +78,55 @@ describe("GET /api/conversations", () => {
     const res = await fetch(`${baseUrl}/api/conversations`);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual([]);
+  });
+});
+
+describe("search settings", () => {
+  test("AC-13.1: Brave-first settings are configurable without ever returning the key", async () => {
+    const patch = await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ enabled: true, provider: "brave", apiKey: "brave-secret-value", maxResults: 4 }),
+    });
+    expect(patch.status).toBe(200);
+    const updated = await patch.json() as Record<string, unknown>;
+    expect(updated).toEqual({ enabled: true, provider: "brave", keyPresent: true, maxResults: 4 });
+    expect(JSON.stringify(updated)).not.toContain("brave-secret-value");
+    const restored = await (await fetch(`${baseUrl}/api/settings/search`)).json() as Record<string, unknown>;
+    expect(restored).toEqual(updated);
+  });
+
+  test("env-provided Brave keys remain env-only when updating non-secret settings", async () => {
+    const settingsFile = path.join(process.env.PI_DESKTOP_AGENT_DIR!, "search-settings.json");
+    fs.rmSync(settingsFile, { force: true });
+    process.env.BRAVE_SEARCH_API_KEY = "env-only-brave-secret";
+    try {
+      const { updateSearchSettings } = await import("./search/settings.js");
+      expect(updateSearchSettings({ enabled: true, maxResults: 6 })).toEqual({
+        enabled: true, provider: "brave", keyPresent: true, maxResults: 6,
+      });
+      const persisted = fs.readFileSync(settingsFile, "utf8");
+      expect(persisted).not.toContain("env-only-brave-secret");
+      expect(JSON.parse(persisted)).not.toHaveProperty("apiKey");
+    } finally {
+      delete process.env.BRAVE_SEARCH_API_KEY;
+    }
+  });
+
+  test("updating non-secret settings preserves an existing stored Brave key", async () => {
+    await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ apiKey: "stored-brave-secret" }),
+    });
+    await fetch(`${baseUrl}/api/settings/search`, {
+      method: "PATCH", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ maxResults: 7 }),
+    });
+
+    const settingsFile = path.join(process.env.PI_DESKTOP_AGENT_DIR!, "search-settings.json");
+    expect(JSON.parse(fs.readFileSync(settingsFile, "utf8"))).toMatchObject({
+      apiKey: "stored-brave-secret",
+      maxResults: 7,
+    });
   });
 });
 
@@ -322,6 +371,11 @@ describe("Task 6: GET /api/models, PATCH /api/conversations/:id/model", () => {
    * reason as index.js above -- it transitively loads config/env.js, which must not
    * resolve against the real environment before this file's top beforeAll sets the
    * scratch PI_DESKTOP_* dirs.
+   *
+   * assistant-ui-migration/AC-15.2: this block is also the re-verification that
+   * a live session still picks up a model switch immediately under the new
+   * chat route (Task 15, re-run and re-confirmed unmodified -- no new test
+   * needed since this one already covers the exact behavior AC-15.2 requires).
    */
   describe("PATCH /api/conversations/:id/model with an already-live cached session", () => {
     // (b): a conversation with a live session must have setModel() called on that
@@ -619,12 +673,591 @@ describe("GET /api/conversations/:id/artifacts/:artifactId", () => {
   });
 });
 
+/**
+ * Task 5 (TASKS.md): the Vercel AI SDK / Assistant UI chat route (originally wired
+ * alongside the legacy `/agui` route; `/agui`, `agui/adapter.ts`, and
+ * `copilot/runtime.ts` were deleted post-/tgd-review once Task 8's frontend cutover
+ * proved this route out end-to-end — see index.ts's comment above this route for the
+ * full history). Real HTTP over app.listen(), same convention as every other describe
+ * block in this file.
+ *
+ * Driving a real turn end-to-end would require real provider auth this scratch
+ * test env never configures (agent/conversations.ts's createSession() ->
+ * getAgentDeps() -> real auth.json/model registry) -- these tests instead get a
+ * REAL AgentSession via getOrCreateSession() (same helper the route itself calls)
+ * and spy on its subscribe()/prompt() methods, same established pattern as the
+ * "PATCH /api/conversations/:id/model with an already-live cached session" block
+ * above (spyOn(session, "setModel")). Overriding subscribe() to capture the
+ * listener the adapter registers (rather than letting the real SDK's internal
+ * event bus drive it) lets prompt()'s mock implementation manually replay a
+ * controlled, conversation-specific sequence of pi session events through that
+ * exact listener -- proving the route's plumbing (getOrCreateSession ->
+ * handleAiSdkRun -> pipeUIMessageStreamToResponse) actually carries THIS
+ * conversation's session activity into the HTTP response, without needing a real
+ * model call.
+ */
+describe("POST /api/conversations/:id/chat", () => {
+  // `listener`/the events fed into it below are typed `any` deliberately: this test
+  // double drives ai-sdk/adapter.ts's PiSessionEvent shape (a narrower, hand-picked
+  // duck type — see that file's own doc comment) through the real SDK's
+  // AgentSessionEventListener slot, and those two types are related in neither
+  // direction under `tsc`'s strict structural check (same mismatch documented at
+  // index.ts's handleAiSdkRun() call site) — `any` here is the pragmatic escape
+  // hatch for a test double, not a production code path.
+  function stubSessionTurn(session: Awaited<ReturnType<typeof import("./agent/conversations.js").getOrCreateSession>>, replyText: string) {
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: replyText },
+      });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+    return { subscribeSpy, promptSpy };
+  }
+
+  // AC-5.1 [R]: Given a real HTTP POST to the new route for a given conversation
+  // id, when the request carries a valid AI-SDK-shaped body ({ messages:
+  // UIMessage[] }), then it receives a real AI-SDK-shaped UI message stream
+  // response reflecting that SPECIFIC conversation's actual AgentSession activity
+  // — proven here via two distinct conversations, each with its own stubbed
+  // session reply, confirming conversation A's response body carries only A's
+  // text and never B's (direct re-verification of wire-chat-backend's
+  // "Cross-conversation message isolation" catalog entry under the new
+  // transport, per TASKS.md's AC-5.1).
+  test("AC-5.1: two conversations' chat responses reflect only their own session activity", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+
+    const convA = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "chat route conversation A" }),
+      })
+    ).json()) as ConversationMeta;
+    const convB = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "chat route conversation B" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const sessionA = await getOrCreateSession(convA.id);
+    const sessionB = await getOrCreateSession(convB.id);
+    const { subscribeSpy: subscribeSpyA, promptSpy: promptSpyA } = stubSessionTurn(
+      sessionA,
+      "reply-only-for-conversation-A",
+    );
+    const { subscribeSpy: subscribeSpyB, promptSpy: promptSpyB } = stubSessionTurn(
+      sessionB,
+      "reply-only-for-conversation-B",
+    );
+
+    const chatBody = (text: string) =>
+      JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text }] }],
+      });
+
+    const resA = await fetch(`${baseUrl}/api/conversations/${convA.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: chatBody("hello from A"),
+    });
+    expect(resA.status).toBe(200);
+    const bodyA = await resA.text();
+    expect(bodyA).toContain("reply-only-for-conversation-A");
+    expect(bodyA).not.toContain("reply-only-for-conversation-B");
+
+    const resB = await fetch(`${baseUrl}/api/conversations/${convB.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: chatBody("hello from B"),
+    });
+    expect(resB.status).toBe(200);
+    const bodyB = await resB.text();
+    expect(bodyB).toContain("reply-only-for-conversation-B");
+    expect(bodyB).not.toContain("reply-only-for-conversation-A");
+
+    // Each conversation's own session.prompt() was driven with ITS request's
+    // extracted user text, not the other conversation's — the userText argument
+    // handleAiSdkRun forwards straight to session.prompt(text, ...) per
+    // ai-sdk/adapter.ts.
+    expect(promptSpyA).toHaveBeenCalledWith("hello from A", undefined);
+    expect(promptSpyB).toHaveBeenCalledWith("hello from B", undefined);
+
+    subscribeSpyA.mockRestore();
+    promptSpyA.mockRestore();
+    subscribeSpyB.mockRestore();
+    promptSpyB.mockRestore();
+  });
+
+  test("a completed chat turn derives the default conversation title", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+    ).json()) as ConversationMeta;
+    const session = await getOrCreateSession(conversation.id);
+    const { subscribeSpy, promptSpy } = stubSessionTurn(session, "Done");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "  Plan   a resilient agent  " }] }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    let updated = conversation;
+    for (let attempt = 0; attempt < 20 && updated.title === "New conversation"; attempt += 1) {
+      await Bun.sleep(5);
+      updated = (await (await fetch(`${baseUrl}/api/conversations/${conversation.id}`)).json()) as ConversationMeta;
+    }
+    expect(updated.title).toBe("Plan a resilient agent");
+    expect(new Date(updated.updatedAt).getTime()).toBeGreaterThanOrEqual(new Date(conversation.updatedAt).getTime());
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
+  test("the next branch run materializes the edited user message before prompting", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Edited branch materialization" }),
+      })
+    ).json()) as ConversationMeta;
+    const session = await getOrCreateSession(conversation.id);
+    const sourceMessageId = session.sessionManager.appendMessage({
+      role: "user",
+      content: "original branch prompt",
+      timestamp: Date.now(),
+    });
+    const branchResponse = await fetch(`${baseUrl}/api/conversations/${conversation.id}/branches`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sourceMessageId, replacementContent: "edited branch prompt" }),
+    });
+    expect(branchResponse.status).toBe(201);
+    const { subscribeSpy, promptSpy } = stubSessionTurn(session, "branch reply");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "next", role: "user", parts: [{ type: "text", text: "continue from the edit" }] }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    const editedEntries = session.sessionManager.getEntries().filter((entry) =>
+      entry.type === "message"
+      && entry.message.role === "user"
+      && entry.message.content === "edited branch prompt"
+    );
+    expect(editedEntries).toHaveLength(1);
+    expect(promptSpy).toHaveBeenCalledWith("continue from the edit", undefined);
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
+  test("attachment IDs materialize only the explicitly referenced staged copy into pi input", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "attachment materialization" }),
+      })
+    ).json()) as ConversationMeta;
+    const originals = path.join(tmpRoot, "attachment-materialization-originals");
+    fs.mkdirSync(originals, { recursive: true });
+    const selectedPath = path.join(originals, "selected.md");
+    const unselectedPath = path.join(originals, "not-selected.md");
+    fs.writeFileSync(selectedPath, "SELECTED_ATTACHMENT_CONTENT");
+    fs.writeFileSync(unselectedPath, "UNSELECTED_SECRET_CONTENT");
+
+    const stage = async (localPath: string) => (await (
+      await fetch(`${baseUrl}/api/conversations/${conversation.id}/attachments`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ localPath }),
+      })
+    ).json()) as { id: string };
+    const selected = await stage(selectedPath);
+    await stage(unselectedPath);
+
+    const session = await getOrCreateSession(conversation.id);
+    const { promptSpy } = stubSessionTurn(session, "attachment received");
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "Review it" }] }],
+        attachmentIds: [selected.id],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    const [prompt, options] = promptSpy.mock.calls[0]!;
+    expect(prompt).toContain("Review it");
+    expect(prompt).toContain("SELECTED_ATTACHMENT_CONTENT");
+    expect(prompt).not.toContain("UNSELECTED_SECRET_CONTENT");
+    expect(prompt).not.toContain(originals);
+    expect(options).toBeUndefined();
+    promptSpy.mockRestore();
+  });
+
+  test("referenced images reach pi as validated image options and never as local paths", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ title: "image input" }),
+    })).json()) as ConversationMeta;
+    const imagePath = path.join(tmpRoot, "validated-image.png");
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    fs.writeFileSync(imagePath, bytes);
+    const staged = await (await fetch(`${baseUrl}/api/conversations/${conversation.id}/attachments`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ localPath: imagePath }),
+    })).json() as { id: string };
+    const session = await getOrCreateSession(conversation.id);
+    const { promptSpy } = stubSessionTurn(session, "image received");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ id: "u", role: "user", parts: [{ type: "text", text: "Inspect" }] }], attachmentIds: [staged.id] }),
+    });
+    await response.text();
+    const [prompt, options] = promptSpy.mock.calls[0]!;
+    expect(prompt).toBe("Inspect");
+    expect(options).toEqual({ images: [{ type: "image", mimeType: "image/png", data: bytes.toString("base64") }] });
+    expect(JSON.stringify(options)).not.toContain(imagePath);
+    promptSpy.mockRestore();
+  });
+
+  // AC-5.2 [R]: Given a malformed conversation id (path-traversal-style, matching
+  // assertSafeConversationId's existing convention), when the new route is
+  // called, then it returns 400 with no leaked stack trace — same convention as
+  // every other per-conversation route in this file (GET .../messages,
+  // .../artifacts/latest, .../artifacts/:artifactId above), re-verifying this bug
+  // class doesn't regress a third time under a brand-new route.
+  test("AC-5.2: malformed conversation id returns 400, not a stack-trace-leaking 500", async () => {
+    const res = await fetch(`${baseUrl}/api/conversations/${encodeURIComponent("../../etc")}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] }] }),
+    });
+    expect(res.status).toBe(400);
+
+    const text = await res.text();
+    expect(text).not.toContain("at ");
+    expect(text).not.toContain(".ts:");
+  });
+});
+
+// Task 13 (TASKS.md) / ADR-002-tool-approval-trust-boundary.md: regression-confirmation,
+// not a rebuild. ADR-002's Finding 3 claims `web_fetch`'s `ctx.ui.confirm()` pause
+// mechanism (`web-fetch/tools.ts`, `web-fetch/pending-interactions.ts`) is
+// protocol-agnostic Pi Agent plumbing that predates AG-UI/CopilotKit and needs ZERO
+// changes to work under the new AI-SDK-shaped chat route — this describe block proves
+// that claim end-to-end against the real, fully-migrated stack, rather than assuming it
+// from the ADR's own reasoning (this task's whole reason to exist).
+//
+// This is the ONLY suitable home for this test (over ai-sdk/adapter.test.ts): AC-13.1
+// requires driving a REAL HTTP POST against the REAL `/api/conversations/:id/chat`
+// route (Task 5) and resolving the pause via a REAL, authenticated HTTP call to the
+// already-merged `POST .../pending-interaction/:interactionId/resolve` endpoint
+// (`f503f55`, ADR-001's `X-Resolve-Token` mechanism) — adapter.test.ts's own
+// `handleAiSdkRun()` unit tests never spin up an Express app or issue real HTTP
+// requests at all (see that file's `makeStubSession`/`collectChunks` helpers), so it
+// cannot exercise the resolve endpoint's auth check or the route-to-adapter wiring
+// this task is specifically asked to re-verify. This file already has every other
+// piece the test needs (a real `app.listen()` instance, `TEST_RESOLVE_TOKEN`, the real
+// `getOrCreateSession()`).
+//
+// The ONE deliberate stub is `session.subscribe()`/`session.prompt()` itself — same
+// convention as the "POST /api/conversations/:id/chat" describe block above. Pi's own
+// model-calling loop (the part that would normally *decide* to call `web_fetch`) is
+// out of this migration's scope entirely (SPEC.md's "Never" boundary: this app never
+// reimplements or drives pi's own agentic loop) — these tests hand-drive the exact
+// `tool_execution_start`/`tool_execution_end` event pair pi's real engine emits around
+// a single tool call. Everything AFTER that point is 100% real, unstubbed production
+// code: the actual `web_fetch` `AgentTool` (`createWebFetchTools`), its real
+// `classifyTarget()`/`plainFetch()` gate, the real `pending-interactions.ts` registry
+// (including its Task-4 creation-notification hook), the real `ai-sdk/adapter.ts`
+// translation, and the real, authenticated HTTP resolve endpoint — the entire chain
+// ADR-002 claims needs zero changes.
+describe("Task 13: web_fetch / ctx.ui.confirm() full chain through the new AI SDK chat route (ADR-002 regression confirmation)", () => {
+  // A loopback target on a port nothing listens on. Chosen deliberately over stubbing
+  // `globalThis.fetch` (as web-fetch/tools.test.ts does): this file's OWN tests rely on
+  // the real, unstubbed `fetch()` to talk to `baseUrl` throughout, so overriding it here
+  // would risk breaking every other test in this file if not perfectly scoped/restored.
+  // A closed loopback port instead gets a real, near-instant ECONNREFUSED from the OS
+  // (verified directly: `curl --max-time 3 http://127.0.0.1:9/x` returns in ~20ms) — no
+  // real network access needed, fully deterministic, and it exercises the REAL
+  // `plainFetch()` network call end-to-end rather than a fake one.
+  const PRIVATE_URL = "http://127.0.0.1:9/private-page";
+
+  /** Waits for `getPending(conversationId)` to become non-undefined — same convention as web-fetch/tools.test.ts's own waitForPending(). */
+  async function waitForPending(conversationId: string, getPending: (id: string) => unknown, timeoutMs = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const pending = getPending(conversationId);
+      if (pending) return pending as { id: string; kind: string; host?: string };
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    throw new Error(`timed out waiting for a pending interaction for conversation ${conversationId}`);
+  }
+
+  /** Real ctx.ui.confirm(), wired to the real pending-interactions.ts registry — mirrors web-fetch/tools.test.ts's own buildRealConfirmContext() (a local, unexported helper there, so duplicated here rather than imported). */
+  function buildRealConfirmContext(
+    conversationId: string,
+    createPendingInteraction: typeof import("./web-fetch/pending-interactions.js").create,
+  ): ExtensionContext {
+    return {
+      ui: {
+        confirm: async (_title: string, message: string, opts?: { timeout?: number }) => {
+          const { promise } = createPendingInteraction(conversationId, {
+            conversationId,
+            kind: "confirm",
+            host: message,
+            timeoutMs: opts?.timeout ?? 5000,
+          });
+          const result = await promise;
+          return result.kind === "confirm" ? result.approved : false;
+        },
+      },
+    } as unknown as ExtensionContext;
+  }
+
+  // AC-13.1 [R], approve direction — covers points 1, 2, 3, and 4 of the acceptance
+  // criteria in one real end-to-end run: pauses exactly as today; a
+  // `tool-approval-request` chunk appears in the AI SDK stream; the fetch does not
+  // proceed until the real resolve endpoint resolves it; and once resolved,
+  // `ctx.ui.confirm()` unblocks, `tool_execution_end` fires, and the result reaches the
+  // stream as `tool-output-available` with zero "continuation injection" code anywhere.
+  test("AC-13.1: private-target web_fetch pauses, surfaces tool-approval-request, and only completes once the real resolve endpoint approves it", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const { createWebFetchTools } = await import("./web-fetch/tools.js");
+    const { create: createPendingInteraction, getPending } = await import("./web-fetch/pending-interactions.js");
+
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "web_fetch approval chain (approve)" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const session = await getOrCreateSession(created.id);
+    const [webFetch] = createWebFetchTools(created.id, "interactive");
+    const ctx = buildRealConfirmContext(created.id, createPendingInteraction);
+
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "tool_execution_start",
+        toolCallId: "call-web-fetch-1",
+        toolName: "web_fetch",
+        args: { url: PRIVATE_URL },
+      });
+      // The REAL web_fetch execute() — this is where it actually calls
+      // ctx.ui.confirm() above, creating a REAL pending interaction and pausing this
+      // promise (and therefore this whole prompt() call, and therefore the /chat
+      // response below) until the test resolves it over real HTTP further down.
+      const result = await webFetch.execute("call-web-fetch-1", { url: PRIVATE_URL }, undefined, undefined, ctx);
+      listener({ type: "tool_execution_end", toolCallId: "call-web-fetch-1", result });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+
+    // Fire the real HTTP request against the real route, but do NOT await its body
+    // yet — execute() above is paused on ctx.ui.confirm() at this point, so the
+    // response cannot complete until this test resolves the pending interaction
+    // below (point 3: "the fetch does not proceed until the resolve endpoint...").
+    const chatPromise = fetch(`${baseUrl}/api/conversations/${created.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: `please fetch ${PRIVATE_URL}` }] }],
+      }),
+    });
+
+    // Point 1: it pauses exactly as it does today — proven by polling the REAL
+    // pending-interactions.ts registry directly (independent of whatever the AI SDK
+    // stream itself carries) for the confirm interaction ctx.ui.confirm() just created.
+    const pending = await waitForPending(created.id, getPending);
+    expect(pending.kind).toBe("confirm");
+    expect(pending.host).toContain(new URL(PRIVATE_URL).href);
+
+    // Point 3: resolve it via the REAL, authenticated HTTP endpoint (Task 11's
+    // already-merged route, commit f503f55) — not by calling
+    // pending-interactions.ts's resolve() directly, since the point of this test is to
+    // prove the HTTP endpoint itself is what unblocks ctx.ui.confirm().
+    const resolveRes = await fetch(
+      `${baseUrl}/api/conversations/${created.id}/pending-interaction/${pending.id}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: true }),
+      },
+    );
+    expect(resolveRes.status).toBe(200);
+    expect(await resolveRes.json()).toEqual({ resolved: true });
+
+    // Point 4: now the /chat request can complete — ctx.ui.confirm() unblocked,
+    // web_fetch.execute() resumed (attempting a real loopback connection to a closed
+    // port: an immediate ECONNREFUSED, no real network access required), the real
+    // tool_execution_end fired, and ai-sdk/adapter.ts's PRE-EXISTING (Task 3)
+    // tool_execution_end -> tool-output-available translation carried the result into
+    // the stream — zero new "continuation injection" logic anywhere, per ADR-002
+    // Finding 3.
+    const chatRes = await chatPromise;
+    expect(chatRes.status).toBe(200);
+    const body = await chatRes.text();
+
+    // Point 2: a tool-approval-request chunk appeared, correlated to the real pending
+    // interaction's id and the real tool call's id (ADR-002 Decision point 4).
+    expect(body).toContain('"type":"tool-approval-request"');
+    expect(body).toContain(`"approvalId":"${pending.id}"`);
+    expect(body).toContain('"toolCallId":"call-web-fetch-1"');
+
+    // The literal, unparaphrased URL argument is visible via tool-input-available
+    // (ADR-002 Decision point 4's "never paraphrase" improvement).
+    expect(body).toContain('"type":"tool-input-available"');
+    expect(body).toContain(PRIVATE_URL);
+
+    // The real (fetch-failed, since nothing listens on the target port) result made it
+    // through as an ordinary tool-output-available part — the specific outcome doesn't
+    // matter here, only that SOME real result flowed through with no special-casing.
+    expect(body).toContain('"type":"tool-output-available"');
+    expect(body).toContain('"toolCallId":"call-web-fetch-1"');
+    expect(body).toContain('"ok":false');
+    expect(body).toContain('"reason":"fetch-failed"');
+
+    // The pending interaction is gone from the registry once settled (no leak).
+    expect(getPending(created.id)).toBeUndefined();
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
+  // AC-13.1 [R], deny direction — re-verifies web-fetch/TASKS.md's original
+  // denied-confirmation criteria under the fully migrated stack. ADR-002 Finding 3:
+  // a denied confirm does NOT throw — execute() resolves normally with an explicit
+  // { ok: false, reason: "not-approved" } result, so pi's own tool_execution_end fires
+  // exactly as it does for a successful fetch, and Task 3's translation needs no
+  // special-casing for the denial path either.
+  test("AC-13.1: denying the approval resolves web_fetch with an explicit not-approved result, still delivered via tool-output-available", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const { createWebFetchTools } = await import("./web-fetch/tools.js");
+    const { create: createPendingInteraction, getPending } = await import("./web-fetch/pending-interactions.js");
+
+    const created = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "web_fetch approval chain (deny)" }),
+      })
+    ).json()) as ConversationMeta;
+
+    const session = await getOrCreateSession(created.id);
+    const [webFetch] = createWebFetchTools(created.id, "interactive");
+    const ctx = buildRealConfirmContext(created.id, createPendingInteraction);
+
+    let listener: ((event: any) => void) | undefined;
+    const subscribeSpy = spyOn(session, "subscribe").mockImplementation((l: any) => {
+      listener = l;
+      return () => {};
+    });
+    const promptSpy = spyOn(session, "prompt").mockImplementation(async () => {
+      if (!listener) throw new Error("expected subscribe() to have been called before prompt()");
+      listener({ type: "message_start", message: { role: "assistant" } });
+      listener({
+        type: "tool_execution_start",
+        toolCallId: "call-web-fetch-2",
+        toolName: "web_fetch",
+        args: { url: PRIVATE_URL },
+      });
+      const result = await webFetch.execute("call-web-fetch-2", { url: PRIVATE_URL }, undefined, undefined, ctx);
+      listener({ type: "tool_execution_end", toolCallId: "call-web-fetch-2", result });
+      listener({ type: "message_end", message: { role: "assistant" } });
+      listener({ type: "agent_end" });
+    });
+
+    const chatPromise = fetch(`${baseUrl}/api/conversations/${created.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: `please fetch ${PRIVATE_URL}` }] }],
+      }),
+    });
+
+    const pending = await waitForPending(created.id, getPending);
+    expect(pending.kind).toBe("confirm");
+
+    const resolveRes = await fetch(
+      `${baseUrl}/api/conversations/${created.id}/pending-interaction/${pending.id}/resolve`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-Resolve-Token": TEST_RESOLVE_TOKEN },
+        body: JSON.stringify({ approved: false }),
+      },
+    );
+    expect(resolveRes.status).toBe(200);
+
+    const chatRes = await chatPromise;
+    expect(chatRes.status).toBe(200);
+    const body = await chatRes.text();
+
+    expect(body).toContain('"type":"tool-approval-request"');
+    expect(body).toContain('"type":"tool-output-available"');
+    expect(body).toContain('"ok":false');
+    expect(body).toContain('"reason":"not-approved"');
+    // Denial must short-circuit BEFORE any network attempt — never "proceed to fetch
+    // anyway" (the exact regression this whole approval gate exists to prevent).
+    expect(body).not.toContain('"reason":"fetch-failed"');
+
+    expect(getPending(created.id)).toBeUndefined();
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+});
+
 // Security-review finding (Critical, /tgd-review security-auditor): createApp() used
 // to mount `cors()` with no options, which is the `cors` package's wildcard default
 // (Access-Control-Allow-Origin: *). Combined with zero auth on any route, that let any
-// web page open in the user's regular browser cross-origin POST into /agui (arbitrary
-// prompt injection, including resuming the well-known "default" conversation id) — see
-// config/env.ts's DEFAULT_CORS_ORIGINS for the fix and full origin-allowlist rationale.
+// web page open in the user's regular browser cross-origin POST into the chat route
+// (arbitrary prompt injection, including resuming the well-known "default" conversation
+// id) — see config/env.ts's DEFAULT_CORS_ORIGINS for the fix and full origin-allowlist
+// rationale. Originally exercised against the since-deleted `/agui` route; `cors()` is
+// mounted globally ahead of all routing (app.use(cors(...)) at the top of createApp()),
+// so its preflight handling is path-agnostic — these tests now hit `/api/settings`, a
+// route that still exists, rather than a deleted one.
 //
 // `Content-Type: application/json` POSTs are not CORS-"simple" requests, so browsers
 // preflight them with an OPTIONS request first; these tests drive that same preflight
@@ -633,7 +1266,7 @@ describe("GET /api/conversations/:id/artifacts/:artifactId", () => {
 // does not get a permissive response, and an allowlisted one does.
 describe("CORS", () => {
   test("preflight from a disallowed origin does not get a permissive Access-Control-Allow-Origin", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "https://evil.example",
@@ -652,7 +1285,7 @@ describe("CORS", () => {
   // webview navigates to directly in `tauri dev` — see config/env.ts's comment) must
   // still get a real preflight approval, not just "not blocked".
   test("preflight from the app's own dev-server origin is allowed", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "http://localhost:1420",
@@ -668,7 +1301,7 @@ describe("CORS", () => {
   // regression here (e.g. someone "simplifying" the allowlist down to just the dev
   // origin) is caught by tests rather than only discovered in a packaged build.
   test("preflight from the packaged macOS/Linux webview origin is allowed", async () => {
-    const res = await fetch(`${baseUrl}/agui`, {
+    const res = await fetch(`${baseUrl}/api/settings`, {
       method: "OPTIONS",
       headers: {
         Origin: "tauri://localhost",
@@ -1023,6 +1656,17 @@ describe("POST /api/conversations/:id/pending-interaction/:interactionId/resolve
  * pre-existing ".../resolve" describe block above (predating this fix) already
  * covers the route's other behaviors with TEST_RESOLVE_TOKEN attached to every
  * request; these tests cover the auth check itself.
+ *
+ * assistant-ui-migration Task 11 / ADR-002-tool-approval-trust-boundary.md
+ * Decision point 2: this exact `POST .../pending-interaction/:interactionId/resolve`
+ * route (X-Resolve-Token header, timingSafeEqual comparison, fail-closed when
+ * unconfigured) IS the endpoint ADR-002 says to port verbatim for the AI-SDK
+ * migration's tool-approval trust boundary — `interactionId` and the AI SDK's
+ * `approvalId` refer to the identical value (`PendingInteraction.id`), so no
+ * route rename was made (see this task's commit message for the full
+ * reasoning). The tests below already prove AC-11.1/AC-11.2/AC-11.3 for that
+ * feature; individual tests are tagged with their AC ids inline rather than
+ * duplicated.
  */
 describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Token auth on POST .../resolve", () => {
   async function createPendingConfirm(conversationId: string, host: string) {
@@ -1035,6 +1679,8 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     });
   }
 
+  // AC-11.2 (assistant-ui-migration Task 11): no X-Resolve-Token header -> 401,
+  // pending approval remains unresolved.
   test("missing X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1060,6 +1706,8 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     expect(pollBody.interaction?.id).toBe(id);
   });
 
+  // AC-11.2 (assistant-ui-migration Task 11): wrong X-Resolve-Token header -> 401,
+  // pending approval remains unresolved.
   test("wrong (non-matching) X-Resolve-Token header returns 401 and does not resolve the interaction", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1083,6 +1731,10 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
     expect(pollBody.interaction?.id).toBe(id);
   });
 
+  // AC-11.1 (assistant-ui-migration Task 11): valid X-Resolve-Token + { approved:
+  // true } -> 200 and the pending approval is marked resolved server-side (proven
+  // here via the settled promise, the same server-side signal a real ctx.ui.confirm()
+  // call is waiting on).
   test("correct X-Resolve-Token header succeeds (same behavior as before this fix)", async () => {
     const created = (await (
       await fetch(`${baseUrl}/api/conversations`, {
@@ -1135,6 +1787,9 @@ describe("ADR-001 / REVIEW.md High finding (self-approval bypass): X-Resolve-Tok
       });
     });
 
+    // AC-11.3 (assistant-ui-migration Task 11): no resolve token configured at all
+    // (env var unset, no stdin handoff) -> every resolve request rejected
+    // unconditionally, fail-closed, whether or not a header is sent.
     test("every resolve request is rejected with 401, even with no header sent at all", async () => {
       const created = (await (
         await fetch(`${noTokenBaseUrl}/api/conversations`, {

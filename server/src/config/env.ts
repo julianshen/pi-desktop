@@ -27,8 +27,9 @@ function list(name: string, fallback: string[]): string[] {
  * Security-review finding (Critical, /tgd-review security-auditor): the previous
  * `app.use(cors())` in index.ts used the `cors` package's wildcard default
  * (`Access-Control-Allow-Origin: *`), which combined with zero auth on any route
- * (including /agui, which drives bash/computer-use/MCP tools) let *any* web page
- * open in the user's regular browser POST arbitrary prompts into the local agent.
+ * (including the chat route, which drives bash/computer-use/MCP tools) let *any*
+ * web page open in the user's regular browser POST arbitrary prompts into the
+ * local agent.
  * This is the explicit allowlist of origins this app's own frontend legitimately
  * runs from — everything else gets rejected at the CORS preflight, which browsers
  * require for `Content-Type: application/json` POSTs (not a CORS-"simple" request):

@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Streamdown } from "streamdown";
+import { code as streamdownCodePlugin } from "@streamdown/code";
 import { CloseIcon } from "../components/icons";
 import type { CanvasTab } from "../state/useShellState";
 import { API_BASE } from "../state/apiBase.js";
+import { wrapAsFencedCodeBlock } from "../lib/asCodeBlock.js";
 
 /** Mirrors server/src/artifacts/store.ts's Artifact exactly (Task 13). */
 export interface Artifact {
@@ -95,17 +98,45 @@ export function ArtifactCanvas({
   const [status, setStatus] = useState<Status>("loading");
   const isFirstRefreshRender = useRef(true);
 
+  /**
+   * Bug fix (test-engineer persona, /tgd-review): `ArtifactCanvas` has two
+   * independent effects below that both call `load()` — one keyed on
+   * `[conversationId, pinnedArtifactId]` (conversation switch), one keyed on
+   * `[refreshSignal]` (a chat turn completing, via App.tsx's
+   * `turnCompleteCount`). Each effect's own `cancelled` closure only guards
+   * against ITS OWN next invocation, not the other effect's in-flight fetch —
+   * and App.tsx renders `<ArtifactCanvas .../>` with no `key` prop (unlike
+   * ChatView, which IS key-remounted per conversation), so this component
+   * persists across a conversation switch instead of unmounting. Reachable
+   * sequence: a turn completes on conversation A (refreshSignal-effect starts
+   * a fetch for A) -> before it resolves, the user switches to conversation B
+   * (conversationId-effect starts and resolves a fetch for B, correctly
+   * showing B) -> the stale A-fetch then resolves and calls
+   * `setArtifact(dataForA)`, silently clobbering B's correct, already-visible
+   * artifact with A's stale one.
+   *
+   * Fix: track the conversationId that's actually still "current" in a ref,
+   * updated synchronously at the top of the conversationId-keyed effect
+   * (which runs before that effect's own fetch is kicked off). Every write
+   * back into state from `load()` — success or failure — checks the id it
+   * was called with against this ref in addition to its own `cancelled` flag,
+   * so a fetch for conversation A landing after the ref has moved on to B can
+   * never win, regardless of which effect started which fetch or the order
+   * they resolve in.
+   */
+  const activeConversationIdRef = useRef<string | null>(conversationId);
+
   const load = useCallback((id: string, mode: "loading" | "updating", artifactId: string | null) => {
     let cancelled = false;
     setStatus(mode);
     fetchArtifact(id, artifactId)
       .then((data) => {
-        if (cancelled) return;
+        if (cancelled || activeConversationIdRef.current !== id) return;
         setArtifact(data);
         setStatus(data ? "populated" : "empty");
       })
       .catch(() => {
-        if (cancelled) return;
+        if (cancelled || activeConversationIdRef.current !== id) return;
         // Honest fallback: don't invent content on a failed fetch, just fall back to
         // whatever we already had (or empty, on a failed initial load).
         setStatus((prev) => (prev === "loading" ? "empty" : prev === "updating" ? "populated" : prev));
@@ -117,6 +148,7 @@ export function ArtifactCanvas({
 
   // Initial mount + conversation switch + pinned-artifact change: reset and fetch fresh.
   useEffect(() => {
+    activeConversationIdRef.current = conversationId;
     if (!conversationId) {
       setArtifact(null);
       setStatus("empty");
@@ -294,18 +326,30 @@ export function ArtifactCanvas({
         )}
 
         {artifact && !isEmpty && !isLoading && tab === "code" && (
-          <pre
-            style={{
-              margin: 0,
-              fontFamily: "ui-monospace,'SF Mono',Menlo,monospace",
-              fontSize: 12,
-              lineHeight: 1.7,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
-            }}
+          // Task 10 (assistant-ui-migration): render as one syntax-highlighted code
+          // block, never as parsed markdown prose — a Python `#` comment or a
+          // markdown artifact's own `#` heading must never become an <h1>.
+          // wrapAsFencedCodeBlock() (markdown-rendering/SPEC.md's Architecture point
+          // 4) is the primary safety mechanism: the whole input is one dynamically-
+          // fenced code block by construction. `allowedElements` is defense-in-depth
+          // alongside it, not instead of it — restricts what Streamdown can ever
+          // produce here even if the fence-escaping had a bug. `mode="static"`
+          // because an already-fetched artifact is never "streaming" from this
+          // component's perspective. `key` is set (same convention as the Preview
+          // tab's iframe below) because Streamdown's internal block memoization
+          // does not reliably re-highlight on a plain content-prop change alone
+          // (verified empirically: without a changing `key`, re-rendering with new
+          // `children` left the previous artifact's highlighted DOM in place) — a
+          // key keyed to the artifact's identity forces a clean remount whenever a
+          // new/republished artifact replaces the current one.
+          <Streamdown
+            key={artifact.id + artifact.publishedAt}
+            mode="static"
+            plugins={{ code: streamdownCodePlugin }}
+            allowedElements={["pre", "code"]}
           >
-            {artifact.code}
-          </pre>
+            {wrapAsFencedCodeBlock(artifact.code, artifact.language)}
+          </Streamdown>
         )}
 
         {artifact && !isEmpty && !isLoading && tab === "preview" && (() => {

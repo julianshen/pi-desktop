@@ -79,6 +79,7 @@ export function IconRail({
       >
         <button
           onClick={onSettings}
+          aria-label="Settings"
           style={{
             width: 34,
             height: 34,

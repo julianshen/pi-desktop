@@ -1,0 +1,233 @@
+DESKTOP
+- button "Close"
+- button "Minimize"
+- button "Maximize"
+- generic: π
+- generic: pi agent
+- generic: Chat
+- generic: Search everything
+- generic: ⌘K
+- generic: AK
+- button "Chat":
+  - generic: Chat
+- button "Store":
+  - generic: Store
+- button "Tasks":
+  - generic: Tasks
+- button "Code":
+  - generic: Code
+- button "MCP":
+  - generic: MCP
+- button "Skills":
+  - generic: Skills
+- button:
+- generic: Conversations
+- button "New conversation":
+- textbox "Search conversations"
+- button "Show archived"
+- button "+ Project"
+- tree "Conversation workspace":
+  - treeitem "Unfiled" [expanded]:
+    - generic: Unfiled
+    - treeitem "hi" [selected]:
+      - button "hi":
+        - generic: hi
+      - button "Actions for hi": ···
+    - treeitem "smoke test":
+      - button "smoke test":
+        - generic: smoke test
+      - button "Actions for smoke test": ···
+    - treeitem "畫出颱風":
+      - button "畫出颱風":
+        - generic: 畫出颱風
+      - button "Actions for 畫出颱風": ···
+    - treeitem "Call the publish_artifact tool with id=\"a1\", title=\"first.tx…":
+      - button "Call the publish_artifact tool with id=\"a1\", title=\"first.tx…":
+        - generic: Call the publish_artifact tool with id="a1", title="first.tx…
+      - button "Actions for Call the publish_artifact tool with id=\"a1\", title=\"first.tx…": ···
+    - treeitem "你好":
+      - button "你好":
+        - generic: 你好
+      - button "Actions for 你好": ···
+    - 'treeitem "E2E test A: what is 7 times 6?"':
+      - 'button "E2E test A: what is 7 times 6?"':
+        - generic: "E2E test A: what is 7 times 6?"
+      - 'button "Actions for E2E test A: what is 7 times 6?"': ···
+    - treeitem "hi":
+      - button "hi":
+        - generic: hi
+      - button "Actions for hi": ···
+    - treeitem "天氣如何":
+      - button "天氣如何":
+        - generic: 天氣如何
+      - button "Actions for 天氣如何": ···
+    - treeitem "How is the weather":
+      - button "How is the weather":
+        - generic: How is the weather
+      - button "Actions for How is the weather": ···
+    - treeitem "今天天氣如何":
+      - button "今天天氣如何":
+        - generic: 今天天氣如何
+      - button "Actions for 今天天氣如何": ···
+    - treeitem "嗨":
+      - button "嗨":
+        - generic: 嗨
+      - button "Actions for 嗨": ···
+- generic: Chat / hi
+- generic: hi
+- button "Model picker":
+  - text: Kimi K2.6
+- button "Canvas":
+  - text: Canvas
+- heading "How can I help you today?" [level=1]
+- paragraph: Ask a question, or hand off a task.
+- button "Attach files":
+- textbox "Message input" [active]:
+  - /placeholder: Send a message...
+- button "Send message" [disabled]:
+- complementary:
+  - generic "Run inspector":
+    - generic: Agent work
+    - generic: No run
+    - list "Task plan"
+    - generic: Steer active run
+    - textbox "Steer active run Steer active run" [disabled]:
+      - /placeholder: Steer the agent…
+    - button "Send steering instruction" [disabled]:
+    - button "Stop run" [disabled]:
+
+SEARCH SETTINGS
+- button "Close"
+- button "Minimize"
+- button "Maximize"
+- generic: π
+- generic: pi agent
+- generic: Settings
+- generic: Search everything
+- generic: ⌘K
+- generic: AK
+- button "Chat":
+  - generic: Chat
+- button "Store":
+  - generic: Store
+- button "Tasks":
+  - generic: Tasks
+- button "Code":
+  - generic: Code
+- button "MCP":
+  - generic: MCP
+- button "Skills":
+  - generic: Skills
+- button "Settings":
+- generic: Settings
+- generic: Settings
+- button "Providers":
+  - generic: Providers
+- button "Model defaults":
+  - generic: Model defaults
+- button "Web search" [active]:
+  - generic: Web search
+- generic: Account / Settings
+- generic: Settings
+- heading "Web search" [level=2]
+- paragraph: Provider-neutral search is available to the agent automatically. Brave is the first built-in provider.
+- strong: Automatic search
+- generic: Let the agent search when current public evidence is needed.
+- checkbox "Enable automatic web search"
+- text: Result limit
+- spinbutton "Maximum search results": "5"
+- text: Brave Search API key
+- textbox "Brave Search API key":
+  - /placeholder: Enter API key
+- generic: The key is stored server-side and is never returned to this window.
+- status: No Brave key configured
+- button "Save search settings"
+
+NARROW
+- button "Close"
+- button "Minimize"
+- button "Maximize"
+- generic: π
+- generic: pi agent
+- generic: Chat
+- generic: Search everything
+- generic: ⌘K
+- generic: AK
+- button "Chat":
+  - generic: Chat
+- button "Store":
+  - generic: Store
+- button "Tasks":
+  - generic: Tasks
+- button "Code":
+  - generic: Code
+- button "MCP":
+  - generic: MCP
+- button "Skills":
+  - generic: Skills
+- button "Settings":
+- generic: Conversations
+- button "New conversation":
+- textbox "Search conversations"
+- button "Show archived"
+- button "+ Project"
+- tree "Conversation workspace":
+  - treeitem "Unfiled" [expanded]:
+    - generic: Unfiled
+    - treeitem "hi" [selected]:
+      - button "hi":
+        - generic: hi
+      - button "Actions for hi": ···
+    - treeitem "smoke test":
+      - button "smoke test":
+        - generic: smoke test
+      - button "Actions for smoke test": ···
+    - treeitem "畫出颱風":
+      - button "畫出颱風":
+        - generic: 畫出颱風
+      - button "Actions for 畫出颱風": ···
+    - treeitem "Call the publish_artifact tool with id=\"a1\", title=\"first.tx…":
+      - button "Call the publish_artifact tool with id=\"a1\", title=\"first.tx…":
+        - generic: Call the publish_artifact tool with id="a1", title="first.tx…
+      - button "Actions for Call the publish_artifact tool with id=\"a1\", title=\"first.tx…": ···
+    - treeitem "你好":
+      - button "你好":
+        - generic: 你好
+      - button "Actions for 你好": ···
+    - 'treeitem "E2E test A: what is 7 times 6?"':
+      - 'button "E2E test A: what is 7 times 6?"':
+        - generic: "E2E test A: what is 7 times 6?"
+      - 'button "Actions for E2E test A: what is 7 times 6?"': ···
+    - treeitem "hi":
+      - button "hi":
+        - generic: hi
+      - button "Actions for hi": ···
+    - treeitem "天氣如何":
+      - button "天氣如何":
+        - generic: 天氣如何
+      - button "Actions for 天氣如何": ···
+    - treeitem "How is the weather":
+      - button "How is the weather":
+        - generic: How is the weather
+      - button "Actions for How is the weather": ···
+    - treeitem "今天天氣如何":
+      - button "今天天氣如何":
+        - generic: 今天天氣如何
+      - button "Actions for 今天天氣如何": ···
+    - treeitem "嗨":
+      - button "嗨":
+        - generic: 嗨
+      - button "Actions for 嗨": ···
+- generic: Chat / hi
+- generic: hi
+- button "Model picker":
+  - text: Kimi K2.6
+- button "Canvas":
+  - text: Canvas
+- heading "How can I help you today?" [level=1]
+- paragraph: Ask a question, or hand off a task.
+- button "Attach files":
+- textbox "Message input" [active]:
+  - /placeholder: Send a message...
+- button "Send message" [disabled]:
+- generic "Agent work"

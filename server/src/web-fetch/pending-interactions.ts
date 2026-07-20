@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 
 /**
  * Shared "pause mid-tool-call and wait on something the frontend supplies
@@ -46,6 +47,94 @@ interface RegistryEntry {
 }
 
 const registry = new Map<string, RegistryEntry>();
+
+/**
+ * Creation-notification hook (Task 4, ADR-002-tool-approval-trust-boundary.md
+ * Decision point 4 -- "Visualization-only bridge"). `ai-sdk/adapter.ts`
+ * subscribes to this so it can hand-construct and write a
+ * `tool-approval-request` UI stream chunk purely for frontend visualization;
+ * the approval's actual resolution still happens entirely outside this
+ * mechanism (the authenticated resolve endpoint, Task 11). A plain
+ * per-process EventEmitter is enough -- this hook is deliberately minimal
+ * (ADR-002 Decision point 4), not a general pub/sub system.
+ *
+ * IMPORTANT: this hook only fires for `kind: "confirm"` interactions (see
+ * the emit call inside create() below). `kind: "render"` interactions (the
+ * headless-webview bridge) do NOT notify today -- per ADR-002's Consequences,
+ * a future feature wanting the render bridge to also surface over the AI SDK
+ * stream needs to extend this hook, not assume it already does.
+ */
+const creationEmitter = new EventEmitter();
+const INTERACTION_CREATED_EVENT = "interaction-created";
+
+/**
+ * Subscribes `listener` to every future `kind: "confirm"` interaction
+ * creation, firing synchronously (inside create(), right after
+ * registry.set(...)) with the created interaction's public shape ("id",
+ * "conversationId", "host" -- never the internal resolver/timer, matching
+ * getPending()'s own "never expose the resolver" convention above). Returns
+ * an unsubscribe function, mirroring this file's own create()'s
+ * id-plus-promise return convention and agui/adapter.ts's
+ * session.subscribe()'s own unsubscribe-function convention.
+ */
+export function onInteractionCreated(listener: (interaction: PendingInteraction) => void): () => void {
+  creationEmitter.on(INTERACTION_CREATED_EVENT, listener);
+  return () => {
+    creationEmitter.off(INTERACTION_CREATED_EVENT, listener);
+  };
+}
+
+/**
+ * Test-only visibility hook: the number of currently-subscribed
+ * onInteractionCreated() listeners. Exists purely so tests can assert a
+ * subscription was actually torn down (e.g. ai-sdk/adapter.ts's Finding-3
+ * remediation regression test, tgd-review) -- a leaked listener is otherwise
+ * unobservable from outside this module. Not read by any production code
+ * path.
+ */
+export function interactionCreatedListenerCount(): number {
+  return creationEmitter.listenerCount(INTERACTION_CREATED_EVENT);
+}
+
+/**
+ * tgd-review (code-reviewer, Important) Finding 1: fires every listener
+ * subscribed via onInteractionCreated() individually, wrapped in its own
+ * try/catch, instead of calling creationEmitter.emit(...) directly.
+ *
+ * Node's EventEmitter.emit() does NOT catch listener exceptions -- a
+ * throwing listener propagates synchronously out of emit() and aborts any
+ * remaining listeners in the same emit() call. create() runs synchronously
+ * inside web_fetch's execute() (via ctx.ui.confirm(), which has no
+ * surrounding try/catch in web-fetch/tools.ts) -- so an unguarded emit()
+ * would let a listener's bug (e.g. ai-sdk/adapter.ts's writer.write() on an
+ * already-closed stream after a client disconnect) fail the ENTIRE
+ * web_fetch tool call with an unrelated transport-layer error, even though
+ * the pending interaction was otherwise created successfully. This
+ * notification hook is documented as "visualization-only" (ADR-002 Decision
+ * point 4) precisely because it must never be able to do that.
+ *
+ * Each listener gets its own try/catch (rather than one try/catch around a
+ * single emit() call) so that one listener throwing does not also silently
+ * skip every *other* still-registered listener -- matching EventEmitter's
+ * normal "every listener gets called" contract as closely as possible while
+ * still guaranteeing create() itself can never fail because of listener
+ * code.
+ */
+function notifyInteractionCreated(interaction: PendingInteraction): void {
+  for (const listener of creationEmitter.listeners(INTERACTION_CREATED_EVENT)) {
+    try {
+      (listener as (interaction: PendingInteraction) => void)(interaction);
+    } catch (error) {
+      // Logged (not silently swallowed) so a broken listener is still
+      // discoverable -- but never rethrown, and never allowed to stop the
+      // remaining listeners or propagate back into create()'s caller.
+      console.error(
+        "[pending-interactions] onInteractionCreated listener threw; ignoring so create() cannot fail because of it:",
+        error,
+      );
+    }
+  }
+}
 
 /**
  * AC-3.2's contract: the timeout default must be the SAFE (fail-closed)
@@ -101,6 +190,15 @@ export function create(
   }, req.timeoutMs);
 
   registry.set(id, { interaction, settled: false, resolver, timer });
+
+  // Only "confirm" interactions notify -- see the doc comment on
+  // creationEmitter/onInteractionCreated above. Goes through
+  // notifyInteractionCreated() (tgd-review Finding 1), never a raw
+  // creationEmitter.emit(...) call, so a throwing listener can never
+  // propagate back out of create() -- see that function's doc comment.
+  if (interaction.kind === "confirm") {
+    notifyInteractionCreated(interaction);
+  }
 
   return { id, promise };
 }

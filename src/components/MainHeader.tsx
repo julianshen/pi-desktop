@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CanvasIcon, ChevronDownIcon, PlusIcon, SearchIcon } from "./icons";
 import { filterConfig } from "../data/mockData";
 import type { ShellActions, ShellState, ViewKey } from "../state/useShellState";
@@ -87,6 +87,23 @@ export function MainHeader({
   // used for conversation titles/artifacts elsewhere in this app; cheap enough to run
   // on every navigation.
   const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
+  // Bug fix (live smoke-test: header picker button kept showing the OLD model
+  // name after a successful switch, until a full reload). Root cause: the
+  // `conversations` list (App.tsx's shared `useConversations()` result, passed
+  // in as a prop) is never told about a model switch that succeeded via the
+  // PATCH below — nothing called `conversations.refetch()` — so
+  // `activeConversation?.modelId` stayed stale. The effect below re-derives
+  // `selectedModelId` from that stale value every time `switching` flips back
+  // to `false` (one of its own dependencies), clobbering the correct
+  // optimistic selection back to the old model. Firing `conversations.refetch()`
+  // in the PATCH success handler closes the race *eventually*, but doesn't
+  // close the WINDOW between "PATCH succeeds, switching flips false, the
+  // effect below re-runs" and "the refetch's own GET actually resolves" — in
+  // that window `activeConversation?.modelId` is still stale, so the effect
+  // would still clobber. This ref tracks "the model id we just explicitly,
+  // successfully switched to"; the effect below refuses to derive from
+  // `activeConversation?.modelId` until that value genuinely agrees with it.
+  const pendingSwitchIdRef = useRef<string | null>(null);
 
   // AC-11.1: fetch the real model list instead of importing mockData's hardcoded
   // `models` array. Depends on `view` (see comment above `defaultModelId`) rather
@@ -138,6 +155,16 @@ export function MainHeader({
   useEffect(() => {
     if (modelsLoading || switching || models.length === 0) return;
     const fromConversation = activeConversation?.modelId;
+    // See `pendingSwitchIdRef`'s comment above: while a just-completed switch's
+    // target id doesn't match what `conversations` reports yet, `conversations`
+    // is stale (its refetch is still in flight) — don't let this re-run
+    // clobber the optimistic selection. Once they agree, resume normal
+    // derivation (and let this same branch also handle the id changing again
+    // later, e.g. the user switching conversations).
+    if (pendingSwitchIdRef.current !== null) {
+      if (fromConversation !== pendingSwitchIdRef.current) return;
+      pendingSwitchIdRef.current = null;
+    }
     if (fromConversation && models.some((m) => m.id === fromConversation)) {
       setSelectedModelId(fromConversation);
     } else if (defaultModelId && models.some((m) => m.id === defaultModelId)) {
@@ -171,6 +198,10 @@ export function MainHeader({
         return res.json();
       })
       .then(() => {
+        // Set before the state updates below so it's already in place by the
+        // time the effect above re-runs off `switching` flipping to `false`
+        // in this same commit (see that effect's comment).
+        pendingSwitchIdRef.current = modelId;
         setSelectedModelId(modelId);
         setSwitching(false);
         // Bug fix (found in final review): this only ever updated MainHeader's own
@@ -182,9 +213,17 @@ export function MainHeader({
         // with what MainHeader itself is now showing.
         const newModel = models.find((m) => m.id === modelId);
         actions.setModel(newModel?.label ?? modelId);
+        // Bug fix (live smoke-test, see `pendingSwitchIdRef` above): tell the
+        // shared `conversations` list about the switch that just succeeded so
+        // its cached `modelId` for this conversation stops being stale. Fired
+        // without awaiting — `refetch()` never rejects (it catches internally,
+        // see useConversations.ts), and awaiting it here would only delay this
+        // optimistic update, reintroducing the exact flicker this fix removes.
+        void conversations.refetch();
       })
       .catch((err: unknown) => {
         console.error("[MainHeader] failed to switch model", err);
+        pendingSwitchIdRef.current = null;
         setSelectedModelId(previous);
         setSwitching(false);
         setSwitchError("Couldn't switch model — try again.");

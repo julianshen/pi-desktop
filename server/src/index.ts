@@ -2,22 +2,29 @@ import express, { type Express } from "express";
 import cors from "cors";
 import readline from "node:readline";
 import { timingSafeEqual } from "node:crypto";
+import { pipeUIMessageStreamToResponse, type UIMessage } from "ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
-import { handleAguiRun } from "./agui/adapter.js";
-import { createCopilotEndpoint } from "./copilot/runtime.js";
+import { handleAiSdkRun, type AgentSessionEventSource } from "./ai-sdk/adapter.js";
 import { startScheduler } from "./scheduler/index.js";
 import { settingsRouter } from "./settings/routes.js";
 import {
-  listConversations,
-  createConversation,
   getConversationMeta,
   touchConversation,
+  touchConversationAfterTurn,
   setLiveSessionModel,
   getConversationMessages,
   getLastTurnError,
   conversationCwd,
+  getOrCreateSession,
+  getWorkspaceStore,
 } from "./agent/conversations.js";
+import { ConversationWorkspace } from "./chat-workspace/conversations.js";
+import { createChatWorkspaceRouter } from "./chat-workspace/routes.js";
+import { AttachmentWorkspace } from "./chat-workspace/attachments.js";
+import { BranchWorkspace, type BranchMessage, type BranchSession } from "./chat-workspace/branches.js";
+import { journalRunStream, RunManager } from "./chat-workspace/runs.js";
+import { setActivePlanRun } from "./agent/plan-tools.js";
 import { listAvailableModels, resolveModelById } from "./agent/models.js";
 import { getLatestArtifact, getArtifactById } from "./artifacts/store.js";
 import {
@@ -143,6 +150,63 @@ function tokensMatch(expected: string, actual: string): boolean {
 }
 
 /**
+ * Task 5: the AI SDK's `UIMessage` shape (verified against the installed
+ * `ai@6.0.224` package's own types, `node_modules/ai/dist/index.d.ts:1580`)
+ * represents a message's content as `parts: Array<UIMessagePart<...>>`, NOT a
+ * plain string like the now-removed AG-UI `RunAgentInput` messages' `.content`
+ * field (the legacy `agui/adapter.ts`'s `extractLatestUserText` read that
+ * directly; deleted post-/tgd-review once this route fully replaced it) -- a
+ * text part is `{ type: 'text', text: string }` (index.d.ts:1609). Walks
+ * backward from the end of `messages`, returns the first `role: "user"`
+ * message's text, joining that message's text parts (a message could in
+ * principle carry more than one, e.g. text interleaved with file parts) with a
+ * blank line. Returns "" for no user message or a user message with no text
+ * parts at all (e.g. attachment-only) -- never throws on a plausible-but-empty
+ * input.
+ */
+function extractLatestUserTextFromUIMessages(messages: UIMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role !== "user") continue;
+    return message.parts
+      .filter((part): part is Extract<UIMessage["parts"][number], { type: "text" }> => part.type === "text")
+      .map((part) => part.text)
+      .join("\n\n");
+  }
+  return "";
+}
+
+function withTextAttachments(
+  userText: string,
+  references: Array<{ name: string; text: string }>,
+): string {
+  if (references.length === 0) return userText;
+  const blocks = references.map(({ name, text }) => {
+    const safeName = name.replace(/[<>"'&]/g, "_");
+    return `\n\n--- Attached local file: ${safeName} ---\n${text}\n--- End attached file: ${safeName} ---`;
+  });
+  return `${userText}${blocks.join("")}`;
+}
+
+function branchMessageToHistory(message: BranchMessage) {
+  if (message.role === "user") {
+    const content = typeof message.content === "string"
+      ? message.content
+      : Array.isArray(message.content)
+        ? message.content.filter((part): part is { type: "text"; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text").map((part) => part.text).join("")
+        : "";
+    return { id: message.id, role: "user" as const, content };
+  }
+  if (message.role === "assistant") {
+    const content = Array.isArray(message.content)
+      ? message.content.filter((part): part is { type: "text"; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text").map((part) => part.text).join("")
+      : typeof message.content === "string" ? message.content : "";
+    return { id: message.id, role: "assistant" as const, content };
+  }
+  return { id: message.id, role: "tool" as const, content: JSON.stringify(message.content) };
+}
+
+/**
  * Builds the Express app without binding a port, so tests (index.test.ts) can
  * app.listen(0) it on an ephemeral port and hit it with real HTTP requests, instead
  * of duplicating route logic or mocking Express. main() below is the only caller
@@ -160,31 +224,36 @@ export function createApp(options?: CreateAppOptions): Express {
     res.json({ status: "ok" });
   });
 
-  // Task 4 (AC-4.1/AC-4.2): list all conversations. listConversations() already
-  // sorts by updatedAt desc internally (agent/conversations.ts) — verified there
-  // rather than re-sorted here, so this route just forwards its result as the API
-  // contract.
-  app.get("/api/conversations", (_req, res) => {
-    res.json(listConversations());
-  });
-
-  // Task 4 (AC-4.2): create a conversation, optionally titled.
-  app.post("/api/conversations", express.json(), (req, res) => {
-    const body = req.body as { title?: unknown } | undefined;
-    const title = typeof body?.title === "string" ? body.title : undefined;
-    const meta = createConversation(title);
-    res.status(201).json(meta);
-  });
-
-  // Task 4 (AC-4.3): 404, not a silent 200 null/empty, for an unknown id.
-  app.get("/api/conversations/:id", (req, res) => {
-    const meta = getConversationMeta(req.params.id);
-    if (!meta) {
-      res.status(404).end();
-      return;
-    }
-    res.json(meta);
-  });
+  // Agent Chat Experience Tasks 1–2: transactional conversation workspace and
+  // organization/lifecycle routes. Mount under /api so the router's resource
+  // paths stay reusable in isolated HTTP contract tests.
+  const workspaceStore = getWorkspaceStore();
+  const attachmentWorkspace = new AttachmentWorkspace(workspaceStore, env.dataDir);
+  const branchWorkspace = new BranchWorkspace(workspaceStore);
+  const runManager = new RunManager(workspaceStore);
+  const branchSession = async (conversationId: string): Promise<BranchSession> => {
+    const session = await getOrCreateSession(conversationId);
+    const manager = session.sessionManager;
+    return {
+      getLeafId: () => manager.getLeafId(),
+      getEntry: (id) => manager.getEntry(id),
+      getBranch: (id) => manager.getBranch(id),
+      branch: (id) => manager.branch(id),
+      resetLeaf: () => manager.resetLeaf(),
+      navigateTree: (id) => session.navigateTree(id),
+      appendMessage: (message) => manager.appendMessage(message),
+    };
+  };
+  app.use("/api", createChatWorkspaceRouter(
+    new ConversationWorkspace(workspaceStore, env.dataDir),
+    {
+      attachments: attachmentWorkspace,
+      branches: branchWorkspace,
+      branchSession,
+      runs: runManager,
+      hasActiveRun: (id) => runManager.hasActiveConversationRun(id),
+    },
+  ));
 
   // Task 6 (AC-6.1): list available models. listAvailableModels() forwards to
   // getAgentDeps()'s real modelRegistry when options.modelRegistry is unset (the
@@ -259,6 +328,17 @@ export function createApp(options?: CreateAppOptions): Express {
   // (a client error, no stack trace leaked), everything else is an unexpected
   // 500 logged via console.error first.
   app.get("/api/conversations/:id/messages", (req, res) => {
+    if (typeof req.query.branchId === "string") {
+      branchSession(req.params.id)
+        .then((session) => branchWorkspace.messages(req.params.id, req.query.branchId as string, session))
+        .then((messages) => res.json(messages.map(branchMessageToHistory)))
+        .catch((error: unknown) => {
+          res.status(error instanceof Error && error.message === "Branch not found" ? 404 : 400).json({
+            error: { code: "NOT_FOUND", message: error instanceof Error ? error.message : "Branch lookup failed", retryable: false },
+          });
+        });
+      return;
+    }
     getConversationMessages(req.params.id)
       .then((messages) => res.json(messages))
       .catch((error: unknown) => {
@@ -389,6 +469,17 @@ export function createApp(options?: CreateAppOptions): Express {
   // succeeded. Per ADR-001 step 1.3: if the server itself has no token configured
   // (options.resolveToken is null/undefined/empty), every request is rejected
   // unconditionally -- fail-closed by explicit, deliberate design, not a bug.
+  //
+  // assistant-ui-migration Task 11 / ADR-002-tool-approval-trust-boundary.md
+  // Decision point 2: this is also the resolve endpoint for the AI SDK migration's
+  // `tool-approval-request` UI chunk (server/src/ai-sdk/adapter.ts, Task 4) -- the
+  // route's `:interactionId` and the AI SDK's `approvalId` are the SAME value
+  // (the adapter sets `approvalId: interaction.id` when it writes that chunk), so
+  // no route rename was made here. Renaming to a `/tool-approvals/:approvalId/`
+  // path was considered (ADR-002 calls it "cosmetic, no bearing on the trust
+  // boundary") and deliberately rejected: it would only churn a path the
+  // frontend already needs to call correctly under a security-sensitive contract,
+  // for a naming difference that doesn't reflect a real behavioral distinction.
   app.post("/api/conversations/:id/pending-interaction/:interactionId/resolve", express.json(), (req, res) => {
     const serverToken = options?.resolveToken;
     const requestToken = req.header("X-Resolve-Token");
@@ -445,28 +536,115 @@ export function createApp(options?: CreateAppOptions): Express {
     res.json({ resolved: true });
   });
 
-  // Raw AG-UI run endpoint, bridging pi's AgentSession event stream (see agui/adapter.ts).
-  app.post("/agui", express.json({ limit: "10mb" }), (req, res) => {
-    handleAguiRun(req, res).catch((error: unknown) => {
-      console.error("[agui] unhandled error", error);
-      if (!res.headersSent) res.status(500).end();
-    });
+  // Task 5 (AC-5.1/AC-5.2): the Vercel AI SDK / Assistant UI chat route. Originally
+  // added alongside the legacy CopilotKit/AG-UI `/agui` route (TASKS.md's Task 5
+  // sequencing note), which stayed until Task 8's frontend rebuild proved this route
+  // out end-to-end. Task 8 landed (commit 9ec4976) and `/agui`, `agui/adapter.ts`, and
+  // `copilot/runtime.ts` have since been deleted (/tgd-review code-reviewer finding,
+  // remediated post-review) -- this is now the only chat route. Per-conversation-
+  // scoped via the URL path param (SPEC.md's API Contract explicitly rules out a
+  // single global /api/chat endpoint, matching every other per-conversation route in
+  // this file) -- Assistant UI's transport (`AssistantChatTransport`) is configured
+  // with a per-conversation `api` URL, so this shape composes directly with the
+  // frontend wiring without a conversationId body field to trust/validate separately.
+  //
+  // Body shape: `{ messages: UIMessage[] }`, the AI SDK's own standard chat request
+  // body (verified against the installed `ai@6.0.224` package's own `UIMessage`
+  // export, node_modules/ai/dist/index.d.ts:1580 -- content is `parts: Array<...>`,
+  // not a plain string; see extractLatestUserTextFromUIMessages() above for the
+  // exact extraction).
+  //
+  // getOrCreateSession(id) rejects (not throws synchronously) for a malformed id --
+  // createSession() is an `async function`, so conversationCwd()'s synchronous throw
+  // (assertSafeConversationId, agent/conversations.ts) is captured into the returned
+  // promise's rejection rather than escaping synchronously. That's why this route
+  // uses the same async .catch() convention as GET /api/conversations/:id/messages
+  // and GET /api/conversations/:id/last-error above (both of which reject via the
+  // exact same code path), not the synchronous try/catch convention used by the
+  // .../artifacts/latest routes (whose getLatestArtifact()/getArtifactById() call
+  // conversationCwd() directly, outside any Promise chain, so IT throws
+  // synchronously instead). Same "Invalid conversation id" message-prefix check,
+  // same 400-no-stack-trace-leaked / 500-logged-first split.
+  app.post("/api/conversations/:id/chat", express.json({ limit: "10mb" }), (req, res) => {
+    getOrCreateSession(req.params.id)
+      .then(async (session) => {
+        const body = req.body as { messages?: UIMessage[]; attachmentIds?: unknown } | undefined;
+        const messages = Array.isArray(body?.messages) ? body.messages : [];
+        const attachmentIds = body?.attachmentIds === undefined ? [] : body.attachmentIds;
+        if (!Array.isArray(attachmentIds) || attachmentIds.some((id) => typeof id !== "string")) {
+          res.status(400).json({ error: { code: "VALIDATION_ERROR", message: "attachmentIds must be an array of strings", retryable: false } });
+          return;
+        }
+        const conversation = workspaceStore.getConversation(req.params.id);
+        const activeBranchId = conversation?.activeBranchId;
+        const materialized = await attachmentWorkspace.materialize(req.params.id, attachmentIds as string[], activeBranchId);
+        if (activeBranchId) {
+          await branchWorkspace.materializePendingReplacement(req.params.id, activeBranchId, session.sessionManager);
+        }
+        const messageText = extractLatestUserTextFromUIMessages(messages);
+        const userText = withTextAttachments(messageText, materialized.textReferences);
+        // ai-sdk/adapter.ts's own doc comment claims a real AgentSession "structurally
+        // satisfies AgentSessionEventSource ... with no adapter shape changes" needed
+        // to wire it in here -- true at the RUNTIME level (the adapter's switch only
+        // ever reads the handful of fields PiSessionEvent models, and pi's real
+        // AgentSessionEvent variants carry those same fields, just with additional
+        // ones the adapter never touches), but NOT true under `tsc --noEmit`'s strict
+        // structural check: pi's real `AgentSessionEvent` union has extra variants
+        // (`agent_start`, `queue_update`, etc., see
+        // node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.d.ts)
+        // with no PiSessionEvent counterpart, and its `message`-carrying variants use
+        // pi's own richer `AgentMessage` type rather than this adapter's intentionally
+        // loose duck-typed `AssistantMessage` -- so neither the covariant nor the
+        // contravariant half of TS's listener-parameter check succeeds outright. Route
+        // wiring (this file, Task 5's actual scope) is the right place for this cast,
+        // not adapter.ts (out of scope here, and its own module doc already documents
+        // the intended duck-typed contract in detail).
+        const rawStream = handleAiSdkRun(
+          session as unknown as AgentSessionEventSource,
+          userText,
+          req.params.id,
+          materialized.images.length > 0 ? { images: materialized.images } : undefined,
+        );
+        const run = runManager.start({
+          conversationId: req.params.id,
+          branchId: activeBranchId,
+          model: conversation?.modelId,
+          abort: () => session.abort(),
+          steer: (instruction) => session.prompt(instruction, { streamingBehavior: "steer" }),
+        });
+        setActivePlanRun(req.params.id, { manager: runManager, runId: run.id });
+        res.setHeader("X-Pi-Run-Id", run.id);
+        const stream = journalRunStream(runManager, run.id, rawStream, () => {
+          setActivePlanRun(req.params.id, undefined);
+          if (activeBranchId) branchWorkspace.commitLeaf(req.params.id, activeBranchId, session.sessionManager.getLeafId() ?? undefined);
+          if (runManager.get(run.id)?.status === "completed") {
+            touchConversationAfterTurn(req.params.id, messageText);
+          }
+        });
+        pipeUIMessageStreamToResponse({ response: res, stream });
+      })
+      .catch((error: unknown) => {
+        if (error instanceof Error && "code" in error) {
+          const code = (error as { code?: string }).code;
+          if (code === "NOT_FOUND" || code === "ATTACHMENT_NOT_READY" || code === "TOO_MANY_ATTACHMENTS") {
+            res.status(code === "NOT_FOUND" ? 404 : 400).json({
+              error: { code: code === "NOT_FOUND" ? "NOT_FOUND" : "VALIDATION_ERROR", message: error.message, retryable: false },
+            });
+            return;
+          }
+        }
+        if (error instanceof Error && error.message.startsWith("Invalid conversation id")) {
+          res.status(400).end();
+          return;
+        }
+        console.error("[api/conversations/:id/chat] unhandled error", error);
+        if (!res.headersSent) res.status(500).end();
+      });
   });
 
   // Settings routes (provider status, connect/disconnect, model selection). Mounted as its
-  // own app.use() call, after /health and /agui and before the CopilotKit catch-all mount
-  // below (that mount is unauthenticated/path-agnostic per its own comment, so anything
-  // that needs its own routing must be registered before it or Express's router falls
-  // through to CopilotKit's handler instead).
+  // own app.use() call, after /health and the AI SDK chat route above.
   app.use("/api/settings", express.json(), settingsRouter);
-
-  const baseUrl = `http://${env.host}:${env.port}`;
-
-  // Mounted at root (not app.use("/copilotkit", ...)): the handler's internal router is built
-  // with basePath: "/copilotkit" and reads the raw req.url, which Express already strips of the
-  // mount prefix for path-scoped app.use() — mounting at root keeps req.url as the full path so
-  // the two agree. CopilotKit's own runtime does its own body parsing; mount unparsed.
-  app.use(createCopilotEndpoint(baseUrl));
 
   return app;
 }
