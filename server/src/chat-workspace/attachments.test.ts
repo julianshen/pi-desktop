@@ -65,6 +65,16 @@ describe("AttachmentWorkspace", () => {
     store.close();
   });
 
+  test("PDFs are rejected honestly until PDF materialization is implemented", async () => {
+    const { originals, store, workspace } = setup();
+    const pdf = path.join(originals, "report.pdf");
+    fs.writeFileSync(pdf, "%PDF-1.7\nnot parsed");
+
+    await expect(workspace.stage("conversation", pdf)).rejects.toMatchObject({ code: "UNSUPPORTED_TYPE" });
+    expect(store.listAttachments("conversation")).toEqual([]);
+    store.close();
+  });
+
   test("AC-5.3: materialization returns only referenced IDs and updates only their disposition", async () => {
     const { originals, store, workspace } = setup();
     const paths = ["one.txt", "two.txt", "three.txt"].map((name, index) => {

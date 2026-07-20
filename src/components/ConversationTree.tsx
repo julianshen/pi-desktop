@@ -98,7 +98,10 @@ function ConversationRow({ conversation, active, projects, folders, workspace, o
             <div role="alert" style={{ display: "grid", gap: 4 }}>
               <span>Delete this conversation and its app-owned files?</span>
               <div style={{ display: "flex", gap: 4 }}>
-                <button disabled={busy} onClick={() => void mutate(() => workspace.remove(conversation.id))}>Confirm delete</button>
+                <button disabled={busy} onClick={() => void mutate(async () => {
+                  const replacementId = await workspace.remove(conversation.id);
+                  if (active) onSelect(replacementId);
+                })}>Confirm delete</button>
                 <button onClick={() => setConfirmDelete(false)}>Cancel</button>
               </div>
             </div>

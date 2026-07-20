@@ -111,6 +111,21 @@ describe("conversations registry", () => {
     expect(new Date(updated!.updatedAt).getTime()).toBeGreaterThan(new Date(originalUpdatedAt).getTime());
   });
 
+  test("completed turns derive a default title and refresh conversation activity", async () => {
+    const meta = conversations.createConversation();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    conversations.touchConversationAfterTurn(meta.id, "  Explain   resumable\nagent work  ");
+
+    const updated = conversations.getConversationMeta(meta.id);
+    expect(updated?.title).toBe("Explain resumable agent work");
+    expect(new Date(updated!.updatedAt).getTime()).toBeGreaterThan(new Date(meta.updatedAt).getTime());
+
+    conversations.touchConversation(updated!.id, { title: "Custom title" });
+    conversations.touchConversationAfterTurn(updated!.id, "This must not replace it");
+    expect(conversations.getConversationMeta(updated!.id)?.title).toBe("Custom title");
+  });
+
   // AC-1.4: Given two calls to getOrCreateSession(id) for the same id, when both
   // resolve, then they return the same AgentSession instance (memoization holds
   // per-id, matching session.ts's existing single-promise pattern).

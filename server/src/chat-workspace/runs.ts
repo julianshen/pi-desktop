@@ -158,7 +158,6 @@ export function journalRunStream<T extends { type: string }>(
     },
     flush() {
       manager.finish(runId, failed ? "failed" : "completed");
-      onComplete?.();
     },
   }));
   const [response, keepAlive] = committed.tee();
@@ -170,6 +169,11 @@ export function journalRunStream<T extends { type: string }>(
       manager.finish(runId, "failed", error instanceof Error ? error.message : String(error));
     } finally {
       reader.releaseLock();
+      try {
+        onComplete?.();
+      } catch (error) {
+        console.error("[runs] completion cleanup failed", error);
+      }
     }
   })();
   return response;

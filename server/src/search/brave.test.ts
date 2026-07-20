@@ -19,4 +19,8 @@ describe("BraveSearchProvider", () => {
     await expect(new BraveSearchProvider({ apiKey: "x", fetch: async () => new Response("", { status: 429 }) }).search({ query: "x" }, new AbortController().signal)).rejects.toMatchObject({ code: "rate_limited", retryable: true } satisfies Partial<SearchProviderError>);
     await expect(new BraveSearchProvider({ apiKey: "x", fetch: async () => new Response("{}") }).search({ query: "x" }, new AbortController().signal)).rejects.toMatchObject({ code: "malformed_response" } satisfies Partial<SearchProviderError>);
   });
+  test("a valid zero-result response returns an empty list", async () => {
+    const provider = new BraveSearchProvider({ apiKey: "x", fetch: async () => new Response(JSON.stringify({ web: {} })) });
+    await expect(provider.search({ query: "nothing" }, new AbortController().signal)).resolves.toEqual([]);
+  });
 });

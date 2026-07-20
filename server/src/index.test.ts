@@ -765,6 +765,40 @@ describe("POST /api/conversations/:id/chat", () => {
     promptSpyB.mockRestore();
   });
 
+  test("a completed chat turn derives the default conversation title", async () => {
+    const { getOrCreateSession } = await import("./agent/conversations.js");
+    const conversation = (await (
+      await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+    ).json()) as ConversationMeta;
+    const session = await getOrCreateSession(conversation.id);
+    const { subscribeSpy, promptSpy } = stubSessionTurn(session, "Done");
+
+    const response = await fetch(`${baseUrl}/api/conversations/${conversation.id}/chat`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ id: "u1", role: "user", parts: [{ type: "text", text: "  Plan   a resilient agent  " }] }],
+      }),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+
+    let updated = conversation;
+    for (let attempt = 0; attempt < 20 && updated.title === "New conversation"; attempt += 1) {
+      await Bun.sleep(5);
+      updated = (await (await fetch(`${baseUrl}/api/conversations/${conversation.id}`)).json()) as ConversationMeta;
+    }
+    expect(updated.title).toBe("Plan a resilient agent");
+    expect(new Date(updated.updatedAt).getTime()).toBeGreaterThanOrEqual(new Date(conversation.updatedAt).getTime());
+
+    subscribeSpy.mockRestore();
+    promptSpy.mockRestore();
+  });
+
   test("attachment IDs materialize only the explicitly referenced staged copy into pi input", async () => {
     const { getOrCreateSession } = await import("./agent/conversations.js");
     const conversation = (await (

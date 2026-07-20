@@ -15,7 +15,7 @@ const ATTACHMENT_FILTERS = [
   {
     name: "Files",
     extensions: [
-      "txt", "md", "markdown", "json", "csv", "tsv", "pdf",
+      "txt", "md", "markdown", "json", "csv", "tsv",
       "js", "jsx", "ts", "tsx", "css", "py", "rs", "go", "java",
       "c", "h", "cpp", "hpp", "swift", "kt", "kts", "sql", "yaml", "yml", "toml", "xml",
     ],
@@ -56,6 +56,7 @@ export type GeneratedFileSaveRequest = {
   conversationId: string;
   runId: string;
   fileId: string;
+  name: string;
   mediaType?: string;
   byteSize?: number;
 };
@@ -72,6 +73,7 @@ export async function saveGeneratedFile(
       conversationId: request.conversationId,
       runId: request.runId,
       fileId: request.fileId,
+      fileName: safeSuggestedName(request.name),
     });
     if (result.status !== "saved" && result.status !== "cancelled") {
       throw new Error("Native save returned an invalid status");

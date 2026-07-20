@@ -23,4 +23,14 @@ describe("GeneratedFile", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save report.txt" }));
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("available"));
   });
+  test("external file state updates replace stale local state", () => {
+    const file = { id: "sync", name: "sync.txt", mediaType: "text/plain", byteSize: 2, state: "available" as const };
+    const { rerender } = render(<GeneratedFile file={file} onSave={() => Promise.resolve()} />);
+    expect(screen.getByRole("status").textContent).toBe("available");
+
+    rerender(<GeneratedFile file={{ ...file, state: "missing" }} onSave={() => Promise.resolve()} />);
+
+    expect(screen.getByRole("status").textContent).toBe("missing");
+    expect(screen.queryByRole("button", { name: "Save sync.txt" })).toBeNull();
+  });
 });

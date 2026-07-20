@@ -34,7 +34,7 @@ export interface UseConversationsResult {
   setActiveId: (id: string) => void;
   create: (input?: { title?: string; projectId?: string; folderId?: string }) => Promise<ConversationMeta>;
   update: (id: string, patch: ConversationPatch) => Promise<ConversationMeta>;
-  remove: (id: string) => Promise<void>;
+  remove: (id: string) => Promise<string>;
   projects: ProjectRecord[];
   folders: FolderRecord[];
   createProject: (name: string) => Promise<ProjectRecord>;
@@ -148,20 +148,20 @@ export function useConversations(): UseConversationsResult {
     return updated;
   }, []);
 
-  const remove = useCallback(async (id: string): Promise<void> => {
+  const remove = useCallback(async (id: string): Promise<string> => {
     const res = await fetch(`${API_BASE}/api/conversations/${id}`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ deleteOwnedFiles: true }),
     });
     if (!res.ok) throw new Error(`DELETE /api/conversations/${id} failed: ${res.status}`);
-    setConversations((prev) => {
-      const next = prev.filter((item) => item.id !== id);
-      setActiveId((active) => active === id ? next[0]?.id ?? "default" : active);
-      return next;
-    });
+    const next = conversations.filter((item) => item.id !== id);
+    const replacementId = next[0]?.id ?? "default";
+    setConversations(next);
+    setActiveId((active) => active === id ? replacementId : active);
     setRemoteSearchResults((prev) => prev?.filter((item) => item.id !== id) ?? null);
-  }, []);
+    return replacementId;
+  }, [conversations]);
 
   const createProject = useCallback(async (name: string): Promise<ProjectRecord> => {
     const res = await fetch(`${API_BASE}/api/projects`, {

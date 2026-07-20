@@ -57,7 +57,8 @@ export class ConversationWorkspace {
       .listConversations()
       .filter((item) => !query.projectId || item.projectId === query.projectId)
       .filter((item) => !query.folderId || item.folderId === query.folderId)
-      .filter((item) => query.status !== "archived" ? !item.archivedAt : Boolean(item.archivedAt))
+      .filter((item) => query.status === undefined
+        || (query.status === "archived" ? Boolean(item.archivedAt) : !item.archivedAt))
       .filter((item) => query.pinned === undefined || Boolean(item.pinnedAt) === query.pinned)
       .map((item) => ({ ...item, searchSnippet: q ? snippet(item.title, q) : undefined }))
       .filter((item) => !q || item.searchSnippet !== undefined)
@@ -103,7 +104,7 @@ export class ConversationWorkspace {
     const removed = this.store.deleteConversation(id);
     if (!removed) return false;
     if (options.deleteOwnedFiles) {
-      for (const directory of ["conversations", "generated-files"]) {
+      for (const directory of ["conversations", "generated-files", "attachments"]) {
         const root = path.resolve(this.dataDir, directory);
         const owned = path.resolve(root, id);
         if (owned.startsWith(`${root}${path.sep}`)) fs.rmSync(owned, { recursive: true, force: true });

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { ChatWorkspaceStore } from "./store.js";
-import { RunManager } from "./runs.js";
+import { journalRunStream, RunManager } from "./runs.js";
 
 const roots: string[] = [];
 function setup() {
@@ -16,6 +16,29 @@ function setup() {
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 describe("RunManager", () => {
+  test("stream errors still finish the run and execute cleanup exactly once", async () => {
+    const { store, manager } = setup();
+    const run = manager.start({ conversationId: "conversation" });
+    let cleanupCalls = 0;
+    let resolveCleanup!: () => void;
+    const cleaned = new Promise<void>((resolve) => { resolveCleanup = resolve; });
+    let controller!: ReadableStreamDefaultController<{ type: string }>;
+    const source = new ReadableStream<{ type: string }>({
+      start(nextController) { controller = nextController; },
+    });
+    const response = journalRunStream(manager, run.id, source, () => {
+      cleanupCalls += 1;
+      resolveCleanup();
+    });
+    controller.error(new Error("stream failed"));
+    await expect(new Response(response).text()).rejects.toThrow("stream failed");
+    await cleaned;
+
+    expect(cleanupCalls).toBe(1);
+    expect(manager.get(run.id)?.status).toBe("failed");
+    store.close();
+  });
+
   test("AC-9.1: reconnect after K replays K+1 through N once and in order", () => {
     const { store, manager } = setup();
     const run = manager.start({ conversationId: "conversation" });

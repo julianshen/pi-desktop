@@ -64,4 +64,28 @@ describe("BranchWorkspace", () => {
     expect(branches.messages("conversation", a.id, manager)).toEqual(aMessages);
     store.close();
   });
+
+  test("production navigateTree branches from the edited message parent", async () => {
+    const { store, manager, branches, firstAnswer, second } = setup();
+    const navigated: string[] = [];
+    const session = {
+      getLeafId: () => manager.getLeafId(),
+      getEntry: (id: string) => manager.getEntry(id),
+      getBranch: (id: string) => manager.getBranch(id),
+      branch: (id: string) => manager.branch(id),
+      resetLeaf: () => manager.resetLeaf(),
+      navigateTree: async (id: string) => {
+        navigated.push(id);
+        manager.branch(id);
+        return { cancelled: false };
+      },
+    };
+
+    const child = await branches.create("conversation", { sourceMessageId: second, replacementContent: "edited middle" }, session);
+
+    expect(navigated).toEqual([firstAnswer]);
+    expect(child.baseEntryId).toBe(firstAnswer);
+    expect(manager.getLeafId()).toBe(firstAnswer);
+    store.close();
+  });
 });

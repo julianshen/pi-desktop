@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { DownloadIcon, FileIcon, RotateCcwIcon } from "lucide-react";
 
 export type GeneratedFileState = "available" | "missing" | "saving" | "saved" | "failed";
@@ -6,6 +6,7 @@ export interface GeneratedFileView { id: string; name: string; mediaType: string
 
 export function GeneratedFile({ file, onSave }: { file: GeneratedFileView; onSave: (fileId: string) => Promise<"saved" | "cancelled" | void> }) {
   const [state, setState] = useState(file.state);
+  useEffect(() => setState(file.state), [file.state]);
   const save = async () => {
     setState("saving");
     try { const outcome = await onSave(file.id); setState(outcome === "cancelled" ? "available" : "saved"); } catch { setState("failed"); }

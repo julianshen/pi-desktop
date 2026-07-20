@@ -93,8 +93,12 @@ export class BranchWorkspace {
       this.store.updateBranch(conversationId, parentId, { leafEntryId: session.getLeafId() ?? undefined, updatedAt: now });
 
       if (session.navigateTree) {
-        const navigation = await session.navigateTree(source.id);
-        if (navigation.cancelled) throw new Error("Branch navigation was cancelled");
+        if (source.parentId === null) {
+          session.resetLeaf();
+        } else {
+          const navigation = await session.navigateTree(source.parentId);
+          if (navigation.cancelled) throw new Error("Branch navigation was cancelled");
+        }
       } else if (source.parentId === null) session.resetLeaf();
       else session.branch(source.parentId);
 

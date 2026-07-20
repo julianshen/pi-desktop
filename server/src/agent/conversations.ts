@@ -191,6 +191,16 @@ export function touchConversation(id: string, patch?: Partial<Pick<ConversationM
   getWorkspaceStore().updateConversation(id, { ...patch, updatedAt: new Date().toISOString() });
 }
 
+export function touchConversationAfterTurn(id: string, userText: string): void {
+  const conversation = getConversationMeta(id);
+  if (!conversation) return;
+  const normalized = userText.replace(/\s+/g, " ").trim();
+  const title = conversation.title === "New conversation" && normalized
+    ? normalized.slice(0, 60)
+    : undefined;
+  touchConversation(id, title ? { title } : undefined);
+}
+
 /**
  * Task 1 fix (path-traversal guard): ids ultimately reach conversationCwd() from
  * client-controlled input (Task 3 wires input.threadId from the AG-UI protocol

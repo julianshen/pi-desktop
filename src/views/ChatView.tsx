@@ -554,7 +554,7 @@ export function ChatView({
     () => function GeneratedFileToolUI({ result }) {
       const file = parseGeneratedFileResult(result);
       if (!file) return <div className="text-xs text-muted">Generated file metadata is unavailable.</div>;
-      return <GeneratedFile file={file} onSave={async () => (await saveGeneratedFile({ conversationId, runId: file.runId, fileId: file.id, mediaType: file.mediaType, byteSize: file.byteSize })).status} />;
+      return <GeneratedFile file={file} onSave={async () => (await saveGeneratedFile({ conversationId, runId: file.runId, fileId: file.id, name: file.name, mediaType: file.mediaType, byteSize: file.byteSize })).status} />;
     }, [conversationId],
   );
   useAssistantToolUI({ toolName: PUBLISH_GENERATED_FILE_TOOL_NAME, render: generatedFileToolUI });

@@ -47,7 +47,6 @@ function signatureMatches(mediaType: string, bytes: Buffer): boolean {
   if (mediaType === "image/jpeg") return bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
   if (mediaType === "image/gif") return bytes.subarray(0, 6).toString("ascii") === "GIF87a" || bytes.subarray(0, 6).toString("ascii") === "GIF89a";
   if (mediaType === "image/webp") return bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP";
-  if (mediaType === "application/pdf") return bytes.subarray(0, 5).toString("ascii") === "%PDF-";
   return true;
 }
 
@@ -64,7 +63,7 @@ function inspectSource(sourcePath: string): { mediaType: string; size: number; i
 
   const extension = path.extname(sourcePath).toLowerCase();
   const isText = extension in TEXT_TYPES;
-  const mediaType = TEXT_TYPES[extension] ?? IMAGE_TYPES[extension] ?? (extension === ".pdf" ? "application/pdf" : undefined);
+  const mediaType = TEXT_TYPES[extension] ?? IMAGE_TYPES[extension];
   if (!mediaType) throw new AttachmentError("UNSUPPORTED_TYPE", "This file type is not supported");
   const handle = fs.openSync(sourcePath, "r");
   const header = Buffer.alloc(16);
@@ -168,9 +167,13 @@ export class AttachmentWorkspace {
     const result: MaterializedAttachments = { textReferences: [], images: [] };
     for (const record of records) {
       if (record.mediaType.startsWith("image/")) {
-        result.images.push({ type: "image", data: fs.readFileSync(record.localPath).toString("base64"), mimeType: record.mediaType });
-      } else if (record.mediaType !== "application/pdf") {
-        result.textReferences.push({ id: record.id, name: record.displayName, text: fs.readFileSync(record.localPath, "utf8") });
+        const data = await fs.promises.readFile(record.localPath);
+        result.images.push({ type: "image", data: data.toString("base64"), mimeType: record.mediaType });
+      } else if (record.mediaType === "application/pdf") {
+        throw new AttachmentError("UNSUPPORTED_TYPE", "PDF attachments are not supported yet");
+      } else {
+        const text = await fs.promises.readFile(record.localPath, "utf8");
+        result.textReferences.push({ id: record.id, name: record.displayName, text });
       }
       this.store.setAttachmentDisposition(conversationId, record.id, "referenced");
       trackServerEvent({ name: "chat_attachment_dispositioned", properties: { outcome: "sent", media_category: mediaCategory(record.mediaType), size_bucket: sizeBucket(record.byteSize) } });

@@ -171,6 +171,45 @@ describe("Sidebar", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Pin Agent plan" }));
     await waitFor(() => expect(screen.getByText("Pinned")).toBeTruthy());
   });
+
+  test("Show archived reveals archived conversations loaded by the workspace", async () => {
+    const active = makeMeta({ id: "active", title: "Active chat" });
+    const archived = makeMeta({ id: "archived", title: "Archived chat", archivedAt: "2026-07-01T00:00:00.000Z" });
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      return Promise.resolve(jsonResponse([active, archived]));
+    }) as unknown as typeof fetch;
+
+    const { SidebarWithHook } = await importSidebarHarness();
+    render(<SidebarWithHook {...baseProps({ activeConv: "active" })} />);
+    await waitFor(() => expect(screen.getByText("Active chat")).toBeTruthy());
+    expect(screen.queryByText("Archived chat")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show archived" }));
+
+    expect(screen.getByText("Archived chat")).toBeTruthy();
+    expect(screen.queryByText("Active chat")).toBeNull();
+  });
+
+  test("deleting the active conversation selects the next valid conversation", async () => {
+    const active = makeMeta({ id: "active", title: "Delete me" });
+    const next = makeMeta({ id: "next", title: "Keep me" });
+    global.fetch = mock((url: string, init?: RequestInit) => {
+      if (url.endsWith("/projects") || url.endsWith("/folders")) return Promise.resolve(jsonResponse([]));
+      if (init?.method === "DELETE") return Promise.resolve(new Response(null, { status: 204 }));
+      return Promise.resolve(jsonResponse([active, next]));
+    }) as unknown as typeof fetch;
+    const onSelectConv = mock(() => {});
+
+    const { SidebarWithHook } = await importSidebarHarness();
+    render(<SidebarWithHook {...baseProps({ activeConv: "active", onSelectConv })} />);
+    await waitFor(() => expect(screen.getByText("Delete me")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Actions for Delete me" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm delete" }));
+
+    await waitFor(() => expect(onSelectConv).toHaveBeenCalledWith("next"));
+  });
 });
 
 /**

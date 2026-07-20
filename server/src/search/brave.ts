@@ -26,7 +26,9 @@ export class BraveSearchProvider implements SearchProvider {
     if (!response.ok) throw new SearchProviderError("provider_error", `Brave Search failed (${response.status})`, response.status >= 500);
     let body: unknown;
     try { body = await response.json(); } catch { throw new SearchProviderError("malformed_response", "Brave Search returned invalid JSON", false); }
-    const results = (body as { web?: { results?: unknown } })?.web?.results;
+    const web = (body as { web?: unknown })?.web;
+    if (!web || typeof web !== "object") throw new SearchProviderError("malformed_response", "Brave Search returned malformed results", false);
+    const results = (web as { results?: unknown }).results ?? [];
     if (!Array.isArray(results)) throw new SearchProviderError("malformed_response", "Brave Search returned malformed results", false);
     return results.slice(0, limit).map((row, index) => normalizeCitation(row, "Brave Search", index));
   }

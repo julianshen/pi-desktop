@@ -11,7 +11,12 @@ export function normalizeCitation(value: unknown, source: string, index: number)
   if (!value || typeof value !== "object") throw new SearchProviderError("malformed_response", "Search provider returned malformed evidence", false);
   const row = value as Record<string, unknown>;
   if (typeof row.title !== "string" || typeof row.url !== "string") throw new SearchProviderError("malformed_response", "Search provider returned malformed evidence", false);
-  const url = new URL(row.url);
+  let url: URL;
+  try {
+    url = new URL(row.url);
+  } catch {
+    throw new SearchProviderError("malformed_response", "Search provider returned an invalid citation URL", false);
+  }
   if (url.protocol !== "https:" && url.protocol !== "http:") throw new SearchProviderError("malformed_response", "Search provider returned an unsafe citation URL", false);
   return { id: `${source}-${index + 1}`, title: row.title, url: url.toString(), snippet: typeof row.description === "string" ? row.description : undefined, source };
 }

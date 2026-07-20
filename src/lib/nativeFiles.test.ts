@@ -18,6 +18,7 @@ describe("native file dialogs", () => {
       expect.objectContaining({ name: "Images" }),
       expect.objectContaining({ name: "Files" }),
     ]));
+    expect(JSON.stringify(captured?.filters)).not.toContain("pdf");
   });
 
   test("AC-4.1: a single selection is normalized to an array", async () => {
@@ -41,11 +42,11 @@ describe("saveGeneratedFile", () => {
   test("AC-15.1: invokes the scoped bridge with opaque IDs and no path", async () => {
     let captured: unknown;
     const result = await saveGeneratedFile(
-      { conversationId: "conversation", runId: "run", fileId: "file" },
+      { conversationId: "conversation", runId: "run", fileId: "file", name: "report.csv" },
       (async (_command: string, args?: Record<string, unknown>) => { captured = args; return { status: "saved" }; }) as never,
     );
     expect(result).toEqual({ status: "saved" });
-    expect(captured).toEqual({ conversationId: "conversation", runId: "run", fileId: "file" });
+    expect(captured).toEqual({ conversationId: "conversation", runId: "run", fileId: "file", fileName: "report.csv" });
     expect(JSON.stringify(captured)).not.toContain("path");
   });
 
@@ -53,11 +54,11 @@ describe("saveGeneratedFile", () => {
     const events: DispatchedDesktopAnalyticsEvent[] = [];
     setDesktopAnalyticsSink((event) => events.push(event));
     expect(await saveGeneratedFile(
-      { conversationId: "c", runId: "r", fileId: "f", mediaType: "text/plain", byteSize: 12 },
+      { conversationId: "c", runId: "r", fileId: "f", name: "report.txt", mediaType: "text/plain", byteSize: 12 },
       (async () => ({ status: "cancelled" })) as never,
     )).toEqual({ status: "cancelled" });
     await expect(saveGeneratedFile(
-      { conversationId: "c", runId: "r", fileId: "f" },
+      { conversationId: "c", runId: "r", fileId: "f", name: "report.txt" },
       (async () => { throw { code: "write_failed" }; }) as never,
     )).rejects.toThrow("Generated file save failed");
     expect(events.map((event) => event.properties.outcome)).toEqual(["cancelled", "failed"]);

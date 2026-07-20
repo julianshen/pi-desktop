@@ -11,6 +11,7 @@ import { settingsRouter } from "./settings/routes.js";
 import {
   getConversationMeta,
   touchConversation,
+  touchConversationAfterTurn,
   setLiveSessionModel,
   getConversationMessages,
   getLastTurnError,
@@ -576,7 +577,8 @@ export function createApp(options?: CreateAppOptions): Express {
         const conversation = workspaceStore.getConversation(req.params.id);
         const activeBranchId = conversation?.activeBranchId;
         const materialized = await attachmentWorkspace.materialize(req.params.id, attachmentIds as string[], activeBranchId);
-        const userText = withTextAttachments(extractLatestUserTextFromUIMessages(messages), materialized.textReferences);
+        const messageText = extractLatestUserTextFromUIMessages(messages);
+        const userText = withTextAttachments(messageText, materialized.textReferences);
         // ai-sdk/adapter.ts's own doc comment claims a real AgentSession "structurally
         // satisfies AgentSessionEventSource ... with no adapter shape changes" needed
         // to wire it in here -- true at the RUNTIME level (the adapter's switch only
@@ -611,6 +613,9 @@ export function createApp(options?: CreateAppOptions): Express {
         const stream = journalRunStream(runManager, run.id, rawStream, () => {
           setActivePlanRun(req.params.id, undefined);
           if (activeBranchId) branchWorkspace.commitLeaf(req.params.id, activeBranchId, session.sessionManager.getLeafId() ?? undefined);
+          if (runManager.get(run.id)?.status === "completed") {
+            touchConversationAfterTurn(req.params.id, messageText);
+          }
         });
         pipeUIMessageStreamToResponse({ response: res, stream });
       })
