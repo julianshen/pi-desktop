@@ -62,21 +62,17 @@ fn generated_root() -> Result<PathBuf, SaveError> {
         .join("generated-files"))
 }
 
-fn resolve_source(
-    root: &Path,
-    conversation_id: &str,
-    run_id: &str,
-    file_id: &str,
-) -> Result<PathBuf, SaveError> {
-    for value in [conversation_id, run_id, file_id] {
-        if !safe_id(value) {
-            return Err(SaveError::InvalidId(
-                "generated-file identifier is invalid".into(),
-            ));
-        }
+fn data_root() -> Result<PathBuf, SaveError> {
+    if let Ok(data_dir) = std::env::var("PI_DESKTOP_DATA_DIR") {
+        return Ok(PathBuf::from(data_dir));
     }
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| SaveError::SourceMissing("app data directory is unavailable".into()))?;
+    Ok(PathBuf::from(home).join(".pi-desktop").join("data"))
+}
 
-    let source = root.join(conversation_id).join(run_id).join(file_id);
+fn resolve_candidate(root: &Path, source: PathBuf) -> Result<PathBuf, SaveError> {
     let metadata = fs::symlink_metadata(&source)
         .map_err(|_| SaveError::SourceMissing("generated file is no longer available".into()))?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -96,6 +92,42 @@ fn resolve_source(
         ));
     }
     Ok(canonical_source)
+}
+
+fn resolve_source(
+    root: &Path,
+    conversation_id: &str,
+    run_id: &str,
+    file_id: &str,
+) -> Result<PathBuf, SaveError> {
+    for value in [conversation_id, run_id, file_id] {
+        if !safe_id(value) {
+            return Err(SaveError::InvalidId(
+                "generated-file identifier is invalid".into(),
+            ));
+        }
+    }
+
+    resolve_candidate(root, root.join(conversation_id).join(run_id).join(file_id))
+}
+
+fn resolve_scheduled_source(
+    root: &Path,
+    task_id: &str,
+    run_id: &str,
+    file_id: &str,
+) -> Result<PathBuf, SaveError> {
+    for value in [task_id, run_id, file_id] {
+        if !safe_id(value) {
+            return Err(SaveError::InvalidId(
+                "scheduled-file identifier is invalid".into(),
+            ));
+        }
+    }
+    resolve_candidate(
+        root,
+        root.join(task_id).join(run_id).join("files").join(file_id),
+    )
 }
 
 fn atomic_copy(source: &Path, destination: &Path) -> Result<(), SaveError> {
@@ -171,6 +203,14 @@ fn save_interactive(
     file_name: String,
 ) -> Result<SaveResult, SaveError> {
     let source = resolve_source(&generated_root()?, &conversation_id, &run_id, &file_id)?;
+    save_resolved_interactive(app, source, file_name)
+}
+
+fn save_resolved_interactive(
+    app: AppHandle,
+    source: PathBuf,
+    file_name: String,
+) -> Result<SaveResult, SaveError> {
     let selected = app
         .dialog()
         .file()
@@ -217,6 +257,23 @@ pub async fn save_generated_file(
 ) -> Result<SaveResult, SaveError> {
     tauri::async_runtime::spawn_blocking(move || {
         save_interactive(app, conversation_id, run_id, file_id, file_name)
+    })
+    .await
+    .map_err(|error| SaveError::WriteFailed(error.to_string()))?
+}
+
+#[tauri::command]
+pub async fn save_scheduled_run_file(
+    app: AppHandle,
+    task_id: String,
+    run_id: String,
+    file_id: String,
+    file_name: String,
+) -> Result<SaveResult, SaveError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = data_root()?.join("scheduler-runs");
+        let source = resolve_scheduled_source(&root, &task_id, &run_id, &file_id)?;
+        save_resolved_interactive(app, source, file_name)
     })
     .await
     .map_err(|error| SaveError::WriteFailed(error.to_string()))?
@@ -322,5 +379,32 @@ mod tests {
     fn generated_file_suggestion_uses_only_the_human_readable_basename() {
         assert_eq!(safe_file_name("../../report.csv"), "report.csv");
         assert_eq!(safe_file_name(""), "generated-file");
+    }
+
+    #[test]
+    fn scheduled_files_are_opaque_id_scoped_and_reject_traversal_or_symlinks() {
+        let base = std::env::temp_dir().join(format!("pi-scheduled-files-{}", uuid::Uuid::new_v4()));
+        let root = base.join("scheduler-runs");
+        let files = root.join("task").join("run").join("files");
+        fs::create_dir_all(&files).unwrap();
+        let source = files.join("file");
+        fs::write(&source, b"scheduled bytes").unwrap();
+        assert_eq!(
+            resolve_scheduled_source(&root, "task", "run", "file").unwrap(),
+            source.canonicalize().unwrap()
+        );
+        assert!(matches!(
+            resolve_scheduled_source(&root, "..", "run", "file"),
+            Err(SaveError::InvalidId(_))
+        ));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("file", files.join("link")).unwrap();
+            assert!(matches!(
+                resolve_scheduled_source(&root, "task", "run", "link"),
+                Err(SaveError::SourceUnsafe(_))
+            ));
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 }

@@ -5,13 +5,17 @@ export type SizeBucket = "under_1mib" | "1_10mib" | "10_25mib" | "over_25mib" | 
 export type ServerAnalyticsEvent =
   | { name: "chat_turn_terminal"; properties: { outcome: "completed" | "stopped" | "failed"; retryable: boolean; model_provider: string; duration_bucket: DurationBucket } }
   | { name: "chat_attachment_dispositioned"; properties: { outcome: "sent" | "rejected" | "missing" | "local_only"; media_category: string; size_bucket: SizeBucket; reason_code?: string } }
-  | { name: "web_search_run_completed"; properties: { provider: string; outcome: "success" | "not_configured" | "rate_limited" | "failed"; result_count_bucket: CountBucket; latency_bucket: DurationBucket } };
+  | { name: "web_search_run_completed"; properties: { provider: string; outcome: "success" | "not_configured" | "rate_limited" | "failed"; result_count_bucket: CountBucket; latency_bucket: DurationBucket } }
+  | { name: "scheduled_task_saved"; properties: { operation: "create" | "update"; enabled: boolean; model_mode: "default" | "override" } }
+  | { name: "scheduled_task_run_started"; properties: { trigger: "cron" | "manual"; dispatch_delay_bucket: DurationBucket; model_mode: "default" | "override" } }
+  | { name: "scheduled_task_run_terminal"; properties: { outcome: "completed" | "failed" | "skipped"; trigger: "cron" | "manual"; duration_bucket: DurationBucket; reason_code?: string; file_count_bucket: CountBucket } }
+  | { name: "scheduled_task_tool_denied"; properties: { category: "computer_use" | "mcp" | "interactive_approval" | "private_network" | "unknown"; phase: "resolution" | "execution" } };
 
 export type DispatchedServerAnalyticsEvent = ServerAnalyticsEvent & { platform: "server" };
 type EventSink = (event: DispatchedServerAnalyticsEvent) => void;
 let sink: EventSink = () => {};
 
-const sensitive = new Set(["prompt", "content", "query", "url", "key", "filename", "path", "hash"]);
+const sensitive = new Set(["prompt", "content", "query", "url", "key", "filename", "path", "hash", "result", "taskid", "runid", "modelid", "cron", "timezone", "finaltext", "errormessage", "toolarguments", "target", "filemetadata"]);
 
 function assertPrivate(value: unknown): void {
   if (!value || typeof value !== "object") return;

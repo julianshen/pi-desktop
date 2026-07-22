@@ -18,7 +18,7 @@ export interface GeneratedFileMetadata {
   id: string; runId: string; name: string; mediaType: string; byteSize: number; state: "available";
 }
 
-function resolveWorkspaceFile(cwd: string, requested: string): string {
+export function resolveWorkspaceFile(cwd: string, requested: string): string {
   const lexicalRoot = path.resolve(cwd);
   const lexicalSource = path.resolve(lexicalRoot, requested);
   if (lexicalSource !== lexicalRoot && !lexicalSource.startsWith(`${lexicalRoot}${path.sep}`)) {

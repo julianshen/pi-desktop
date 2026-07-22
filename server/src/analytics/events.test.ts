@@ -16,4 +16,14 @@ describe("privacy-safe server analytics", () => {
       expect(() => trackServerEvent({ name: "web_search_run_completed", properties: { provider: "brave", outcome: "success", result_count_bucket: "1", latency_bucket: "under_1s", nested: { [field]: "secret" } } } as never)).toThrow(`Analytics field is forbidden`);
     }
   });
+
+  test("AC-12.3: scheduled analytics accepts registered buckets/enums and rejects identifiers or task content recursively", () => {
+    const events: DispatchedServerAnalyticsEvent[] = [];
+    setServerAnalyticsSink((event) => events.push(event));
+    trackServerEvent({ name: "scheduled_task_run_terminal", properties: { outcome: "failed", trigger: "cron", duration_bucket: "10_60s", reason_code: "execution_failed", file_count_bucket: "1" } });
+    expect(events).toHaveLength(1);
+    for (const field of ["taskId", "run_id", "prompt", "finalText", "errorMessage", "cron", "timezone", "modelId", "toolArguments", "targetUrl", "fileMetadata", "path"]) {
+      expect(() => trackServerEvent({ name: "scheduled_task_tool_denied", properties: { category: "unknown", phase: "execution", nested: { [field]: "secret" } } } as never)).toThrow("Analytics field is forbidden");
+    }
+  });
 });

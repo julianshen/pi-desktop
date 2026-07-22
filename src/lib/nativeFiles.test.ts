@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chooseChatAttachments, chooseGeneratedFileDestination, saveGeneratedFile } from "./nativeFiles.js";
+import { chooseChatAttachments, chooseGeneratedFileDestination, saveGeneratedFile, saveScheduledRunFile } from "./nativeFiles.js";
 import { setDesktopAnalyticsSink, type DispatchedDesktopAnalyticsEvent } from "./analytics.js";
 
 afterEach(() => setDesktopAnalyticsSink());
@@ -63,5 +63,20 @@ describe("saveGeneratedFile", () => {
     )).rejects.toThrow("Generated file save failed");
     expect(events.map((event) => event.properties.outcome)).toEqual(["cancelled", "failed"]);
     expect(JSON.stringify(events)).not.toMatch(/filename|path|content/i);
+  });
+});
+
+describe("saveScheduledRunFile", () => {
+  test("AC-9.3: invokes the scheduled scoped bridge with opaque IDs and no source path", async () => {
+    let command = "";
+    let captured: unknown;
+    const result = await saveScheduledRunFile(
+      { taskId: "task", runId: "run", fileId: "file", name: "../report.md" },
+      (async (nextCommand: string, args?: Record<string, unknown>) => { command = nextCommand; captured = args; return { status: "saved" }; }) as never,
+    );
+    expect(result).toEqual({ status: "saved" });
+    expect(command).toBe("save_scheduled_run_file");
+    expect(captured).toEqual({ taskId: "task", runId: "run", fileId: "file", fileName: "report.md" });
+    expect(JSON.stringify(captured)).not.toContain("path");
   });
 });

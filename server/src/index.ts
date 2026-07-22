@@ -6,7 +6,9 @@ import { pipeUIMessageStreamToResponse, type UIMessage } from "ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
 import { env } from "./config/env.js";
 import { handleAiSdkRun, type AgentSessionEventSource } from "./ai-sdk/adapter.js";
-import { startScheduler } from "./scheduler/index.js";
+import { getSchedulerService, startScheduler } from "./scheduler/index.js";
+import { createScheduledTasksRouter } from "./scheduler/routes.js";
+import type { SchedulerService } from "./scheduler/service.js";
 import { settingsRouter } from "./settings/routes.js";
 import {
   getConversationMeta,
@@ -56,6 +58,7 @@ import {
 export interface CreateAppOptions {
   modelRegistry?: ModelRegistry;
   resolveToken?: string | null;
+  schedulerService?: SchedulerService;
 }
 
 const STDIN_RESOLVE_TOKEN_TIMEOUT_MS = 3000;
@@ -223,6 +226,10 @@ export function createApp(options?: CreateAppOptions): Express {
   app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
   });
+
+  if (options?.schedulerService) {
+    app.use(createScheduledTasksRouter(options.schedulerService));
+  }
 
   // Agent Chat Experience Tasks 1–2: transactional conversation workspace and
   // organization/lifecycle routes. Mount under /api so the router's resource
@@ -663,14 +670,15 @@ async function main(): Promise<void> {
     );
   }
 
-  const app = createApp({ resolveToken });
+  await startScheduler();
+  const schedulerService = await getSchedulerService();
+  const app = createApp({ resolveToken, schedulerService });
   const baseUrl = `http://${env.host}:${env.port}`;
 
   app.listen(env.port, env.host, () => {
     console.log(`[pi-desktop] server listening on ${baseUrl}`);
   });
 
-  startScheduler();
 }
 
 // Bun-native entrypoint guard (equivalent of Node's require.main === module): only run
