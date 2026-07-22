@@ -133,4 +133,37 @@ describe("useScheduledTasks", () => {
     await waitFor(() => expect(result.current.tasks[0]?.status).toBe("active"));
     expect(result.current.mutating).toBe(false);
   });
+
+  test("review regression: polling refreshes the selected task detail and run history", async () => {
+    let listCalls = 0;
+    let detailCalls = 0;
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/api/scheduled-tasks")) {
+        listCalls += 1;
+        return Promise.resolve(response({
+          tasks: [task("one", listCalls === 1 ? "running" : "active")],
+          unreadCount: listCalls > 1 ? 1 : 0,
+        }));
+      }
+      if (url.endsWith("/api/scheduled-tasks/one")) {
+        detailCalls += 1;
+        return Promise.resolve(response({
+          task: task("one", detailCalls === 1 ? "running" : "active"),
+          stats: { successRate: detailCalls === 1 ? 0 : 100, averageDurationMs: 5 },
+          recentRuns: [],
+        }));
+      }
+      if (url.includes("/runs?limit=25")) {
+        return Promise.resolve(response({
+          runs: detailCalls > 1 ? [{ id: "completed-run", status: "completed" }] : [],
+        }));
+      }
+      return Promise.reject(new Error(`unexpected ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useScheduledTasks({ pollMs: 100, runningPollMs: 10 }));
+    await waitFor(() => expect(detailCalls).toBeGreaterThanOrEqual(2), { timeout: 500 });
+    await waitFor(() => expect(result.current.stats?.successRate).toBe(100));
+    expect(result.current.runs[0]?.id).toBe("completed-run");
+  });
 });

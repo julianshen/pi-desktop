@@ -76,6 +76,30 @@ const input = {
 };
 
 describe("scheduled task definition routes", () => {
+  test("review regression: scheduler JSON parsing does not cap later non-scheduler routes", async () => {
+    const context = await setup();
+    const app = express();
+    app.use(createScheduledTasksRouter(context.service));
+    app.post("/api/conversations/example/chat", express.json({ limit: "1mb" }), (request, response) => {
+      response.json({ length: String(request.body.message).length });
+    });
+    const server = app.listen(0);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected TCP address");
+
+    const payload = "x".repeat(300 * 1024);
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/conversations/example/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: payload }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ length: payload.length });
+  });
+
   test("AC-4.1: CRUD responses reflect persisted registration immediately", async () => {
     const context = await setup();
     const createdResponse = await fetch(`${context.baseUrl}/api/scheduled-tasks`, {

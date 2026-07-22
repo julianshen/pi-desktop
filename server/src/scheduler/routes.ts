@@ -89,7 +89,7 @@ function asyncRoute(
 
 export function createScheduledTasksRouter(service: SchedulerService): Router {
   const router = Router();
-  router.use(express.json({ limit: "256kb" }));
+  router.use("/api/scheduled-tasks", express.json({ limit: "256kb" }));
 
   router.get("/api/scheduled-tasks", (_request, response) => {
     response.json({ tasks: service.listTaskSummaries(), unreadCount: service.unreadCount() });

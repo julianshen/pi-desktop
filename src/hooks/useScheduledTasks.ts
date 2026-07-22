@@ -84,6 +84,7 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
   const [detailLoading, setDetailLoading] = useState(false);
   const [mutating, setMutating] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [detailRefreshRevision, setDetailRefreshRevision] = useState(0);
   const mountedRef = useRef(true);
   const listRequestRef = useRef(0);
 
@@ -107,6 +108,7 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
       const payload = await apiJson<TaskListResponse>("/api/scheduled-tasks");
       if (!mountedRef.current || requestId !== listRequestRef.current) return;
       reconcileList(payload);
+      setDetailRefreshRevision((current) => current + 1);
       setError(null);
     } catch (cause) {
       if (mountedRef.current && requestId === listRequestRef.current) {
@@ -177,7 +179,7 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
       stopped = true;
       controller.abort();
     };
-  }, [selectedTaskId, visible]);
+  }, [detailRefreshRevision, selectedTaskId, visible]);
 
   const mutate = useCallback(async <T,>(operation: () => Promise<T>): Promise<T> => {
     setMutating(true);
