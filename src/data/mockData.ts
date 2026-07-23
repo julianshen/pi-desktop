@@ -1,7 +1,6 @@
 /**
- * Sample data for views that have no backend yet (artifacts, scheduled tasks,
- * coding agents, MCP servers, skills, provider settings). The Chat view is the
- * only one wired to the real server — see views/ChatView.tsx.
+ * Sample data for views that have no backend yet: the artifact store, coding
+ * agents, MCP server management, and the skills library.
  */
 
 export type Status =
@@ -68,40 +67,6 @@ export const artifacts: Artifact[] = [
   { type: "Slide Deck", title: "Board Deck — July", desc: "18 slides generated from the update doc.", meta: "v1 · 4d ago", status: "Review" },
 ];
 
-export interface ScheduledTask {
-  name: string;
-  schedule: string;
-  cadence: string;
-  last: string;
-  next: string;
-  status: Status;
-}
-
-export const schedules: ScheduledTask[] = [
-  { name: "Daily metrics digest", schedule: "0 8 * * *", cadence: "Every day · 08:00", last: "Today 08:00", next: "Tomorrow 08:00", status: "Active" },
-  { name: "Warehouse sync", schedule: "*/30 * * * *", cadence: "Every 30 min", last: "12m ago", next: "in 18m", status: "Active" },
-  { name: "Churn model retrain", schedule: "0 3 * * 1", cadence: "Weekly · Mon 03:00", last: "Mon 03:00", next: "in 5d", status: "Active" },
-  { name: "Competitor news scan", schedule: "0 */6 * * *", cadence: "Every 6 hours", last: "2h ago", next: "paused", status: "Paused" },
-  { name: "Support triage sweep", schedule: "*/15 9-18 * * *", cadence: "15 min · work hrs", last: "8m ago", next: "in 7m", status: "Active" },
-  { name: "Nightly test agent", schedule: "0 2 * * *", cadence: "Every day · 02:00", last: "02:00", next: "retry queued", status: "Failed" },
-];
-
-export interface TaskRun {
-  time: string;
-  dur: string;
-  tokens: string;
-  out: string;
-  status: Status;
-}
-
-export const taskRuns: TaskRun[] = [
-  { time: "Today · 08:00", dur: "4.2s", tokens: "12.4k", out: "metrics_digest.md", status: "Done" },
-  { time: "Yesterday · 08:00", dur: "3.9s", tokens: "11.8k", out: "metrics_digest.md", status: "Done" },
-  { time: "Jul 9 · 08:00", dur: "5.1s", tokens: "13.1k", out: "metrics_digest.md", status: "Done" },
-  { time: "Jul 8 · 08:00", dur: "—", tokens: "2.1k", out: "timeout: warehouse unreachable", status: "Failed" },
-  { time: "Jul 7 · 08:00", dur: "4.0s", tokens: "12.0k", out: "metrics_digest.md", status: "Done" },
-];
-
 export interface McpServer {
   name: string;
   transport: string;
@@ -155,7 +120,6 @@ export const codeRuns: CodeRun[] = [
 
 export const filterConfig: Record<string, { heading: string; items: [string, string][] }> = {
   artifacts: { heading: "Type", items: [["All", "24"], ["Apps", "7"], ["Documents", "9"], ["Charts", "5"], ["Datasets", "3"]] },
-  scheduled: { heading: "Status", items: [["All", "6"], ["Active", "4"], ["Paused", "1"], ["Failed", "1"]] },
   coding: { heading: "Repository", items: [["pi-agent-web", "2"], ["billing-svc", "1"], ["infra", "1"]] },
   mcp: { heading: "Category", items: [["All", "6"], ["Databases", "1"], ["Search", "1"], ["DevOps", "2"], ["Files", "1"]] },
   skills: { heading: "Category", items: [["All", "24"], ["Writing", "6"], ["Data", "8"], ["Coding", "5"], ["Research", "5"]] },

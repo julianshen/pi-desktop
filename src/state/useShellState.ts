@@ -6,7 +6,6 @@ export type CanvasTab = "code" | "preview";
 
 const DEFAULT_FILTER: Partial<Record<ViewKey, string>> = {
   artifacts: "All",
-  scheduled: "All",
   mcp: "All",
   skills: "All",
   coding: "pi-agent-web",
@@ -29,7 +28,6 @@ export interface ShellState {
   model: string;
   activeFilter: string;
   settingsSection: SettingsSection;
-  taskOpen: number | null;
   taskCreate: boolean;
 }
 
@@ -44,8 +42,6 @@ export interface ShellActions {
   setModel: (name: string) => void;
   setActiveFilter: (label: string) => void;
   setSettingsSection: (section: SettingsSection) => void;
-  openTask: (index: number) => void;
-  backToTasks: () => void;
   openTaskCreate: () => void;
   closeTaskCreate: () => void;
 }
@@ -95,7 +91,6 @@ export function useShellState(initialView: ViewKey = "chat") {
     model: "",
     activeFilter: DEFAULT_FILTER[initialView] ?? "All",
     settingsSection: "providers",
-    taskOpen: null,
     taskCreate: false,
   });
 
@@ -105,7 +100,6 @@ export function useShellState(initialView: ViewKey = "chat") {
       view,
       activeFilter: DEFAULT_FILTER[view] ?? "All",
       modelOpen: false,
-      taskOpen: null,
       taskCreate: false,
     }));
   }, []);
@@ -133,10 +127,8 @@ export function useShellState(initialView: ViewKey = "chat") {
     setModel: (name) => setState((s) => ({ ...s, model: name, modelOpen: false })),
     setActiveFilter: (label) => setState((s) => ({ ...s, activeFilter: label })),
     setSettingsSection: (section) => setState((s) => ({ ...s, settingsSection: section })),
-    openTask: (index) => setState((s) => ({ ...s, taskOpen: index })),
-    backToTasks: () => setState((s) => ({ ...s, taskOpen: null })),
     openTaskCreate: () =>
-      setState((s) => (s.view === "scheduled" ? { ...s, taskCreate: true, taskOpen: null } : s)),
+      setState((s) => (s.view === "scheduled" ? { ...s, taskCreate: true } : s)),
     closeTaskCreate: () => setState((s) => ({ ...s, taskCreate: false })),
   };
 

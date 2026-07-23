@@ -34,7 +34,6 @@ const MAIN_TITLES: Partial<Record<ViewKey, string>> = {
 
 const SEARCH_HINTS: Partial<Record<ViewKey, string>> = {
   artifacts: "Filter artifacts",
-  scheduled: "Filter tasks",
   coding: "Filter runs",
   mcp: "Filter servers",
   skills: "Search skills",
@@ -368,22 +367,24 @@ export function MainHeader({
 
       {isFiltered && (
         <>
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 7,
-              height: 32,
-              padding: "0 10px",
-              border: "1px solid var(--color-divider)",
-              color: "color-mix(in srgb, var(--color-text) 55%, transparent)",
-              fontSize: 12,
-              width: 220,
-            }}
-          >
-            <SearchIcon size={13} />
-            <span>{SEARCH_HINTS[view] ?? ""}</span>
-          </div>
+          {view !== "scheduled" && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 7,
+                height: 32,
+                padding: "0 10px",
+                border: "1px solid var(--color-divider)",
+                color: "color-mix(in srgb, var(--color-text) 55%, transparent)",
+                fontSize: 12,
+                width: 220,
+              }}
+            >
+              <SearchIcon size={13} />
+              <span>{SEARCH_HINTS[view] ?? ""}</span>
+            </div>
+          )}
           <button
             onClick={view === "scheduled" ? actions.openTaskCreate : undefined}
             style={{

@@ -167,12 +167,18 @@ export function Sidebar({
 }) {
   const isChat = view === "chat";
   const isSettings = view === "settings";
-  const isFiltered = !isChat && !isSettings;
+  const isScheduled = view === "scheduled";
+  const isFiltered = !isChat && !isSettings && !isScheduled;
   const cfg = filterConfig[view] ?? { heading: "", items: [] };
 
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [showArchived, setShowArchived] = useState(false);
+
+  // ScheduledTasksView owns a real task navigator, search, status and unread
+  // state. The generic shell sidebar duplicated it with hardcoded sample counts
+  // and filters that never reached the real view.
+  if (isScheduled) return null;
 
   // AC-10.3: "+" creates a new conversation and it becomes active. `create()`'s
   // Promise rejects on failure (network error/non-2xx) without touching the

@@ -64,10 +64,7 @@ function installApi(tasks: ScheduledTaskSummary[], runs: ScheduledRunRecord[] = 
 }
 
 const baseProps = {
-  taskOpen: null,
   taskCreate: false,
-  onOpenTask: () => {},
-  onBackToTasks: () => {},
   onCloseCreate: () => {},
 };
 
