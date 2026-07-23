@@ -137,7 +137,6 @@ export class ScheduledRunExecutor {
       return { run: skipped, completion: Promise.resolve(skipped) };
     }
 
-    this.active.add(task.id);
     const startedAt = this.now().toISOString();
     let record: ScheduledRunRecord = {
       id: runId,
@@ -151,10 +150,16 @@ export class ScheduledRunExecutor {
       definition: snapshot(task),
     };
     this.runStore.save(record);
-    const dispatchDelay = scheduledFor ? Math.max(0, Date.parse(startedAt) - Date.parse(scheduledFor)) : 0;
-    trackServerEvent({ name: "scheduled_task_run_started", properties: { trigger, dispatch_delay_bucket: durationBucket(dispatchDelay), model_mode: task.modelId ? "override" : "default" } });
-    const completion = this.complete(task, record);
-    return { run: record, completion };
+    this.active.add(task.id);
+    try {
+      const dispatchDelay = scheduledFor ? Math.max(0, Date.parse(startedAt) - Date.parse(scheduledFor)) : 0;
+      trackServerEvent({ name: "scheduled_task_run_started", properties: { trigger, dispatch_delay_bucket: durationBucket(dispatchDelay), model_mode: task.modelId ? "override" : "default" } });
+      const completion = this.complete(task, record);
+      return { run: record, completion };
+    } catch (error) {
+      this.active.delete(task.id);
+      throw error;
+    }
   }
 
   private async complete(

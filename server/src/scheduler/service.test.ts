@@ -21,10 +21,12 @@ function setup() {
   const runStore = new RunStore(path.join(root, "data"));
   const handles = new Map<string, { handle: ScheduledHandle; cron: string; timezone: string }>();
   const stopped: string[] = [];
+  const registrations: string[] = [];
   const callbacks = new Map<string, () => void>();
   let failCron: string | undefined;
   const scheduleTask = (task: ScheduledTaskRecord, callback: () => void): ScheduledHandle => {
     if (task.cron === failCron) throw new Error("schedule failed");
+    registrations.push(task.id);
     const handle: ScheduledHandle = {
       stop: () => {
         stopped.push(task.id);
@@ -73,6 +75,7 @@ function setup() {
     taskStore,
     handles,
     stopped,
+    registrations,
     callbacks,
     executions,
     resolvedModels,
@@ -111,6 +114,23 @@ describe("SchedulerService definition lifecycle", () => {
     expect(context.handles.has("invalid-cron")).toBe(false);
     expect(context.handles.has("../unsafe")).toBe(false);
     expect(() => context.service.listTaskSummaries()).not.toThrow();
+  });
+
+  test("review regression: duplicate startup task IDs register only one cron handle", async () => {
+    const context = setup();
+    const timestamp = "2026-07-22T00:00:00.000Z";
+    context.taskStore.replaceAll([
+      { ...validInput, id: "duplicate", name: "First", createdAt: timestamp, updatedAt: timestamp },
+      { ...validInput, id: "duplicate", name: "Second", createdAt: timestamp, updatedAt: timestamp },
+    ]);
+
+    await context.service.start();
+
+    expect(context.registrations).toEqual(["duplicate"]);
+    expect(context.service.listTasks()).toEqual([
+      expect.objectContaining({ id: "duplicate", name: "First" }),
+    ]);
+    expect(context.handles.size).toBe(1);
   });
 
   test("AC-12.1: saved analytics emits once only after create/update durable registration matches", async () => {

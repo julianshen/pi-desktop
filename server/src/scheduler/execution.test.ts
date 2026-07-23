@@ -205,4 +205,37 @@ describe("ScheduledRunExecutor", () => {
       runStore,
     )).rejects.toThrow("Invalid task id");
   });
+
+  test("review regression: an initial manifest write failure cannot leave the task guard active", async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-desktop-scheduled-initial-save-"));
+    const runStore = new RunStore(dataDir);
+    const save = runStore.save.bind(runStore);
+    let failInitialSave = true;
+    runStore.save = (record) => {
+      if (failInitialSave) {
+        failInitialSave = false;
+        throw new Error("disk full");
+      }
+      save(record);
+    };
+    const executor = new ScheduledRunExecutor({
+      runStore,
+      sessionFactory: async () => ({
+        prompt: async () => {},
+        messages: () => [{ role: "assistant", content: "Recovered" }],
+        dispose: () => {},
+      }),
+      id: (() => {
+        let nextId = 0;
+        return () => `initial-save-${++nextId}`;
+      })(),
+    });
+
+    expect(() => executor.start(task("save-task"), "manual")).toThrow("disk full");
+    expect(executor.isActive("save-task")).toBe(false);
+    await expect(executor.run(task("save-task"), "manual")).resolves.toMatchObject({
+      status: "completed",
+      finalText: "Recovered",
+    });
+  });
 });

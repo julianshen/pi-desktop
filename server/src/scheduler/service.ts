@@ -122,6 +122,13 @@ export class SchedulerService {
     this.tasks.clear();
     for (const task of loaded) {
       try {
+        if (this.tasks.has(task.id)) {
+          throw new SchedulerError(
+            "duplicate_task_id",
+            `Duplicate scheduled task ID "${task.id}".`,
+            400,
+          );
+        }
         await this.validateTask(task);
         if (task.enabled) this.handles.set(task.id, this.register(task));
         this.tasks.set(task.id, task);
