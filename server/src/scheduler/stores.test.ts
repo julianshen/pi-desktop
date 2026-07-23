@@ -127,7 +127,7 @@ describe("TaskStore", () => {
 });
 
 describe("RunStore", () => {
-  test("review regression: a malformed run manifest cannot hide valid runs or abort reconciliation", () => {
+  test("review regression: malformed or wrong-shaped run manifests cannot hide valid runs or abort reconciliation", () => {
     const dataDir = scratch();
     const store = new RunStore(dataDir);
     const interrupted: ScheduledRunRecord = {
@@ -141,8 +141,20 @@ describe("RunStore", () => {
     const malformedDirectory = store.runDir("weekly-report", "malformed");
     fs.mkdirSync(malformedDirectory, { recursive: true });
     fs.writeFileSync(path.join(malformedDirectory, "run.json"), "{not-json");
+    const emptyDirectory = store.runDir("weekly-report", "empty");
+    fs.mkdirSync(emptyDirectory, { recursive: true });
+    fs.writeFileSync(path.join(emptyDirectory, "run.json"), "{}");
+    const invalidFilesDirectory = store.runDir("weekly-report", "invalid-files");
+    fs.mkdirSync(invalidFilesDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(invalidFilesDirectory, "run.json"),
+      JSON.stringify({ ...terminalRun("weekly-report", 201), id: "invalid-files", files: null }),
+    );
 
     expect(store.get("weekly-report", "malformed")).toBeUndefined();
+    expect(store.get("weekly-report", "empty")).toBeUndefined();
+    expect(store.get("weekly-report", "invalid-files")).toBeUndefined();
+    expect(store.resolveFile("weekly-report", "invalid-files", "result")).toBeUndefined();
     expect(store.list("weekly-report").map((candidate) => candidate.id)).toEqual(["interrupted"]);
     expect(store.reconcileInterrupted()).toBe(1);
     expect(store.get("weekly-report", "interrupted")?.status).toBe("failed");

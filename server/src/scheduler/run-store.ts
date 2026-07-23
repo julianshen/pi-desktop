@@ -4,9 +4,75 @@ import type { ScheduledRunRecord } from "./types.js";
 import type { ScheduledRunFile } from "./types.js";
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const RUN_STATUSES = new Set(["running", "completed", "failed", "skipped"]);
+const RUN_TRIGGERS = new Set(["cron", "manual"]);
+const ERROR_CODES = new Set(["execution_failed", "process_interrupted", "model_unavailable", "invalid_definition"]);
 
 function assertSafeId(value: string, label: string): void {
   if (!SAFE_ID.test(value)) throw new Error(`Invalid ${label}`);
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isRunFile(value: unknown): boolean {
+  return isObject(value)
+    && typeof value.id === "string"
+    && SAFE_ID.test(value.id)
+    && typeof value.name === "string"
+    && typeof value.mediaType === "string"
+    && typeof value.byteSize === "number"
+    && Number.isFinite(value.byteSize)
+    && value.byteSize >= 0
+    && (value.state === "available" || value.state === "missing");
+}
+
+function isTaskSnapshot(value: unknown): boolean {
+  return isObject(value)
+    && typeof value.name === "string"
+    && typeof value.prompt === "string"
+    && typeof value.cron === "string"
+    && typeof value.timezone === "string"
+    && typeof value.enabled === "boolean"
+    && isOptionalString(value.modelId);
+}
+
+function isRunError(value: unknown): boolean {
+  return value === undefined || (
+    isObject(value)
+    && typeof value.code === "string"
+    && ERROR_CODES.has(value.code)
+    && typeof value.message === "string"
+    && typeof value.retryable === "boolean"
+  );
+}
+
+function isScheduledRunRecord(value: unknown, taskId: string, runId: string): value is ScheduledRunRecord {
+  return isObject(value)
+    && value.id === runId
+    && value.taskId === taskId
+    && typeof value.trigger === "string"
+    && RUN_TRIGGERS.has(value.trigger)
+    && typeof value.status === "string"
+    && RUN_STATUSES.has(value.status)
+    && isOptionalString(value.scheduledFor)
+    && isOptionalString(value.startedAt)
+    && isOptionalString(value.completedAt)
+    && (value.durationMs === undefined
+      || (typeof value.durationMs === "number" && Number.isFinite(value.durationMs) && value.durationMs >= 0))
+    && isOptionalString(value.modelId)
+    && isOptionalString(value.finalText)
+    && isRunError(value.error)
+    && (value.skipReason === undefined || value.skipReason === "already_running")
+    && Array.isArray(value.files)
+    && value.files.every(isRunFile)
+    && typeof value.unread === "boolean"
+    && isTaskSnapshot(value.definition);
 }
 
 function timestamp(run: ScheduledRunRecord): number {
@@ -61,7 +127,11 @@ export class RunStore {
     const manifest = path.join(directory, "run.json");
     if (!fs.existsSync(manifest) || fs.lstatSync(manifest).isSymbolicLink()) return undefined;
     try {
-      return JSON.parse(fs.readFileSync(manifest, "utf8")) as ScheduledRunRecord;
+      const document: unknown = JSON.parse(fs.readFileSync(manifest, "utf8"));
+      if (!isScheduledRunRecord(document, taskId, runId)) {
+        throw new Error("Run manifest has an invalid structure.");
+      }
+      return document;
     } catch (error) {
       console.error(`[scheduler] run manifest "${taskId}/${runId}" could not be loaded and was ignored`, error);
       return undefined;
