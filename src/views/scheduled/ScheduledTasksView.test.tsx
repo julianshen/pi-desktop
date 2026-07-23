@@ -286,4 +286,51 @@ describe("ScheduledTasksView", () => {
     expect(screen.queryByRole("dialog", { name: "Run inspector" })).toBeNull();
     expect(screen.queryByText("Late evidence")).toBeNull();
   });
+
+  test("review regression: a failed run switch cannot retain the previous run evidence", async () => {
+    const selectedTask = task("active", "active");
+    const runA = { ...run("run-a", "completed", 1), finalText: "Evidence from run A" };
+    const runB = run("run-b", "failed");
+    let rejectRunB!: (value: Response) => void;
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/runs/run-a")) return Promise.resolve(response({ run: runA }));
+      if (url.endsWith("/runs/run-b")) {
+        return new Promise<Response>((resolve) => {
+          rejectRunB = resolve;
+        });
+      }
+      if (url.endsWith("/api/scheduled-tasks")) {
+        return Promise.resolve(response({ tasks: [selectedTask], unreadCount: 0 }));
+      }
+      if (url.includes("/runs?limit=25")) {
+        return Promise.resolve(response({ runs: [runA, runB] }));
+      }
+      if (url.endsWith("/api/scheduled-tasks/active")) {
+        return Promise.resolve(response({
+          task: selectedTask,
+          stats: { successRate: 50, averageDurationMs: 5000 },
+          recentRuns: [runA, runB],
+        }));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    }) as unknown as typeof fetch;
+
+    render(<ScheduledTasksView {...baseProps} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open run run-a/ }));
+    await waitFor(() => expect(screen.getByText("Evidence from run A")).toBeTruthy());
+    expect(screen.getByText("report-0.md")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Open run run-b/ }));
+    expect(screen.queryByText("Evidence from run A")).toBeNull();
+    expect(screen.queryByText("report-0.md")).toBeNull();
+
+    rejectRunB(response({
+      error: { code: "run_not_found", message: "Run evidence no longer exists.", retryable: false },
+    }, 404));
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toContain("Run evidence no longer exists."));
+    expect(screen.queryByText("Evidence from run A")).toBeNull();
+    expect(screen.queryByText("report-0.md")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
+  });
 });

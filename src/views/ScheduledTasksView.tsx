@@ -72,6 +72,7 @@ export function ScheduledTasksView({ taskCreate, onCloseCreate, onCreateTask }: 
 
   const inspectRun = (run: Omit<ScheduledRunRecord, "finalText">) => {
     const request = ++inspectorRequest.current;
+    setInspectedRun(null);
     setInspectorLoading(true);
     setInspectorError(null);
     scheduled.getRun(run.taskId, run.id)
