@@ -60,6 +60,20 @@ describe("TaskForm", () => {
     });
   });
 
+  test("review regression: submits backend-valid named-weekday cron syntax", async () => {
+    installModels();
+    let submitted: ScheduledTaskInput | undefined;
+    render(<TaskForm mode="create" onSubmit={(value) => { submitted = value; return Promise.resolve(); }} onCancel={() => {}} />);
+    await waitFor(() => expect(screen.getByRole("option", { name: "Claude" })).toBeTruthy());
+    fireEvent.change(screen.getByLabelText("Task name"), { target: { value: "Monday report" } });
+    fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "Build the report" } });
+    fireEvent.change(screen.getByLabelText("Cron expression"), { target: { value: "0 9 * * Mon" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
+
+    await waitFor(() => expect(submitted?.cron).toBe("0 9 * * Mon"));
+    expect(screen.queryByText("Use a valid five-field cron expression.")).toBeNull();
+  });
+
   test("AC-8.1: a rejected server mutation remains in the form action region", async () => {
     installModels();
     render(<TaskForm mode="create" onSubmit={() => Promise.reject(new Error("The selected model is unavailable."))} onCancel={() => {}} />);

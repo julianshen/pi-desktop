@@ -95,6 +95,24 @@ const validInput = {
 };
 
 describe("SchedulerService definition lifecycle", () => {
+  test("review regression: startup exposes only validated tasks with safe IDs", async () => {
+    const context = setup();
+    const timestamp = "2026-07-22T00:00:00.000Z";
+    context.taskStore.replaceAll([
+      { ...validInput, id: "valid-task", createdAt: timestamp, updatedAt: timestamp },
+      { ...validInput, id: "invalid-cron", cron: "not a cron", createdAt: timestamp, updatedAt: timestamp },
+      { ...validInput, id: "../unsafe", createdAt: timestamp, updatedAt: timestamp },
+    ]);
+
+    await context.service.start();
+
+    expect(context.service.listTasks().map((task) => task.id)).toEqual(["valid-task"]);
+    expect(context.handles.has("valid-task")).toBe(true);
+    expect(context.handles.has("invalid-cron")).toBe(false);
+    expect(context.handles.has("../unsafe")).toBe(false);
+    expect(() => context.service.listTaskSummaries()).not.toThrow();
+  });
+
   test("AC-12.1: saved analytics emits once only after create/update durable registration matches", async () => {
     const events: DispatchedServerAnalyticsEvent[] = [];
     setServerAnalyticsSink((event) => events.push(event));

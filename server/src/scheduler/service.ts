@@ -7,6 +7,8 @@ import type { ScheduledRunFile } from "./types.js";
 import type { ScheduledRunStart } from "./session.js";
 import { trackServerEvent } from "../analytics/events.js";
 
+const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
 export interface ScheduledHandle {
   stop(): void;
   getNextRun(): Date | null;
@@ -118,11 +120,12 @@ export class SchedulerService {
     if (this.started) return;
     this.runStore.reconcileInterrupted();
     const loaded = this.taskStore.load();
-    this.tasks = new Map(loaded.map((task) => [task.id, task]));
+    this.tasks.clear();
     for (const task of loaded) {
       try {
         await this.validateTask(task);
         if (task.enabled) this.handles.set(task.id, this.register(task));
+        this.tasks.set(task.id, task);
       } catch (error) {
         console.error(`[scheduler] task "${task.id}" is invalid and was not registered`, error);
       }
@@ -401,6 +404,9 @@ export class SchedulerService {
   }
 
   private async validateTask(task: ScheduledTaskRecord): Promise<void> {
+    if (!SAFE_TASK_ID.test(task.id)) {
+      throw new SchedulerError("invalid_task_id", "Task ID is invalid.", 400);
+    }
     if (Array.from(task.name).length < 1 || Array.from(task.name).length > 120) {
       throw new SchedulerError("invalid_name", "Name must contain 1–120 characters.", 400);
     }

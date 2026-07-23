@@ -22,7 +22,7 @@ function timezoneIsValid(timezone: string): boolean {
 
 function cronLooksValid(cron: string): boolean {
   const fields = cron.trim().split(/\s+/);
-  return fields.length === 5 && fields.every((field) => /^[\d*,\-\/]+$/.test(field));
+  return fields.length === 5;
 }
 
 function initialValue(task?: ScheduledTaskSummary): TaskFormValue {
