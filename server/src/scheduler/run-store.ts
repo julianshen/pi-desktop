@@ -60,7 +60,12 @@ export class RunStore {
     if (!fs.existsSync(directory) || fs.lstatSync(directory).isSymbolicLink()) return undefined;
     const manifest = path.join(directory, "run.json");
     if (!fs.existsSync(manifest) || fs.lstatSync(manifest).isSymbolicLink()) return undefined;
-    return JSON.parse(fs.readFileSync(manifest, "utf8")) as ScheduledRunRecord;
+    try {
+      return JSON.parse(fs.readFileSync(manifest, "utf8")) as ScheduledRunRecord;
+    } catch (error) {
+      console.error(`[scheduler] run manifest "${taskId}/${runId}" could not be loaded and was ignored`, error);
+      return undefined;
+    }
   }
 
   list(taskId: string): ScheduledRunRecord[] {

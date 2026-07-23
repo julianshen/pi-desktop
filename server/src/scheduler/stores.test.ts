@@ -127,6 +127,27 @@ describe("TaskStore", () => {
 });
 
 describe("RunStore", () => {
+  test("review regression: a malformed run manifest cannot hide valid runs or abort reconciliation", () => {
+    const dataDir = scratch();
+    const store = new RunStore(dataDir);
+    const interrupted: ScheduledRunRecord = {
+      ...terminalRun("weekly-report", 200),
+      id: "interrupted",
+      status: "running",
+      completedAt: undefined,
+    };
+    store.save(interrupted);
+
+    const malformedDirectory = store.runDir("weekly-report", "malformed");
+    fs.mkdirSync(malformedDirectory, { recursive: true });
+    fs.writeFileSync(path.join(malformedDirectory, "run.json"), "{not-json");
+
+    expect(store.get("weekly-report", "malformed")).toBeUndefined();
+    expect(store.list("weekly-report").map((candidate) => candidate.id)).toEqual(["interrupted"]);
+    expect(store.reconcileInterrupted()).toBe(1);
+    expect(store.get("weekly-report", "interrupted")?.status).toBe("failed");
+  });
+
   test("AC-1.3: reconciles interrupted runs and retains only the newest 100 app-owned run directories", () => {
     const dataDir = scratch();
     const store = new RunStore(dataDir);

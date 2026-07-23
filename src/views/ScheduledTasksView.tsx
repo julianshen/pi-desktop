@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useScheduledTasks } from "../hooks/useScheduledTasks.js";
 import { TaskCreateView } from "./scheduled/TaskCreateView.js";
 import { TaskDetailView } from "./scheduled/TaskDetailView.js";
@@ -24,6 +24,7 @@ export function ScheduledTasksView({ taskCreate, onCloseCreate, onCreateTask }: 
   const [inspectedRun, setInspectedRun] = useState<ScheduledRunRecord | null>(null);
   const [inspectorLoading, setInspectorLoading] = useState(false);
   const [inspectorError, setInspectorError] = useState<string | null>(null);
+  const inspectorRequest = useRef(0);
   const inspectedHistoryRun = inspectedRun
     ? scheduled.runs.find((run) => run.id === inspectedRun.id)
     : undefined;
@@ -70,20 +71,32 @@ export function ScheduledTasksView({ taskCreate, onCloseCreate, onCreateTask }: 
   ]);
 
   const inspectRun = (run: Omit<ScheduledRunRecord, "finalText">) => {
+    const request = ++inspectorRequest.current;
     setInspectorLoading(true);
     setInspectorError(null);
     scheduled.getRun(run.taskId, run.id)
       .then(async (detail) => {
+        if (request !== inspectorRequest.current) return;
         setInspectedRun(detail);
         trackDesktopEvent({ name: "scheduled_task_run_opened", properties: { outcome: "success", run_status: detail.status, has_files: detail.files.length > 0 } });
         if (detail.unread) await scheduled.markRunRead(detail.taskId, detail.id);
       })
       .catch((cause: unknown) => {
+        if (request !== inspectorRequest.current) return;
         const message = cause instanceof Error ? cause.message : "Run evidence could not be loaded.";
         setInspectorError(message);
         trackDesktopEvent({ name: "scheduled_task_run_opened", properties: { outcome: /not found/i.test(message) ? "not_found" : /unavailable|failed \(5\d\d\)/i.test(message) ? "unavailable" : "failed", run_status: run.status, has_files: run.files.length > 0 } });
       })
-      .finally(() => setInspectorLoading(false));
+      .finally(() => {
+        if (request === inspectorRequest.current) setInspectorLoading(false);
+      });
+  };
+
+  const closeInspector = () => {
+    inspectorRequest.current += 1;
+    setInspectedRun(null);
+    setInspectorLoading(false);
+    setInspectorError(null);
   };
 
   if (taskCreate) return (
@@ -144,7 +157,7 @@ export function ScheduledTasksView({ taskCreate, onCloseCreate, onCreateTask }: 
         onSelectRun={inspectRun}
       />
       {(inspectedRun || inspectorLoading || inspectorError) && (
-        <RunDetail run={inspectedRun} loading={inspectorLoading} error={inspectorError} onClose={() => { setInspectedRun(null); setInspectorError(null); }} />
+        <RunDetail run={inspectedRun} loading={inspectorLoading} error={inspectorError} onClose={closeInspector} />
       )}
       {editing && scheduled.selectedTask && (
         <TaskForm

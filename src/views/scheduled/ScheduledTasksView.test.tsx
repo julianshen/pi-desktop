@@ -245,4 +245,45 @@ describe("ScheduledTasksView", () => {
     expect(screen.getByText("report-0.md")).toBeTruthy();
     expect(detailCalls).toBeGreaterThanOrEqual(2);
   });
+
+  test("review regression: closing a loading inspector keeps a late detail response dismissed", async () => {
+    const selectedTask = task("active", "active");
+    const selectedRun = run("slow-run", "completed");
+    let resolveDetail!: (value: Response) => void;
+    global.fetch = mock((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/runs/slow-run")) {
+        return new Promise<Response>((resolve) => {
+          resolveDetail = resolve;
+        });
+      }
+      if (url.endsWith("/api/scheduled-tasks")) {
+        return Promise.resolve(response({ tasks: [selectedTask], unreadCount: 0 }));
+      }
+      if (url.includes("/runs?limit=25")) {
+        return Promise.resolve(response({ runs: [selectedRun] }));
+      }
+      if (url.endsWith("/api/scheduled-tasks/active")) {
+        return Promise.resolve(response({
+          task: selectedTask,
+          stats: { successRate: 100, averageDurationMs: 5000 },
+          recentRuns: [selectedRun],
+        }));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    }) as unknown as typeof fetch;
+
+    render(<ScheduledTasksView {...baseProps} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open run slow-run/ }));
+    const inspector = await screen.findByRole("dialog", { name: "Run inspector" });
+    fireEvent.click(screen.getByRole("button", { name: "Close run inspector" }));
+    expect(inspector.isConnected).toBe(false);
+
+    resolveDetail(response({ run: { ...selectedRun, finalText: "Late evidence" } }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.queryByRole("dialog", { name: "Run inspector" })).toBeNull();
+    expect(screen.queryByText("Late evidence")).toBeNull();
+  });
 });
