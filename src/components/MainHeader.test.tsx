@@ -88,11 +88,13 @@ function Harness({
   conversations,
   activeConv = "conv-1",
   onSetModel,
+  onOpenTaskCreate,
   view = "chat",
 }: {
   conversations: UseConversationsResult;
   activeConv?: string;
   onSetModel?: (name: string) => void;
+  onOpenTaskCreate?: () => void;
   view?: ShellState["view"];
 }) {
   const [modelOpen, setModelOpen] = useState(false);
@@ -106,7 +108,6 @@ function Harness({
     model: "pi-2 Sonnet",
     activeFilter: "All",
     settingsSection: "providers",
-    taskOpen: null,
     taskCreate: false,
   };
   const actions: ShellActions = {
@@ -119,9 +120,7 @@ function Harness({
     setModel: onSetModel ?? noop,
     setActiveFilter: noop,
     setSettingsSection: noop,
-    openTask: noop,
-    backToTasks: noop,
-    openTaskCreate: noop,
+    openTaskCreate: onOpenTaskCreate ?? noop,
     closeTaskCreate: noop,
   };
   return <MainHeader state={state} actions={actions} conversations={conversations} />;
@@ -139,6 +138,23 @@ afterEach(() => {
 });
 
 describe("MainHeader", () => {
+  test("scheduled tasks exposes only the real create action and no decorative filter control", () => {
+    const onOpenTaskCreate = mock(() => {});
+    global.fetch = mock(() => Promise.resolve(jsonResponse([]))) as unknown as typeof fetch;
+
+    render(
+      <Harness
+        conversations={makeConversationsResult()}
+        view="scheduled"
+        onOpenTaskCreate={onOpenTaskCreate}
+      />,
+    );
+
+    expect(screen.queryByText("Filter tasks")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "New schedule" }));
+    expect(onOpenTaskCreate).toHaveBeenCalledTimes(1);
+  });
+
   test('AC-11.1: shows the ModelPickerLoading state ("Loading models…") while GET /api/models is in flight, not the hardcoded "pi-2 Sonnet"', async () => {
     let resolveFetch!: (res: Response) => void;
     const pending = new Promise<Response>((resolve) => {

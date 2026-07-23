@@ -9,10 +9,7 @@ import { trackDesktopEvent } from "../lib/analytics.js";
 import { TaskListView } from "./scheduled/TaskListView.js";
 
 interface ScheduledTasksViewProps {
-  taskOpen: number | null;
   taskCreate: boolean;
-  onOpenTask: (index: number) => void;
-  onBackToTasks: () => void;
   onCloseCreate: () => void;
   onCreateTask?: () => void;
 }

@@ -324,10 +324,7 @@ function App() {
               {state.view === "artifacts" && <ArtifactStoreView />}
               {state.view === "scheduled" && (
                 <ScheduledTasksView
-                  taskOpen={state.taskOpen}
                   taskCreate={state.taskCreate}
-                  onOpenTask={actions.openTask}
-                  onBackToTasks={actions.backToTasks}
                   onCloseCreate={actions.closeTaskCreate}
                   onCreateTask={actions.openTaskCreate}
                 />

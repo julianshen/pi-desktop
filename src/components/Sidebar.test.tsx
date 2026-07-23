@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Sidebar } from "./Sidebar.js";
-import type { ConversationMeta } from "../state/useConversations.js";
+import type { ConversationMeta, UseConversationsResult } from "../state/useConversations.js";
 
 /**
  * Task 10: same bun:test + happy-dom + @testing-library/react harness Task 9
@@ -57,6 +57,20 @@ afterEach(() => {
 });
 
 describe("Sidebar", () => {
+  test("scheduled tasks uses its real in-view navigator instead of the mock shell filter sidebar", () => {
+    const { container } = render(
+      <Sidebar
+        {...baseProps({ view: "scheduled" })}
+        conversations={{} as UseConversationsResult}
+      />,
+    );
+
+    expect(container.innerHTML).toBe("");
+    expect(screen.queryByText("All")).toBeNull();
+    expect(screen.queryByText("Active")).toBeNull();
+    expect(screen.queryByText("Failed")).toBeNull();
+  });
+
   test("AC-10.1: shows the ConversationListLoading spinner state while conversations are fetching, not the old mock list", async () => {
     let resolveFetch!: (res: Response) => void;
     const pending = new Promise<Response>((resolve) => {
