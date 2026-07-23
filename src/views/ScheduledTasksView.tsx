@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useScheduledTasks } from "../hooks/useScheduledTasks.js";
 import { TaskCreateView } from "./scheduled/TaskCreateView.js";
 import { TaskDetailView } from "./scheduled/TaskDetailView.js";
@@ -24,6 +24,50 @@ export function ScheduledTasksView({ taskCreate, onCloseCreate, onCreateTask }: 
   const [inspectedRun, setInspectedRun] = useState<ScheduledRunRecord | null>(null);
   const [inspectorLoading, setInspectorLoading] = useState(false);
   const [inspectorError, setInspectorError] = useState<string | null>(null);
+  const inspectedHistoryRun = inspectedRun
+    ? scheduled.runs.find((run) => run.id === inspectedRun.id)
+    : undefined;
+
+  useEffect(() => {
+    if (
+      !inspectedRun
+      || inspectedRun.status !== "running"
+      || !inspectedHistoryRun
+      || inspectedHistoryRun.status === "running"
+    ) {
+      return;
+    }
+    let cancelled = false;
+    scheduled.getRun(inspectedRun.taskId, inspectedRun.id)
+      .then(async (detail) => {
+        if (cancelled) return;
+        setInspectedRun(detail);
+        setInspectorError(null);
+        if (detail.unread) {
+          await scheduled.markRunRead(detail.taskId, detail.id);
+          if (!cancelled) {
+            setInspectedRun((current) => current?.id === detail.id
+              ? { ...current, unread: false }
+              : current);
+          }
+        }
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled) {
+          setInspectorError(cause instanceof Error ? cause.message : "Run evidence could not be refreshed.");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    inspectedHistoryRun?.status,
+    inspectedRun?.id,
+    inspectedRun?.status,
+    inspectedRun?.taskId,
+    scheduled.getRun,
+    scheduled.markRunRead,
+  ]);
 
   const inspectRun = (run: Omit<ScheduledRunRecord, "finalText">) => {
     setInspectorLoading(true);

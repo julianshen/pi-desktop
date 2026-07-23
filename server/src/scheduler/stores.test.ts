@@ -101,6 +101,29 @@ describe("TaskStore", () => {
     expect(fs.readFileSync(path.join(agentDir, "scheduled-agents.json"), "utf8")).toBe(before);
     expect(fs.existsSync(path.join(agentDir, "scheduled-agents.json.tmp"))).toBe(false);
   });
+
+  test("review regression: malformed config entries are isolated without hiding valid tasks or aborting load", () => {
+    const agentDir = scratch();
+    const configPath = path.join(agentDir, "scheduled-agents.json");
+    fs.writeFileSync(configPath, JSON.stringify([
+      null,
+      { id: "missing-prompt", cron: "0 8 * * *" },
+      {
+        id: "valid",
+        cron: "0 9 * * *",
+        prompt: "Run the valid task.",
+        timezone: "UTC",
+      },
+    ]));
+
+    const store = new TaskStore(agentDir);
+    expect(store.load()).toEqual([
+      expect.objectContaining({ id: "valid", prompt: "Run the valid task." }),
+    ]);
+
+    fs.writeFileSync(configPath, "{not-json");
+    expect(store.load()).toEqual([]);
+  });
 });
 
 describe("RunStore", () => {

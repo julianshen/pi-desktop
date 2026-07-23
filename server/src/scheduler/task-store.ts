@@ -18,14 +18,21 @@ export interface TaskStoreFileSystem {
 type StoredTask = Partial<ScheduledTaskRecord> & Pick<ScheduledTaskRecord, "id" | "cron" | "prompt">;
 
 function asStoredTasks(value: unknown): StoredTask[] {
-  if (!Array.isArray(value)) throw new Error("scheduled-agents.json must contain an array");
-  return value.map((candidate) => {
-    if (!candidate || typeof candidate !== "object") throw new Error("Scheduled task must be an object");
+  if (!Array.isArray(value)) {
+    console.error("[scheduler] scheduled-agents.json must contain an array; no tasks were loaded");
+    return [];
+  }
+  return value.flatMap((candidate, index) => {
+    if (!candidate || typeof candidate !== "object") {
+      console.error(`[scheduler] scheduled task at index ${index} is not an object and was ignored`);
+      return [];
+    }
     const task = candidate as Record<string, unknown>;
     if (typeof task.id !== "string" || typeof task.cron !== "string" || typeof task.prompt !== "string") {
-      throw new Error("Scheduled task requires string id, cron, and prompt");
+      console.error(`[scheduler] scheduled task at index ${index} is missing string id, cron, or prompt and was ignored`);
+      return [];
     }
-    return task as unknown as StoredTask;
+    return [task as unknown as StoredTask];
   });
 }
 
@@ -44,7 +51,14 @@ export class TaskStore {
   load(): ScheduledTaskRecord[] {
     if (!this.fileSystem.existsSync(this.configPath)) return [];
     const timestamp = this.fileSystem.statSync(this.configPath).mtime.toISOString();
-    const stored = asStoredTasks(JSON.parse(this.fileSystem.readFileSync(this.configPath, "utf8")));
+    let document: unknown;
+    try {
+      document = JSON.parse(this.fileSystem.readFileSync(this.configPath, "utf8"));
+    } catch (error) {
+      console.error("[scheduler] scheduled-agents.json is not valid JSON; no tasks were loaded", error);
+      return [];
+    }
+    const stored = asStoredTasks(document);
     const hostTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
     return stored.map((task) => ({

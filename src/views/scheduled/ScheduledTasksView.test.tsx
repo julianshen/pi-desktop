@@ -196,4 +196,53 @@ describe("ScheduledTasksView", () => {
     expect(screen.getByText("Warehouse unavailable")).toBeTruthy();
     await waitFor(() => expect(calls.some((call) => call.includes("POST") && call.endsWith("/runs/failed-run/read"))).toBe(true));
   });
+
+  test("review regression: an open running inspector refreshes to terminal evidence without reopening", async () => {
+    const runningTask = task("active", "running");
+    const runningRun = {
+      ...run("inspected-run", "running"),
+      completedAt: undefined,
+      durationMs: undefined,
+    };
+    const completedRun = {
+      ...run("inspected-run", "completed", 1),
+      finalText: "Fresh terminal evidence",
+      unread: true,
+    };
+    let complete = false;
+    let detailCalls = 0;
+    global.fetch = mock((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/runs/inspected-run/read") && init?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      if (url.endsWith("/runs/inspected-run")) {
+        detailCalls += 1;
+        return Promise.resolve(response({ run: complete ? completedRun : runningRun }));
+      }
+      if (url.endsWith("/api/scheduled-tasks")) {
+        return Promise.resolve(response({ tasks: [runningTask], unreadCount: complete ? 1 : 0 }));
+      }
+      if (url.includes("/runs?limit=25")) {
+        return Promise.resolve(response({ runs: [complete ? completedRun : runningRun] }));
+      }
+      if (url.endsWith("/api/scheduled-tasks/active")) {
+        return Promise.resolve(response({
+          task: runningTask,
+          stats: { successRate: complete ? 100 : 0, averageDurationMs: 5000 },
+          recentRuns: [complete ? completedRun : runningRun],
+        }));
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    }) as unknown as typeof fetch;
+
+    render(<ScheduledTasksView {...baseProps} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Open run inspected-run/ }));
+    await waitFor(() => expect(screen.getByText("This run is still in progress. Evidence refreshes from durable state.")).toBeTruthy());
+
+    complete = true;
+    await waitFor(() => expect(screen.getByText("Fresh terminal evidence")).toBeTruthy(), { timeout: 2_500 });
+    expect(screen.getByText("report-0.md")).toBeTruthy();
+    expect(detailCalls).toBeGreaterThanOrEqual(2);
+  });
 });
