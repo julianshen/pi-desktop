@@ -39,6 +39,17 @@ fn safe_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+fn safe_scheduled_id(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value.bytes().skip(1).all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
+        })
+}
+
 fn safe_file_name(value: &str) -> String {
     value
         .rsplit(['/', '\\'])
@@ -118,7 +129,7 @@ fn resolve_scheduled_source(
     file_id: &str,
 ) -> Result<PathBuf, SaveError> {
     for value in [task_id, run_id, file_id] {
-        if !safe_id(value) {
+        if !safe_scheduled_id(value) {
             return Err(SaveError::InvalidId(
                 "scheduled-file identifier is invalid".into(),
             ));
@@ -383,7 +394,8 @@ mod tests {
 
     #[test]
     fn scheduled_files_are_opaque_id_scoped_and_reject_traversal_or_symlinks() {
-        let base = std::env::temp_dir().join(format!("pi-scheduled-files-{}", uuid::Uuid::new_v4()));
+        let base =
+            std::env::temp_dir().join(format!("pi-scheduled-files-{}", uuid::Uuid::new_v4()));
         let root = base.join("scheduler-runs");
         let files = root.join("task").join("run").join("files");
         fs::create_dir_all(&files).unwrap();
@@ -393,8 +405,20 @@ mod tests {
             resolve_scheduled_source(&root, "task", "run", "file").unwrap(),
             source.canonicalize().unwrap()
         );
+        let dotted_files = root.join("task.v1").join("run.v1").join("files");
+        fs::create_dir_all(&dotted_files).unwrap();
+        let dotted_source = dotted_files.join("file.v1");
+        fs::write(&dotted_source, b"scheduled bytes").unwrap();
+        assert_eq!(
+            resolve_scheduled_source(&root, "task.v1", "run.v1", "file.v1").unwrap(),
+            dotted_source.canonicalize().unwrap()
+        );
         assert!(matches!(
             resolve_scheduled_source(&root, "..", "run", "file"),
+            Err(SaveError::InvalidId(_))
+        ));
+        assert!(matches!(
+            resolve_scheduled_source(&root, "-task", "run", "file"),
             Err(SaveError::InvalidId(_))
         ));
         #[cfg(unix)]

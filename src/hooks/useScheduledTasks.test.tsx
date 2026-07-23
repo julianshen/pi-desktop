@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useScheduledTasks } from "./useScheduledTasks.js";
 import type { ScheduledTaskSummary } from "../views/scheduled/types.js";
+import type { ScheduledRunRecord } from "../views/scheduled/types.js";
 
 const originalFetch = global.fetch;
 afterEach(() => {
@@ -31,6 +32,26 @@ function task(id: string, status: ScheduledTaskSummary["status"] = "active"): Sc
     nextRun: status === "paused" ? null : "2026-08-01T09:00:00.000Z",
     scheduleLabel: "0 9 * * 1 · UTC",
     unreadCount: 0,
+  };
+}
+
+function run(id: string): Omit<ScheduledRunRecord, "finalText"> {
+  return {
+    id,
+    taskId: "one",
+    trigger: "cron",
+    status: "completed",
+    completedAt: "2026-07-01T00:00:00.000Z",
+    durationMs: 10,
+    files: [],
+    unread: false,
+    definition: {
+      name: "Task one",
+      prompt: "Do the work",
+      cron: "0 9 * * 1",
+      timezone: "UTC",
+      enabled: true,
+    },
   };
 }
 
@@ -165,5 +186,49 @@ describe("useScheduledTasks", () => {
     await waitFor(() => expect(detailCalls).toBeGreaterThanOrEqual(2), { timeout: 500 });
     await waitFor(() => expect(result.current.stats?.successRate).toBe(100));
     expect(result.current.runs[0]?.id).toBe("completed-run");
+  });
+
+  test("review regression: polling merges the first page without discarding loaded older runs or its cursor", async () => {
+    let listCalls = 0;
+    let firstPageCalls = 0;
+    global.fetch = mock((url: string) => {
+      if (url.endsWith("/api/scheduled-tasks")) {
+        listCalls += 1;
+        return Promise.resolve(response({
+          tasks: [task("one")],
+          unreadCount: 0,
+        }));
+      }
+      if (url.endsWith("/api/scheduled-tasks/one")) {
+        return Promise.resolve(response({
+          task: task("one"),
+          stats: { successRate: 100, averageDurationMs: 10 },
+          recentRuns: [],
+        }));
+      }
+      if (url.includes("cursor=page-2")) {
+        return Promise.resolve(response({ runs: [run("older")], nextCursor: "page-3" }));
+      }
+      if (url.includes("/runs?limit=25")) {
+        firstPageCalls += 1;
+        return Promise.resolve(response({
+          runs: firstPageCalls === 1 ? [run("latest")] : [run("new"), run("latest")],
+          nextCursor: "page-2",
+        }));
+      }
+      return Promise.reject(new Error(`unexpected ${url}`));
+    }) as unknown as typeof fetch;
+
+    const { result } = renderHook(() => useScheduledTasks({ pollMs: 100, runningPollMs: 150 }));
+    await waitFor(() => expect(result.current.runs.map((item) => item.id)).toEqual(["latest"]));
+    await act(async () => {
+      await result.current.loadMoreRuns();
+    });
+    expect(result.current.runs.map((item) => item.id)).toEqual(["latest", "older"]);
+    expect(result.current.nextCursor).toBe("page-3");
+
+    await waitFor(() => expect(firstPageCalls).toBeGreaterThanOrEqual(2), { timeout: 500 });
+    await waitFor(() => expect(result.current.runs.map((item) => item.id)).toEqual(["new", "latest", "older"]));
+    expect(result.current.nextCursor).toBe("page-3");
   });
 });

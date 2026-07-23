@@ -6,8 +6,7 @@ import type { ScheduledRunRecord, ScheduledRunTrigger, ScheduledTaskRecord } fro
 import type { ScheduledRunFile } from "./types.js";
 import type { ScheduledRunStart } from "./session.js";
 import { trackServerEvent } from "../analytics/events.js";
-
-const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+import { isSafeScheduledId } from "./ids.js";
 
 export interface ScheduledHandle {
   stop(): void;
@@ -187,6 +186,9 @@ export class SchedulerService {
         trackServerEvent({ name: "scheduled_task_saved", properties: { operation: "create", enabled: candidate.enabled, model_mode: candidate.modelId ? "override" : "default" } });
         return candidate;
       } catch (error) {
+        this.handles.get(candidate.id)?.stop();
+        this.handles.delete(candidate.id);
+        this.tasks.delete(candidate.id);
         this.taskStore.replaceAll(previous);
         throw error;
       }
@@ -220,6 +222,9 @@ export class SchedulerService {
         trackServerEvent({ name: "scheduled_task_saved", properties: { operation: "update", enabled: candidate.enabled, model_mode: candidate.modelId ? "override" : "default" } });
         return candidate;
       } catch (error) {
+        this.handles.get(taskId)?.stop();
+        this.handles.delete(taskId);
+        this.tasks.set(taskId, existing);
         this.taskStore.replaceAll(previous);
         if (existing.enabled) this.handles.set(taskId, this.register(existing));
         throw error;
@@ -404,7 +409,7 @@ export class SchedulerService {
   }
 
   private async validateTask(task: ScheduledTaskRecord): Promise<void> {
-    if (!SAFE_TASK_ID.test(task.id)) {
+    if (!isSafeScheduledId(task.id)) {
       throw new SchedulerError("invalid_task_id", "Task ID is invalid.", 400);
     }
     if (Array.from(task.name).length < 1 || Array.from(task.name).length > 120) {

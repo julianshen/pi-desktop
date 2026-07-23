@@ -15,7 +15,7 @@ export type DispatchedServerAnalyticsEvent = ServerAnalyticsEvent & { platform: 
 type EventSink = (event: DispatchedServerAnalyticsEvent) => void;
 let sink: EventSink = () => {};
 
-const sensitive = new Set(["prompt", "content", "query", "url", "key", "filename", "path", "hash", "result", "taskid", "runid", "modelid", "cron", "timezone", "finaltext", "errormessage", "toolarguments", "target", "filemetadata"]);
+const sensitive = new Set(["prompt", "content", "query", "url", "key", "filename", "path", "hash", "toolresult", "taskid", "runid", "modelid", "cron", "timezone", "finaltext", "errormessage", "toolarguments", "target", "filemetadata"]);
 
 function assertPrivate(value: unknown): void {
   if (!value || typeof value !== "object") return;

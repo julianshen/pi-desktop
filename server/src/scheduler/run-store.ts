@@ -35,8 +35,24 @@ export class RunStore {
     fs.mkdirSync(directory, { recursive: true });
     const destination = path.join(directory, "run.json");
     const temporary = path.join(directory, "run.json.tmp");
-    fs.writeFileSync(temporary, `${JSON.stringify(run, null, 2)}\n`, { mode: 0o600 });
+    const descriptor = fs.openSync(temporary, "w", 0o600);
+    try {
+      fs.writeFileSync(descriptor, `${JSON.stringify(run, null, 2)}\n`, "utf8");
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
     fs.renameSync(temporary, destination);
+    try {
+      const directoryDescriptor = fs.openSync(directory, "r");
+      try {
+        fs.fsyncSync(directoryDescriptor);
+      } finally {
+        fs.closeSync(directoryDescriptor);
+      }
+    } catch {
+      // The manifest is committed; some platforms do not support directory fsync.
+    }
   }
 
   get(taskId: string, runId: string): ScheduledRunRecord | undefined {

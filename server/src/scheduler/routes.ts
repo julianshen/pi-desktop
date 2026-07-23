@@ -143,7 +143,12 @@ export function createScheduledTasksRouter(service: SchedulerService): Router {
     response.setHeader("Content-Type", resolved.file.mediaType);
     response.setHeader("Content-Length", String(fs.statSync(resolved.path).size));
     response.setHeader("Content-Disposition", `attachment; filename="${name}"`);
-    fs.createReadStream(resolved.path).pipe(response);
+    const stream = fs.createReadStream(resolved.path);
+    stream.on("error", (streamError) => {
+      console.error("[scheduled-tasks] file stream error", streamError);
+      response.destroy(streamError);
+    });
+    stream.pipe(response);
   }));
 
   router.use((

@@ -17,6 +17,7 @@ interface AwarenessTask { id: string; name: string; unreadCount: number }
 interface AwarenessRun { id: string; status: string; unread: boolean }
 
 const handledFailureRunIds = new Set<string>();
+const MAX_HANDLED_FAILURE_RUN_IDS = 500;
 const nativeNotification: NotificationBridge = {
   isPermissionGranted: async () => (await import("@tauri-apps/plugin-notification")).isPermissionGranted(),
   requestPermission: async () => (await import("@tauri-apps/plugin-notification")).requestPermission(),
@@ -26,6 +27,10 @@ const nativeNotification: NotificationBridge = {
 async function notifyFailureOnce(task: AwarenessTask, run: AwarenessRun, bridge: NotificationBridge): Promise<void> {
   if (handledFailureRunIds.has(run.id)) return;
   handledFailureRunIds.add(run.id);
+  if (handledFailureRunIds.size > MAX_HANDLED_FAILURE_RUN_IDS) {
+    const oldest = handledFailureRunIds.values().next().value;
+    if (oldest !== undefined) handledFailureRunIds.delete(oldest);
+  }
   const appVisible = document.visibilityState === "visible";
   try {
     let granted = await bridge.isPermissionGranted();

@@ -34,6 +34,14 @@ interface ApiErrorBody {
   error?: { message?: string };
 }
 
+function mergeRunHistory(
+  refreshed: Array<Omit<ScheduledRunRecord, "finalText">>,
+  current: Array<Omit<ScheduledRunRecord, "finalText">>,
+): Array<Omit<ScheduledRunRecord, "finalText">> {
+  const refreshedIds = new Set(refreshed.map((run) => run.id));
+  return [...refreshed, ...current.filter((run) => !refreshedIds.has(run.id))];
+}
+
 async function apiJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, init);
   if (!response.ok) {
@@ -87,6 +95,7 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
   const [detailRefreshRevision, setDetailRefreshRevision] = useState(0);
   const mountedRef = useRef(true);
   const listRequestRef = useRef(0);
+  const loadedHistoryTaskRef = useRef<string | null>(null);
 
   useEffect(() => () => {
     mountedRef.current = false;
@@ -144,6 +153,7 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
 
   useEffect(() => {
     if (!visible || !selectedTaskId) {
+      loadedHistoryTaskRef.current = null;
       setSelectedTask(null);
       setStats(null);
       setRuns([]);
@@ -163,10 +173,17 @@ export function useScheduledTasks(options: ScheduledTasksOptions = {}) {
       }),
     ]).then(([detail, history]) => {
       if (stopped) return;
+      const isInitialTaskLoad = loadedHistoryTaskRef.current !== selectedTaskId;
+      loadedHistoryTaskRef.current = selectedTaskId;
       setSelectedTask(detail.task);
       setStats(detail.stats);
-      setRuns(history.runs);
-      setNextCursor(history.nextCursor ?? null);
+      if (isInitialTaskLoad) {
+        setRuns(history.runs);
+        setNextCursor(history.nextCursor ?? null);
+      } else {
+        setRuns((current) => mergeRunHistory(history.runs, current));
+        setNextCursor((current) => current ?? history.nextCursor ?? null);
+      }
       setError(null);
     }).catch((cause: unknown) => {
       if (!stopped && !(cause instanceof DOMException && cause.name === "AbortError")) {

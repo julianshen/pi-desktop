@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import type { ScheduledRunRecord } from "./types.js";
+import { formatDuration } from "./format.js";
 
 type JournalFilter = "all" | "failed" | "files";
 
@@ -7,11 +8,6 @@ function when(run: Omit<ScheduledRunRecord, "finalText">): string {
   const value = run.startedAt ?? run.scheduledFor;
   if (!value) return "Start time unavailable";
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
-}
-
-function duration(value: number | undefined): string {
-  if (value === undefined) return "—";
-  return value < 1_000 ? `${value}ms` : `${(value / 1_000).toFixed(1)}s`;
 }
 
 const runLabel: Record<ScheduledRunRecord["status"], string> = {
@@ -65,7 +61,7 @@ export function RunHistory({
               {run.error?.message ?? (run.files.length ? `${run.files.length} generated file${run.files.length === 1 ? "" : "s"}` : "No generated files")}
             </div>
             <div className="scheduled-run-facts">
-              <span>{duration(run.durationMs)}</span>
+              <span>{formatDuration(run.durationMs)}</span>
               <span className={`scheduled-run-status scheduled-run-status-${run.status}`}>{runLabel[run.status]}</span>
               {run.unread && <span className="scheduled-unread-dot" aria-label="Unread run">●</span>}
             </div>
@@ -83,10 +79,16 @@ export function RunHistory({
   );
 }
 
+const shortFilterLabel: Record<string, string> = {
+  "All runs": "All",
+  "Failed runs": "Failed",
+  "Runs with files": "Files",
+};
+
 function FilterButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
   return (
     <button type="button" className={active ? "seg-opt active" : "seg-opt"} aria-pressed={active} aria-label={label} onClick={onClick}>
-      {label.replace(" runs", "")}
+      {shortFilterLabel[label] ?? label}
     </button>
   );
 }

@@ -293,7 +293,7 @@ body {
 .scheduled-inspector-file span, .scheduled-inspector-file small { display: block; }
 .scheduled-inspector-file small { color: var(--color-neutral-600); margin-top: 2px; }
 .scheduled-save-state { margin-top: 7px; font-size: 11px; }
-.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); clip-path: inset(50%); white-space: nowrap; border: 0; }
 @media (max-width: 1149px) {
   .scheduled-console { grid-template-columns: minmax(240px, 280px) minmax(0, 1fr); }
   .scheduled-definition { grid-template-columns: 1fr; }

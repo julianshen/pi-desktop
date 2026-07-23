@@ -179,6 +179,24 @@ describe("SchedulerService definition lifecycle", () => {
     expect(context.taskStore.load()).toHaveLength(1);
   });
 
+  test("review regression: failed commit verification rolls back definitions, task maps, and cron handles", async () => {
+    const createContext = setup();
+    await createContext.service.start();
+    createContext.taskStore.load = () => [];
+    await expect(createContext.service.create(validInput)).rejects.toMatchObject({ code: "commit_mismatch" });
+    expect(createContext.service.listTasks()).toEqual([]);
+    expect(createContext.handles.size).toBe(0);
+
+    const updateContext = setup();
+    await updateContext.service.start();
+    const existing = await updateContext.service.create(validInput);
+    updateContext.taskStore.load = () => [];
+    await expect(updateContext.service.update(existing.id, { cron: "30 10 * * 2" }))
+      .rejects.toMatchObject({ code: "commit_mismatch" });
+    expect(updateContext.service.listTasks()).toEqual([existing]);
+    expect(updateContext.handles.get(existing.id)?.cron).toBe(validInput.cron);
+  });
+
   test("AC-2.3: default-model tasks stay unpinned while explicit models validate and remain captured", async () => {
     const context = setup();
     await context.service.start();

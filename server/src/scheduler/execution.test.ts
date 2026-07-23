@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { RunStore } from "./run-store.js";
 import {
+  createScheduledSession,
   ScheduledRunExecutor,
   type ScheduledSessionFactory,
   type ScheduledSessionHandle,
@@ -169,5 +170,39 @@ describe("ScheduledRunExecutor", () => {
       error: { code: "execution_failed", message: "provider unavailable", retryable: false },
     });
     expect(executor.isActive("reports")).toBe(false);
+  });
+
+  test("review regression: a dispose failure is non-fatal and cannot leave the task guard wedged", async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-desktop-scheduled-dispose-"));
+    const runStore = new RunStore(dataDir);
+    let nextId = 0;
+    const executor = new ScheduledRunExecutor({
+      runStore,
+      id: () => `dispose-${++nextId}`,
+      sessionFactory: async () => ({
+        prompt: async () => {},
+        messages: () => [{ role: "assistant", content: "Done" }],
+        dispose: () => {
+          throw new Error("dispose failed");
+        },
+      }),
+    });
+
+    await expect(executor.run(task("dispose-task"), "manual")).resolves.toMatchObject({ status: "completed" });
+    expect(executor.isActive("dispose-task")).toBe(false);
+    await expect(executor.run(task("dispose-task"), "manual")).resolves.toMatchObject({ status: "completed" });
+  });
+
+  test("review regression: malformed task IDs are rejected before a scheduled workspace path is created", async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-desktop-scheduled-id-"));
+    const runStore = new RunStore(dataDir);
+    const malformed = task("../escape");
+
+    expect(() => new ScheduledRunExecutor({ runStore }).start(malformed, "manual")).toThrow("Invalid task id");
+    await expect(createScheduledSession(
+      malformed,
+      { runId: "run", publishFile: () => {} },
+      runStore,
+    )).rejects.toThrow("Invalid task id");
   });
 });

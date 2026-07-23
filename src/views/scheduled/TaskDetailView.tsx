@@ -3,6 +3,7 @@ import { PlayIcon } from "../../components/icons.js";
 import { HealthBadge } from "./TaskListView.js";
 import { RunHistory } from "./RunHistory.js";
 import type { ScheduledRunRecord, ScheduledTaskStats, ScheduledTaskSummary } from "./types.js";
+import { formatDuration } from "./format.js";
 
 function timestamp(value: string | null | undefined): string {
   if (!value) return "—";
@@ -10,12 +11,6 @@ function timestamp(value: string | null | undefined): string {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(new Date(value));
-}
-
-function duration(value: number | undefined): string {
-  if (value === undefined) return "—";
-  if (value < 1_000) return `${value}ms`;
-  return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)}s`;
 }
 
 export function TaskDetailView({
@@ -76,7 +71,7 @@ export function TaskDetailView({
         <Metric label="Next run" value={task.enabled ? timestamp(task.nextRun) : "Paused"} />
         <Metric label="Last run" value={timestamp(task.lastRun?.completedAt ?? task.lastRun?.startedAt)} />
         <Metric label="Success rate" value={stats ? `${stats.successRate}%` : "—"} />
-        <Metric label="Avg duration" value={duration(stats?.averageDurationMs)} />
+        <Metric label="Avg duration" value={formatDuration(stats?.averageDurationMs)} />
       </div>
 
       <Blueprint className="scheduled-definition">

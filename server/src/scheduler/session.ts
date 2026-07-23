@@ -20,6 +20,7 @@ import type {
   ScheduledTaskSnapshot,
 } from "./types.js";
 import { countBucket, durationBucket, trackServerEvent } from "../analytics/events.js";
+import { assertSafeScheduledId } from "./ids.js";
 
 export interface ScheduledSessionMessage {
   role: string;
@@ -115,6 +116,7 @@ export class ScheduledRunExecutor {
     trigger: ScheduledRunTrigger,
     scheduledFor?: string,
   ): ScheduledRunStart {
+    assertSafeScheduledId(task.id, "task id");
     const runId = this.id();
     if (this.active.has(task.id)) {
       const skipped: ScheduledRunRecord = {
@@ -200,10 +202,14 @@ export class ScheduledRunExecutor {
         unread: true,
       };
     } finally {
-      session?.dispose();
+      this.active.delete(task.id);
+      try {
+        session?.dispose();
+      } catch (disposeError) {
+        console.error("[scheduled-tasks] session dispose failed", disposeError);
+      }
       this.runStore.save(record);
       this.runStore.prune(task.id);
-      this.active.delete(task.id);
       trackServerEvent({
         name: "scheduled_task_run_terminal",
         properties: {
@@ -231,6 +237,7 @@ export async function createScheduledSession(
   context: ScheduledSessionContext,
   runStore: RunStore,
 ): Promise<ScheduledSessionHandle> {
+  assertSafeScheduledId(task.id, "task id");
   const cwd = path.join(env.dataDir, "scheduled", task.id);
   fs.mkdirSync(cwd, { recursive: true });
   const { authStorage, modelRegistry, model: defaultModel } = await getAgentDeps();
