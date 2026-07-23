@@ -19,4 +19,18 @@ describe("privacy-safe desktop analytics", () => {
       expect(() => trackDesktopEvent({ name: "generated_file_save_terminal", properties: { outcome: "saved", media_category: "text", size_bucket: "under_1mib", nested: { [field]: "private" } } } as never)).toThrow("Analytics field is forbidden");
     }
   });
+
+  test("AC-13.1: scheduled opened/notified outcomes dispatch only approved status booleans and enums", () => {
+    const events: DispatchedDesktopAnalyticsEvent[] = [];
+    setDesktopAnalyticsSink((event) => events.push(event));
+    trackDesktopEvent({ name: "scheduled_task_run_opened", properties: { outcome: "success", run_status: "completed", has_files: true } });
+    trackDesktopEvent({ name: "scheduled_task_failure_notified", properties: { outcome: "permission_denied", app_visible: false } });
+    expect(events).toEqual([
+      { name: "scheduled_task_run_opened", platform: "desktop", properties: { outcome: "success", run_status: "completed", has_files: true } },
+      { name: "scheduled_task_failure_notified", platform: "desktop", properties: { outcome: "permission_denied", app_visible: false } },
+    ]);
+    for (const field of ["taskId", "runId", "prompt", "errorMessage", "fileMetadata", "path"]) {
+      expect(() => trackDesktopEvent({ name: "scheduled_task_run_opened", properties: { outcome: "failed", run_status: "unknown", has_files: false, nested: { [field]: "private" } } } as never)).toThrow("Analytics field is forbidden");
+    }
+  });
 });

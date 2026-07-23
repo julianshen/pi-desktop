@@ -60,6 +60,14 @@ export type GeneratedFileSaveRequest = {
   mediaType?: string;
   byteSize?: number;
 };
+export type ScheduledRunFileSaveRequest = {
+  taskId: string;
+  runId: string;
+  fileId: string;
+  name: string;
+  mediaType?: string;
+  byteSize?: number;
+};
 
 type NativeInvoke = typeof invoke;
 
@@ -83,6 +91,26 @@ export async function saveGeneratedFile(
   } catch (error) {
     trackDesktopEvent({ name: "generated_file_save_terminal", properties: { outcome: "failed", media_category: mediaCategory(request.mediaType), size_bucket: sizeBucket(request.byteSize) } });
     const message = error instanceof Error ? error.message : "Generated file save failed";
+    throw new Error(message, { cause: error });
+  }
+}
+
+/** Scheduled output variant: opaque scheduler IDs only; native code owns source resolution. */
+export async function saveScheduledRunFile(
+  request: ScheduledRunFileSaveRequest,
+  nativeInvoke: NativeInvoke = invoke,
+): Promise<GeneratedFileSaveResult> {
+  try {
+    const result = await nativeInvoke<GeneratedFileSaveResult>("save_scheduled_run_file", {
+      taskId: request.taskId,
+      runId: request.runId,
+      fileId: request.fileId,
+      fileName: safeSuggestedName(request.name),
+    });
+    if (result.status !== "saved" && result.status !== "cancelled") throw new Error("Native save returned an invalid status");
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Scheduled run file save failed";
     throw new Error(message, { cause: error });
   }
 }

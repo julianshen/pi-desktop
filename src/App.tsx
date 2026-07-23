@@ -23,6 +23,7 @@ import { getResolveToken } from "./lib/resolveToken.js";
 import { prepareAttachmentRequestBody } from "./state/attachmentDrafts.js";
 import { useActiveRun } from "./hooks/useActiveRun.js";
 import { AgentWorkSurface } from "./components/chat/AgentWorkSurface.js";
+import { useScheduledAwareness } from "./hooks/useScheduledAwareness.js";
 
 /**
  * Task 10 (SPEC.md's "Headless render bridge" section). Public shape returned
@@ -251,6 +252,7 @@ function App() {
   // this exact interaction while the user is looking at Settings or any other
   // view, not just Chat.
   usePendingRenderInteractionWatcher(state.activeConv);
+  const scheduledAwareness = useScheduledAwareness();
 
   const runtime = useAssistantChatRuntime(state.activeConv);
 
@@ -271,7 +273,7 @@ function App() {
         <TitleBar windowTitle={WINDOW_TITLES[state.view]} />
 
         <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-          <IconRail items={railViews} view={state.view} onSelect={actions.go} onSettings={() => actions.go("settings")} />
+          <IconRail items={railViews} view={state.view} onSelect={actions.go} onSettings={() => actions.go("settings")} scheduledUnreadCount={scheduledAwareness.unreadCount} />
 
           <Sidebar
             view={state.view}
@@ -327,6 +329,7 @@ function App() {
                   onOpenTask={actions.openTask}
                   onBackToTasks={actions.backToTasks}
                   onCloseCreate={actions.closeTaskCreate}
+                  onCreateTask={actions.openTaskCreate}
                 />
               )}
               {state.view === "coding" && <CodingAgentsView />}

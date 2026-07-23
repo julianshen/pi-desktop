@@ -1,9 +1,10 @@
-import { beforeAll, afterAll, describe, expect, test } from "bun:test";
+import { beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getPending } from "../web-fetch/pending-interactions.js";
+import type { ScheduledTaskRecord } from "./types.js";
 
 /**
  * Task 7 (TASKS.md) — proves the scheduler's own session-construction wiring
@@ -28,10 +29,6 @@ beforeAll(async () => {
   scheduler = await import("./index.js");
 });
 
-afterAll(() => {
-  // Best-effort cleanup; not load-bearing for the assertions above.
-});
-
 /** A ctx.ui.confirm() that throws if ever called -- proves the hard-block path never reaches the approval gate at all (mirrors web-fetch/tools.test.ts's own helper of the same name/intent). */
 function buildConfirmMustNotBeCalledContext(): ExtensionContext {
   return {
@@ -46,7 +43,7 @@ function buildConfirmMustNotBeCalledContext(): ExtensionContext {
 const PRIVATE_URL = "http://127.0.0.1:9/private-page";
 
 describe("scheduler session construction", () => {
-  // AC-7.2 [R] — Given a scheduled/background agent run, when its session is
+  // AC-3.2 [R] — Given a scheduled/background agent run, when its session is
   // created, then its web_fetch tool instance was constructed with
   // sessionKind: "scheduled", not "interactive" -- verified by confirming a
   // private-URL call from that session hits the hard-block path (an explicit
@@ -59,12 +56,24 @@ describe("scheduler session construction", () => {
   // failure mode: an unattended run silently entering the pending-approval
   // state and hanging forever) would be caught by this test actually invoking
   // ctx.ui.confirm() and failing loudly, not by inspecting source text.
-  test("AC-7.2 [R]: a scheduled session's web_fetch tool hard-blocks a private URL instead of creating a pending approval", async () => {
+  test("AC-3.2 [R]: a scheduled session's web_fetch tool hard-blocks a private URL instead of creating a pending approval", async () => {
     const taskId = `scheduled-task-${Date.now()}`;
-    const session = await scheduler.createScheduledSession(taskId);
+    const task: ScheduledTaskRecord = {
+      id: taskId,
+      name: "Safety test",
+      prompt: "Do not run",
+      cron: "0 9 * * 1",
+      timezone: "UTC",
+      enabled: true,
+      createdAt: "2026-07-22T00:00:00.000Z",
+      updatedAt: "2026-07-22T00:00:00.000Z",
+    };
+    const runStore = new (await import("./run-store.js")).RunStore(process.env.PI_DESKTOP_DATA_DIR!);
+    const session = await scheduler.createScheduledSession(task, { runId: "safety-run", publishFile: () => {} }, runStore);
 
-    expect(session.getActiveToolNames()).toContain("web_fetch");
-    const webFetch = session.getToolDefinition("web_fetch");
+    expect(session.getActiveToolNames?.()).toContain("web_fetch");
+    expect(session.getActiveToolNames?.().some((name) => name.startsWith("computer_") || name.startsWith("mcp_"))).toBe(false);
+    const webFetch = session.getToolDefinition?.("web_fetch");
     expect(webFetch).toBeDefined();
 
     const ctx = buildConfirmMustNotBeCalledContext();

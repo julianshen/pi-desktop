@@ -103,6 +103,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
         .manage(ResolveTokenState(resolve_token))
@@ -203,6 +204,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             generated_files::save_generated_file,
+            generated_files::save_scheduled_run_file,
             web_fetch::render_url_headless,
             get_resolve_token,
             window_close,

@@ -4,6 +4,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createWebFetchTools } from "./tools.js";
 import { create as createPendingInteraction, resolve as resolvePendingInteraction, getPending } from "./pending-interactions.js";
 import { MAX_REDIRECTS } from "./fetcher.js";
+import { setServerAnalyticsSink } from "../analytics/events.js";
 
 /**
  * Task 6 (TASKS.md) — the full execute() gated-fetch matrix for `web_fetch`.
@@ -55,6 +56,7 @@ beforeEach(() => {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  setServerAnalyticsSink();
 });
 
 /** A ctx.ui.confirm() wired to the real pending-interactions.ts registry — see module doc comment above. */
@@ -191,6 +193,24 @@ describe("web_fetch tool", () => {
     expect(text).toContain(new URL(PRIVATE_URL).host);
     expect(text).toContain("not permitted in a background run");
     expect(getPending(conversationId)).toBeUndefined();
+    expect(fetchCalls).toHaveLength(0);
+  });
+
+  test("review regression: analytics failures cannot escape a scheduled private-network denial", async () => {
+    setServerAnalyticsSink(() => {
+      throw new Error("analytics unavailable");
+    });
+    const [webFetch] = createWebFetchTools(randomUUID(), "scheduled");
+
+    const result = await webFetch.execute(
+      "call-analytics-failure",
+      { url: PRIVATE_URL },
+      undefined,
+      undefined,
+      buildConfirmMustNotBeCalledContext(),
+    );
+
+    expect(result.details).toMatchObject({ ok: false, reason: "scheduled-private-blocked" });
     expect(fetchCalls).toHaveLength(0);
   });
 

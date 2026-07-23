@@ -17,11 +17,13 @@ export function IconRail({
   view,
   onSelect,
   onSettings,
+  scheduledUnreadCount = 0,
 }: {
   items: { key: ViewKey; label: string }[];
   view: ViewKey;
   onSelect: (key: ViewKey) => void;
   onSettings: () => void;
+  scheduledUnreadCount?: number;
 }) {
   return (
     <div
@@ -61,7 +63,15 @@ export function IconRail({
                 textTransform: "uppercase",
               }}
             >
-              <Icon size={20} />
+              <span style={{ position: "relative", display: "inline-flex" }}>
+                <Icon size={20} />
+                {item.key === "scheduled" && scheduledUnreadCount > 0 && (
+                  <span
+                    aria-label={`${scheduledUnreadCount} unread scheduled task outcomes`}
+                    style={{ position: "absolute", top: -8, right: -12, minWidth: 16, height: 16, padding: "0 4px", display: "grid", placeItems: "center", borderRadius: 8, color: "white", background: "var(--color-danger)", fontSize: 9, lineHeight: 1 }}
+                  >{scheduledUnreadCount > 99 ? "99+" : scheduledUnreadCount}</span>
+                )}
+              </span>
               <span>{item.label}</span>
             </button>
           );

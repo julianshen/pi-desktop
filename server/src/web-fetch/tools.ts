@@ -21,6 +21,7 @@ import {
 } from "./fetcher.js";
 import { classifyTarget, DnsResolutionError } from "./safety.js";
 import { create as createPendingInteraction } from "./pending-interactions.js";
+import { trackServerEvent } from "../analytics/events.js";
 
 export type SessionKind = "interactive" | "scheduled";
 
@@ -224,6 +225,11 @@ export function createWebFetchTools(conversationId: string, sessionKind: Session
         redirectFrom?: URL,
       ): Promise<{ approved: true } | { approved: false; result: ReturnType<typeof textResult> }> {
         if (sessionKind === "scheduled") {
+          try {
+            trackServerEvent({ name: "scheduled_task_tool_denied", properties: { category: "private_network", phase: "execution" } });
+          } catch (analyticsError) {
+            console.error("[web-fetch] scheduled denial analytics failed", analyticsError);
+          }
           // (c) Scheduled sessions hard-block immediately — never call
           // ctx.ui.confirm(), never create a pending interaction (AC-6.4,
           // US-05: an unattended run must never hang waiting on an approval

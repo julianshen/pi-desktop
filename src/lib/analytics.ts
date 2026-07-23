@@ -4,12 +4,14 @@ export type SizeBucket = "under_1mib" | "1_10mib" | "10_25mib" | "over_25mib" | 
 export type DesktopAnalyticsEvent =
   | { name: "conversation_restored"; properties: { outcome: "success" | "failed"; had_active_run: boolean; message_count_bucket: CountBucket } }
   | { name: "agent_run_restored"; properties: { outcome: "success" | "failed"; prior_status: string; replayed_event_count_bucket: CountBucket } }
-  | { name: "generated_file_save_terminal"; properties: { outcome: "saved" | "cancelled" | "failed"; media_category: string; size_bucket: SizeBucket } };
+  | { name: "generated_file_save_terminal"; properties: { outcome: "saved" | "cancelled" | "failed"; media_category: string; size_bucket: SizeBucket } }
+  | { name: "scheduled_task_run_opened"; properties: { outcome: "success" | "not_found" | "unavailable" | "failed"; run_status: "running" | "completed" | "failed" | "skipped" | "unknown"; has_files: boolean } }
+  | { name: "scheduled_task_failure_notified"; properties: { outcome: "requested" | "permission_denied" | "api_unavailable" | "failed"; app_visible: boolean } };
 
 export type DispatchedDesktopAnalyticsEvent = DesktopAnalyticsEvent & { platform: "desktop" };
 type Sink = (event: DispatchedDesktopAnalyticsEvent) => void;
 let sink: Sink = () => {};
-const denied = ["prompt", "content", "query", "url", "key", "filename", "path", "hash"];
+const denied = ["prompt", "content", "query", "url", "key", "filename", "path", "hash", "result", "taskid", "runid", "modelid", "cron", "timezone", "finaltext", "errormessage", "filemetadata"];
 
 function assertPrivate(value: unknown): void {
   if (!value || typeof value !== "object") return;
